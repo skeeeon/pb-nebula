@@ -160,18 +160,23 @@ func (cm *Manager) createCACollection() error {
 }
 
 // createNetworksCollection creates the networks collection for tenant isolation.
-// Networks define CIDR ranges, firewall rules, and lighthouse configurations.
+// Networks define CIDR ranges only - firewall rules are host-based in Nebula.
 //
 // SECURITY MODEL:
 // - Authenticated users can list and view active networks
 // - Only authenticated users can create/update/delete networks
 // - Network isolation handled by Nebula, not PocketBase rules
 //
+// NEBULA FIREWALL DESIGN:
+// - Firewall rules are HOST-BASED, not network-based
+// - Rules use GROUPS assigned to host certificates
+// - Default is DENY-ALL
+// - Each host configures its own firewall based on its groups
+//
 // SCHEMA:
 // - Identity: name, description
 // - Network: cidr_range (IPv4 only for now)
 // - Relation: ca_id (to nebula_ca)
-// - Firewall: firewall_outbound, firewall_inbound (Nebula JSON format)
 // - Management: active (enable/disable)
 // - Metadata: created, updated timestamps
 //
@@ -216,16 +221,6 @@ func (cm *Manager) createNetworksCollection() error {
 	// Add management field
 	collection.Fields.Add(&core.BoolField{
 		Name: "active",
-	})
-
-	// Add firewall rules (stored as JSON text)
-	collection.Fields.Add(&core.TextField{
-		Name: "firewall_outbound",
-		Max:  10000,
-	})
-	collection.Fields.Add(&core.TextField{
-		Name: "firewall_inbound",
-		Max:  10000,
 	})
 
 	// Add timestamps
@@ -286,9 +281,16 @@ func (cm *Manager) createNetworksCollection() error {
 // - Relations: network_id (foreign key)
 // - Generated: ca_certificate (denormalized), config_yaml (complete Nebula config)
 // - Lighthouse: is_lighthouse, public_host_port
+// - Firewall: firewall_outbound, firewall_inbound (host-specific rules)
+//
+// FIREWALL RULES (HOST-BASED):
+// - Each host defines its own firewall rules
+// - Rules reference groups assigned to certificates
+// - Deny-all by default
+// - Rules stored as JSON in Nebula native format
 //
 // SPECIAL FIELDS:
-// - groups: JSON array of group names for firewall rules
+// - groups: JSON array of group names (embedded in certificate)
 // - validity_years: Certificate validity period
 // - expires_at: Certificate expiration timestamp
 //
@@ -354,6 +356,16 @@ func (cm *Manager) createHostsCollection() error {
 	collection.Fields.Add(&core.TextField{
 		Name: "config_yaml",
 		Max:  50000,
+	})
+
+	// Add host-specific firewall rules (Nebula native JSON format)
+	collection.Fields.Add(&core.TextField{
+		Name: "firewall_outbound",
+		Max:  10000,
+	})
+	collection.Fields.Add(&core.TextField{
+		Name: "firewall_inbound",
+		Max:  10000,
 	})
 
 	// Add validity fields

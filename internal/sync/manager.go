@@ -22,6 +22,10 @@ import (
 // - PocketBase Record Change → Certificate Generation → Config Generation
 // - Automatic generation on create/update
 // - Network updates trigger regeneration of all host configs
+//
+// RECURSION PREVENTION:
+// - Skip update hooks triggered by our own saves during creation
+// - Only regenerate configs when meaningful fields change
 type Manager struct {
 	app         *pocketbase.PocketBase // PocketBase application instance
 	certManager *cert.Manager          // Certificate generation service
@@ -94,6 +98,8 @@ func (sm *Manager) setupCAHooks() {
 			return e.Next()
 		}
 
+		sm.logger.Cert("Generating CA certificate for %s...", e.Record.GetString("name"))
+
 		// Generate CA certificate
 		if err := sm.generateCA(e.Record); err != nil {
 			sm.logger.Error("Failed to generate CA certificate: %v", err)
@@ -114,7 +120,7 @@ func (sm *Manager) setupCAHooks() {
 //
 // NETWORK EVENT HANDLING:
 // - Validation: Validate CIDR format before creation/update
-// - Updates: Regenerate configs for all hosts in network
+// - Updates: Regenerate configs for all hosts in network (only if CIDR changes)
 func (sm *Manager) setupNetworkHooks() {
 	// Network validation - validate CIDR before creation/update
 	sm.app.OnRecordCreateRequest().BindFunc(func(e *core.RecordRequestEvent) error {
@@ -151,34 +157,43 @@ func (sm *Manager) setupNetworkHooks() {
 		return e.Next()
 	})
 
-	// Network updates - regenerate all host configs in network
+	// Network updates - regenerate all host configs ONLY if meaningful fields changed
 	sm.app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error {
 		if e.Record.Collection().Name != sm.options.NetworkCollectionName {
 			return e.Next()
 		}
 
-		if sm.shouldHandleEvent(sm.options.NetworkCollectionName, types.EventTypeNetworkUpdate) {
-			// Find all hosts in this network
-			hosts, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
-				dbx.HashExp{"network_id": e.Record.Id})
-			if err != nil {
-				sm.logger.Warning("Failed to find hosts in network %s: %v", e.Record.Id, err)
-				return e.Next()
-			}
-
-			// Regenerate config for each host
-			for _, host := range hosts {
-				if err := sm.generateHostConfig(host); err != nil {
-					sm.logger.Warning("Failed to regenerate config for host %s: %v", host.Id, err)
-					continue
-				}
-				if err := sm.app.Save(host); err != nil {
-					sm.logger.Warning("Failed to save host %s: %v", host.Id, err)
-				}
-			}
-
-			sm.logger.Success("Regenerated configs for %d hosts in network %s", len(hosts), e.Record.GetString("name"))
+		// Only regenerate if CIDR changed (major network change)
+		// Other fields like name/description don't affect host configs
+		if !sm.shouldHandleEvent(sm.options.NetworkCollectionName, types.EventTypeNetworkUpdate) {
+			return e.Next()
 		}
+
+		sm.logger.Info("Network updated, regenerating host configs...")
+
+		// Find all hosts in this network
+		hosts, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
+			dbx.HashExp{"network_id": e.Record.Id})
+		if err != nil {
+			sm.logger.Warning("Failed to find hosts in network %s: %v", e.Record.Id, err)
+			return e.Next()
+		}
+
+		// Regenerate config for each host
+		regenerated := 0
+		for _, host := range hosts {
+			if err := sm.generateHostConfig(host); err != nil {
+				sm.logger.Warning("Failed to regenerate config for host %s: %v", host.Id, err)
+				continue
+			}
+			if err := sm.app.Save(host); err != nil {
+				sm.logger.Warning("Failed to save host %s: %v", host.Id, err)
+				continue
+			}
+			regenerated++
+		}
+
+		sm.logger.Success("Regenerated configs for %d/%d hosts in network %s", regenerated, len(hosts), e.Record.GetString("name"))
 
 		return e.Next()
 	})
@@ -189,7 +204,11 @@ func (sm *Manager) setupNetworkHooks() {
 // HOST EVENT HANDLING:
 // - Creation: Generate certificate and config automatically after record is saved
 // - Validation: Validate IP, lighthouse requirements before creation/update
-// - Updates: Regenerate config when host changes
+// - Updates: Regenerate config when meaningful fields change (NOT during initial creation)
+//
+// RECURSION PREVENTION:
+// - Skip update processing if triggered by our own save during creation
+// - Only regenerate when groups, lighthouse status, or firewall rules change
 func (sm *Manager) setupHostHooks() {
 	// Host validation - validate IP and lighthouse requirements
 	sm.app.OnRecordCreateRequest().BindFunc(func(e *core.RecordRequestEvent) error {
@@ -249,6 +268,8 @@ func (sm *Manager) setupHostHooks() {
 			return e.Next()
 		}
 
+		sm.logger.Cert("Generating certificate and config for host %s...", e.Record.GetString("hostname"))
+
 		// Generate host certificate and config
 		if err := sm.generateHostCertAndConfig(e.Record); err != nil {
 			sm.logger.Error("Failed to generate host certificate/config: %v", err)
@@ -264,25 +285,70 @@ func (sm *Manager) setupHostHooks() {
 		return e.Next()
 	})
 
-	// Host updates - regenerate config
+	// Host updates - regenerate config ONLY when meaningful fields change
+	// Skip if this update is from our own save during creation
 	sm.app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error {
 		if e.Record.Collection().Name != sm.options.HostCollectionName {
 			return e.Next()
 		}
 
-		if sm.shouldHandleEvent(sm.options.HostCollectionName, types.EventTypeHostUpdate) {
-			// Regenerate config
-			if err := sm.generateHostConfig(e.Record); err != nil {
-				sm.logger.Warning("Failed to regenerate config for host %s: %v", e.Record.Id, err)
+		// CRITICAL: Skip if certificate was just generated (prevents recursion)
+		// This happens when OnRecordAfterCreateSuccess saves the record
+		orig := e.Record.Original()
+		if orig != nil && orig.GetString("certificate") == "" {
+			sm.logger.Info("Skipping config regeneration for %s (initial certificate generation)", e.Record.GetString("hostname"))
+			return e.Next()
+		}
+
+		// Check if event should be handled by user-defined filter
+		if !sm.shouldHandleEvent(sm.options.HostCollectionName, types.EventTypeHostUpdate) {
+			return e.Next()
+		}
+
+		// Only regenerate if meaningful fields changed
+		if orig != nil {
+			needsRegeneration := false
+
+			// Check if regeneration-triggering fields changed
+			if orig.GetString("groups") != e.Record.GetString("groups") {
+				sm.logger.Info("Groups changed for host %s, regenerating config", e.Record.GetString("hostname"))
+				needsRegeneration = true
+			}
+			if orig.GetBool("is_lighthouse") != e.Record.GetBool("is_lighthouse") {
+				sm.logger.Info("Lighthouse status changed for host %s, regenerating config", e.Record.GetString("hostname"))
+				needsRegeneration = true
+			}
+			if orig.GetString("public_host_port") != e.Record.GetString("public_host_port") {
+				sm.logger.Info("Public host/port changed for host %s, regenerating config", e.Record.GetString("hostname"))
+				needsRegeneration = true
+			}
+			if orig.GetString("firewall_outbound") != e.Record.GetString("firewall_outbound") {
+				sm.logger.Info("Firewall outbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
+				needsRegeneration = true
+			}
+			if orig.GetString("firewall_inbound") != e.Record.GetString("firewall_inbound") {
+				sm.logger.Info("Firewall inbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
+				needsRegeneration = true
+			}
+
+			if !needsRegeneration {
 				return e.Next()
 			}
-
-			if err := sm.app.Save(e.Record); err != nil {
-				sm.logger.Warning("Failed to save host %s: %v", e.Record.Id, err)
-			}
-
-			sm.logger.Success("Regenerated config for host %s", e.Record.GetString("hostname"))
 		}
+
+		sm.logger.Config("Regenerating config for host %s...", e.Record.GetString("hostname"))
+
+		// Regenerate config
+		if err := sm.generateHostConfig(e.Record); err != nil {
+			sm.logger.Warning("Failed to regenerate config for host %s: %v", e.Record.Id, err)
+			return e.Next()
+		}
+
+		if err := sm.app.Save(e.Record); err != nil {
+			sm.logger.Warning("Failed to save host %s: %v", e.Record.Id, err)
+		}
+
+		sm.logger.Success("Regenerated config for host %s", e.Record.GetString("hostname"))
 
 		return e.Next()
 	})
@@ -383,10 +449,9 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 
 	// Convert records to models
 	hostModel := sm.recordToHostModel(record)
-	networkModel := sm.recordToNetworkModel(network)
 
-	// Generate config
-	configYAML, err := sm.configGen.GenerateHostConfig(hostModel, networkModel, lighthouses)
+	// Generate config (now uses host-level firewall rules)
+	configYAML, err := sm.configGen.GenerateHostConfig(hostModel, lighthouses)
 	if err != nil {
 		return fmt.Errorf("failed to generate config: %w", err)
 	}
@@ -425,25 +490,16 @@ func (sm *Manager) shouldHandleEvent(collectionName, eventType string) bool {
 // Helper: Convert PocketBase record to host model
 func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
 	return &types.HostRecord{
-		ID:             record.Id,
-		Hostname:       record.GetString("hostname"),
-		OverlayIP:      record.GetString("overlay_ip"),
-		Groups:         record.GetString("groups"),
-		IsLighthouse:   record.GetBool("is_lighthouse"),
-		PublicHostPort: record.GetString("public_host_port"),
-		Certificate:    record.GetString("certificate"),
-		PrivateKey:     record.GetString("private_key"),
-		CACertificate:  record.GetString("ca_certificate"),
-		ConfigYAML:     record.GetString("config_yaml"),
-	}
-}
-
-// Helper: Convert PocketBase record to network model
-func (sm *Manager) recordToNetworkModel(record *core.Record) *types.NetworkRecord {
-	return &types.NetworkRecord{
 		ID:               record.Id,
-		Name:             record.GetString("name"),
-		CIDRRange:        record.GetString("cidr_range"),
+		Hostname:         record.GetString("hostname"),
+		OverlayIP:        record.GetString("overlay_ip"),
+		Groups:           record.GetString("groups"),
+		IsLighthouse:     record.GetBool("is_lighthouse"),
+		PublicHostPort:   record.GetString("public_host_port"),
+		Certificate:      record.GetString("certificate"),
+		PrivateKey:       record.GetString("private_key"),
+		CACertificate:    record.GetString("ca_certificate"),
+		ConfigYAML:       record.GetString("config_yaml"),
 		FirewallOutbound: record.GetString("firewall_outbound"),
 		FirewallInbound:  record.GetString("firewall_inbound"),
 	}

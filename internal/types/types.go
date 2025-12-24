@@ -32,26 +32,27 @@ type CARecord struct {
 }
 
 // NetworkRecord represents a Nebula network providing isolation for hosts.
-// Networks define CIDR ranges, firewall rules, and lighthouse configurations.
+// Networks define CIDR ranges only - firewall rules are HOST-BASED in Nebula.
 //
 // NETWORK ISOLATION:
 // Like accounts in pb-nats, networks provide natural isolation boundaries.
 // Hosts in different networks cannot communicate directly (unless unsafe routes configured).
 //
-// FIREWALL RULES:
-// Stored in Nebula's native JSON format for simplicity - no abstraction layer.
-// Rules are applied at the network level, affecting all hosts in the network.
+// FIREWALL DESIGN:
+// Nebula firewalls are HOST-BASED, not network-based:
+// - Each host defines its own firewall rules
+// - Rules use GROUPS assigned to certificates
+// - Default is DENY-ALL
+// - See HostRecord for firewall rule fields
 type NetworkRecord struct {
-	ID               string    `json:"id"`                 // Database primary key
-	Name             string    `json:"name"`               // Human-readable network name
-	CIDRRange        string    `json:"cidr_range"`         // IPv4 CIDR (e.g., "10.128.0.0/16")
-	Description      string    `json:"description"`        // Network description
-	CAID             string    `json:"ca_id"`              // Relation to nebula_ca
-	FirewallOutbound string    `json:"firewall_outbound"`  // JSON array of Nebula firewall rules
-	FirewallInbound  string    `json:"firewall_inbound"`   // JSON array of Nebula firewall rules
-	Active           bool      `json:"active"`             // Network enable/disable flag
-	Created          time.Time `json:"created"`            // Creation timestamp
-	Updated          time.Time `json:"updated"`            // Last update timestamp
+	ID          string    `json:"id"`          // Database primary key
+	Name        string    `json:"name"`        // Human-readable network name
+	CIDRRange   string    `json:"cidr_range"`  // IPv4 CIDR (e.g., "10.128.0.0/16")
+	Description string    `json:"description"` // Network description
+	CAID        string    `json:"ca_id"`       // Relation to nebula_ca
+	Active      bool      `json:"active"`      // Network enable/disable flag
+	Created     time.Time `json:"created"`     // Creation timestamp
+	Updated     time.Time `json:"updated"`     // Last update timestamp
 }
 
 // HostRecord represents a Nebula host with PocketBase authentication integration.
@@ -64,6 +65,11 @@ type NetworkRecord struct {
 // CERTIFICATE LIFECYCLE:
 // Host certificates are signed by the CA and contain the overlay IP, groups, and validity period.
 // Certificates cannot outlive the CA certificate that signed them.
+//
+// FIREWALL RULES (HOST-BASED):
+// Each host defines its own firewall rules stored in firewall_outbound and firewall_inbound.
+// Rules use Nebula's native format and reference GROUPS assigned to certificates.
+// Default behavior is DENY-ALL if no rules are specified.
 //
 // CONFIG MANAGEMENT:
 // Complete Nebula YAML config is generated and stored in config_yaml field.
@@ -90,6 +96,10 @@ type HostRecord struct {
 	PrivateKey    string `json:"private_key"`    // PEM encoded host private key
 	CACertificate string `json:"ca_certificate"` // PEM encoded CA cert (denormalized for convenience)
 	ConfigYAML    string `json:"config_yaml"`    // Complete Nebula config ready to use
+
+	// Host-specific firewall rules (Nebula native JSON format)
+	FirewallOutbound string `json:"firewall_outbound"` // JSON array of outbound firewall rules
+	FirewallInbound  string `json:"firewall_inbound"`  // JSON array of inbound firewall rules
 
 	// Certificate validity
 	ValidityYears int       `json:"validity_years"` // Certificate validity period
@@ -134,7 +144,7 @@ type Options struct {
 
 // Collection names with nebula_ prefix for clear identification
 const (
-	DefaultCACollectionName      = "nebula_ca"      // CA certificate authority
+	DefaultCACollectionName      = "nebula_ca"       // CA certificate authority
 	DefaultNetworkCollectionName = "nebula_networks" // Network definitions
 	DefaultHostCollectionName    = "nebula_hosts"    // Host configurations (auth collection)
 )
@@ -208,21 +218,25 @@ func (h *HostRecord) SetGroups(groups []string) error {
 // Rules are arrays of objects with: port, proto, host, groups, etc.
 // Example: [{"port": "22", "proto": "tcp", "groups": ["admin"]}]
 //
+// HOST-BASED DESIGN:
+// Each host defines its own firewall rules. Rules reference groups that are
+// embedded in certificates. Default is DENY-ALL if no rules specified.
+//
 // RETURNS:
 // - outbound: Array of outbound firewall rules
 // - inbound: Array of inbound firewall rules
 // - error if JSON parsing fails
-func (n *NetworkRecord) GetFirewallRules() (outbound, inbound []map[string]interface{}, err error) {
+func (h *HostRecord) GetFirewallRules() (outbound, inbound []map[string]interface{}, err error) {
 	// Parse outbound rules
-	if n.FirewallOutbound != "" && n.FirewallOutbound != "null" {
-		if err := json.Unmarshal([]byte(n.FirewallOutbound), &outbound); err != nil {
+	if h.FirewallOutbound != "" && h.FirewallOutbound != "null" {
+		if err := json.Unmarshal([]byte(h.FirewallOutbound), &outbound); err != nil {
 			return nil, nil, err
 		}
 	}
 
 	// Parse inbound rules
-	if n.FirewallInbound != "" && n.FirewallInbound != "null" {
-		if err := json.Unmarshal([]byte(n.FirewallInbound), &inbound); err != nil {
+	if h.FirewallInbound != "" && h.FirewallInbound != "null" {
+		if err := json.Unmarshal([]byte(h.FirewallInbound), &inbound); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -239,27 +253,27 @@ func (n *NetworkRecord) GetFirewallRules() (outbound, inbound []map[string]inter
 //
 // RETURNS:
 // - error if JSON encoding fails
-func (n *NetworkRecord) SetFirewallRules(outbound, inbound []map[string]interface{}) error {
+func (h *HostRecord) SetFirewallRules(outbound, inbound []map[string]interface{}) error {
 	// Encode outbound rules
 	if len(outbound) == 0 {
-		n.FirewallOutbound = "[]"
+		h.FirewallOutbound = "[]"
 	} else {
 		outboundJSON, err := json.Marshal(outbound)
 		if err != nil {
 			return err
 		}
-		n.FirewallOutbound = string(outboundJSON)
+		h.FirewallOutbound = string(outboundJSON)
 	}
 
 	// Encode inbound rules
 	if len(inbound) == 0 {
-		n.FirewallInbound = "[]"
+		h.FirewallInbound = "[]"
 	} else {
 		inboundJSON, err := json.Marshal(inbound)
 		if err != nil {
 			return err
 		}
-		n.FirewallInbound = string(inboundJSON)
+		h.FirewallInbound = string(inboundJSON)
 	}
 
 	return nil
