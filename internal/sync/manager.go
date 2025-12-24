@@ -231,6 +231,15 @@ func (sm *Manager) setupHostHooks() {
 			return fmt.Errorf("lighthouse hosts must specify public_host_port")
 		}
 
+		// Validate groups is valid JSON array
+		groupsJSON := e.Record.GetString("groups")
+		if groupsJSON != "" && groupsJSON != "null" {
+			var groups []string
+			if err := json.Unmarshal([]byte(groupsJSON), &groups); err != nil {
+				return fmt.Errorf("groups must be a valid JSON array of strings: %w", err)
+			}
+		}
+
 		return e.Next()
 	})
 
@@ -252,6 +261,15 @@ func (sm *Manager) setupHostHooks() {
 		// Validate lighthouse requirements
 		if e.Record.GetBool("is_lighthouse") && e.Record.GetString("public_host_port") == "" {
 			return fmt.Errorf("lighthouse hosts must specify public_host_port")
+		}
+
+		// Validate groups is valid JSON array
+		groupsJSON := e.Record.GetString("groups")
+		if groupsJSON != "" && groupsJSON != "null" {
+			var groups []string
+			if err := json.Unmarshal([]byte(groupsJSON), &groups); err != nil {
+				return fmt.Errorf("groups must be a valid JSON array of strings: %w", err)
+			}
 		}
 
 		return e.Next()
@@ -285,18 +303,22 @@ func (sm *Manager) setupHostHooks() {
 		return e.Next()
 	})
 
-	// Host updates - regenerate config ONLY when meaningful fields change
-	// Skip if this update is from our own save during creation
+	// Host updates - regenerate certificate OR config depending on what changed
+	// Certificate regeneration: groups, validity_years (embedded in cert)
+	// Config regeneration: lighthouse, firewall rules (only in config)
 	sm.app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error {
 		if e.Record.Collection().Name != sm.options.HostCollectionName {
 			return e.Next()
 		}
 
-		// CRITICAL: Skip if certificate was just generated (prevents recursion)
-		// This happens when OnRecordAfterCreateSuccess saves the record
 		orig := e.Record.Original()
-		if orig != nil && orig.GetString("certificate") == "" {
-			sm.logger.Info("Skipping config regeneration for %s (initial certificate generation)", e.Record.GetString("hostname"))
+
+		// CRITICAL: Skip if certificate was JUST generated (prevents recursion during creation)
+		// Only skip if: certificate went from empty -> populated (initial generation)
+		if orig != nil && 
+		   orig.GetString("certificate") == "" && 
+		   e.Record.GetString("certificate") != "" {
+			sm.logger.Info("Skipping regeneration for %s (initial certificate generation)", e.Record.GetString("hostname"))
 			return e.Next()
 		}
 
@@ -305,50 +327,82 @@ func (sm *Manager) setupHostHooks() {
 			return e.Next()
 		}
 
-		// Only regenerate if meaningful fields changed
+		needsCertRegeneration := false
+		needsConfigRegeneration := false
+
 		if orig != nil {
-			needsRegeneration := false
-
-			// Check if regeneration-triggering fields changed
+			// Check if CERTIFICATE regeneration is needed (expensive - new cert)
 			if orig.GetString("groups") != e.Record.GetString("groups") {
-				sm.logger.Info("Groups changed for host %s, regenerating config", e.Record.GetString("hostname"))
-				needsRegeneration = true
+				sm.logger.Info("Groups changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
+				needsCertRegeneration = true
 			}
-			if orig.GetBool("is_lighthouse") != e.Record.GetBool("is_lighthouse") {
-				sm.logger.Info("Lighthouse status changed for host %s, regenerating config", e.Record.GetString("hostname"))
-				needsRegeneration = true
-			}
-			if orig.GetString("public_host_port") != e.Record.GetString("public_host_port") {
-				sm.logger.Info("Public host/port changed for host %s, regenerating config", e.Record.GetString("hostname"))
-				needsRegeneration = true
-			}
-			if orig.GetString("firewall_outbound") != e.Record.GetString("firewall_outbound") {
-				sm.logger.Info("Firewall outbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
-				needsRegeneration = true
-			}
-			if orig.GetString("firewall_inbound") != e.Record.GetString("firewall_inbound") {
-				sm.logger.Info("Firewall inbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
-				needsRegeneration = true
+			if orig.GetInt("validity_years") != e.Record.GetInt("validity_years") && e.Record.GetInt("validity_years") > 0 {
+				sm.logger.Info("Validity years changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
+				needsCertRegeneration = true
 			}
 
-			if !needsRegeneration {
-				return e.Next()
+			// Check if only CONFIG regeneration is needed (cheap - just YAML)
+			if !needsCertRegeneration {
+				if orig.GetBool("is_lighthouse") != e.Record.GetBool("is_lighthouse") {
+					sm.logger.Info("Lighthouse status changed for host %s, regenerating config", e.Record.GetString("hostname"))
+					needsConfigRegeneration = true
+				}
+				if orig.GetString("public_host_port") != e.Record.GetString("public_host_port") {
+					sm.logger.Info("Public host/port changed for host %s, regenerating config", e.Record.GetString("hostname"))
+					needsConfigRegeneration = true
+				}
+				if orig.GetString("firewall_outbound") != e.Record.GetString("firewall_outbound") {
+					sm.logger.Info("Firewall outbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
+					needsConfigRegeneration = true
+				}
+				if orig.GetString("firewall_inbound") != e.Record.GetString("firewall_inbound") {
+					sm.logger.Info("Firewall inbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
+					needsConfigRegeneration = true
+				}
 			}
+		} else {
+			// If we don't have original data, regenerate cert to be safe
+			sm.logger.Info("No original data available for host %s, regenerating certificate", e.Record.GetString("hostname"))
+			needsCertRegeneration = true
 		}
 
-		sm.logger.Config("Regenerating config for host %s...", e.Record.GetString("hostname"))
-
-		// Regenerate config
-		if err := sm.generateHostConfig(e.Record); err != nil {
-			sm.logger.Warning("Failed to regenerate config for host %s: %v", e.Record.Id, err)
+		if !needsCertRegeneration && !needsConfigRegeneration {
+			sm.logger.Info("No meaningful changes detected for host %s, skipping regeneration", e.Record.GetString("hostname"))
 			return e.Next()
 		}
 
-		if err := sm.app.Save(e.Record); err != nil {
-			sm.logger.Warning("Failed to save host %s: %v", e.Record.Id, err)
+		// Regenerate certificate (which also regenerates config)
+		if needsCertRegeneration {
+			sm.logger.Cert("Regenerating certificate and config for host %s...", e.Record.GetString("hostname"))
+			
+			if err := sm.generateHostCertAndConfig(e.Record); err != nil {
+				sm.logger.Error("Failed to regenerate certificate for host %s: %v", e.Record.Id, err)
+				return e.Next()
+			}
+			
+			if err := sm.app.Save(e.Record); err != nil {
+				sm.logger.Warning("Failed to save host %s: %v", e.Record.Id, err)
+			}
+			
+			sm.logger.Success("Regenerated certificate and config for host %s", e.Record.GetString("hostname"))
+			return e.Next()
 		}
 
-		sm.logger.Success("Regenerated config for host %s", e.Record.GetString("hostname"))
+		// Only regenerate config (cheaper operation)
+		if needsConfigRegeneration {
+			sm.logger.Config("Regenerating config for host %s...", e.Record.GetString("hostname"))
+			
+			if err := sm.generateHostConfig(e.Record); err != nil {
+				sm.logger.Warning("Failed to regenerate config for host %s: %v", e.Record.Id, err)
+				return e.Next()
+			}
+			
+			if err := sm.app.Save(e.Record); err != nil {
+				sm.logger.Warning("Failed to save host %s: %v", e.Record.Id, err)
+			}
+			
+			sm.logger.Success("Regenerated config for host %s", e.Record.GetString("hostname"))
+		}
 
 		return e.Next()
 	})

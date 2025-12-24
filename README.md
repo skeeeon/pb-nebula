@@ -1,19 +1,42 @@
 # 🦴 pb-nebula
 
-**Nebula mesh VPN certificate and configuration management for PocketBase**
+**Nebula mesh VPN certificate authority and configuration management for PocketBase**
 
-pb-nebula transforms PocketBase into a complete Nebula overlay network management system. It automatically handles CA generation, host certificate signing, and full Nebula configuration generation with zero manual intervention.
+pb-nebula transforms PocketBase into a complete Nebula overlay network management system with automatic certificate generation, intelligent regeneration, and zero-configuration deployment.
 
 ## Features
 
-- ✅ **Automatic CA Generation** - Create self-signed CA certificates on record creation
-- ✅ **Host Certificate Signing** - Generate and sign host certificates automatically
-- ✅ **Config Generation** - Complete Nebula YAML configs with lighthouse discovery
-- ✅ **Real-time Updates** - Automatic config regeneration on network/host changes
-- ✅ **IP Validation** - Ensure hosts are within network CIDR ranges
-- ✅ **Firewall Management** - Network-level firewall rules in Nebula native format
-- ✅ **PocketBase Auth** - Hosts authenticate via email/password to download configs
-- ✅ **Tenant Isolation** - Networks provide natural isolation boundaries
+### 🔐 Certificate Management
+- ✅ **Automatic CA Generation** - Self-signed root CA created on first record
+- ✅ **Host Certificate Signing** - Certificates signed by CA with embedded groups
+- ✅ **Smart Regeneration** - Automatically regenerates certificates when groups or validity change
+- ✅ **Expiration Management** - Host certificates capped by CA expiration
+- ✅ **CURVE25519** - Uses Nebula's recommended Ed25519/X25519 curve
+
+### 📝 Configuration Generation
+- ✅ **Complete Nebula Configs** - Ready-to-use YAML with PKI, lighthouse, and firewall
+- ✅ **Lighthouse Discovery** - Automatic static_host_map generation
+- ✅ **Host-Based Firewall** - Firewall rules per host using certificate groups
+- ✅ **Smart Config Updates** - Regenerates only when meaningful fields change
+- ✅ **Sensible Defaults** - Production-ready settings out of the box
+
+### 🌐 Network Management
+- ✅ **CIDR Validation** - Ensures valid network ranges (IPv4)
+- ✅ **IP Validation** - Hosts must be within network CIDR
+- ✅ **Unique Constraints** - No duplicate IPs per network
+- ✅ **Tenant Isolation** - Networks provide natural boundaries
+
+### 🔄 Real-Time Sync
+- ✅ **Two-Tier Regeneration** - Smart distinction between cert and config updates
+- ✅ **Recursion Prevention** - No infinite loops or excessive processing
+- ✅ **Event Filtering** - Optional custom event handling
+- ✅ **Detailed Logging** - Clear visibility into what's happening
+
+### 🔒 Security
+- ✅ **PocketBase Auth** - Email/password authentication for hosts
+- ✅ **Self-Service** - Hosts can only access their own records
+- ✅ **Hidden Keys** - CA private key hidden from API
+- ✅ **JSON Validation** - Invalid firewall rules rejected immediately
 
 ## Installation
 
@@ -46,7 +69,7 @@ func main() {
 }
 ```
 
-Run your application:
+**Run your application:**
 
 ```bash
 go run main.go serve
@@ -54,75 +77,112 @@ go run main.go serve
 
 Access the admin UI at `http://127.0.0.1:8090/_/`
 
-## How It Works
-
-### Architecture
-
-```
-PocketBase Collections
-├── nebula_ca           (Root CA - Single record)
-├── nebula_networks     (Network definitions with CIDR ranges)
-└── nebula_hosts        (Auth collection - Hosts with certificates)
-
-Automatic Workflow
-├── Create CA → Certificate generated automatically
-├── Create Network → CIDR validated
-├── Create Host → Certificate + Config generated
-└── Update Network → All host configs regenerated
-```
+## Architecture
 
 ### Collections
 
+```
+PocketBase Collections
+├── nebula_ca           Root CA (admin only, single record)
+├── nebula_networks     Network definitions with CIDR ranges
+└── nebula_hosts        Auth collection with certificates & configs
+
+Automatic Workflow
+├── Create CA → Certificate auto-generated
+├── Create Network → CIDR validated
+├── Create Host → Certificate + Config auto-generated
+├── Update Groups → Certificate regenerated (embedded in cert)
+├── Update Firewall → Config regenerated (not in cert)
+└── Update Network → All host configs regenerated
+```
+
+### Data Model
+
 #### `nebula_ca` (Base Collection)
-- Single CA per deployment (like pb-nats operator)
-- Contains root certificate and private key
-- Admin-only access
-- Private key stored in HIDDEN field
+Single CA certificate authority per deployment.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| name | text | CA name |
+| certificate | text | PEM encoded CA certificate (auto-generated) |
+| private_key | text | PEM encoded CA private key (HIDDEN) |
+| validity_years | number | Certificate validity (default: 10) |
+| expires_at | date | CA expiration timestamp |
+| curve | text | Cryptographic curve (CURVE25519) |
+
+**Security:** Admin only, private_key field hidden from API.
 
 #### `nebula_networks` (Base Collection)
-- Network definitions with CIDR ranges (e.g., `10.128.0.0/16`)
-- Firewall rules (Nebula native JSON format)
-- Links to CA via `ca_id` relation
-- Active/inactive flag
+Network definitions for tenant isolation.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| name | text | Network name |
+| cidr_range | text | IPv4 CIDR (e.g., "10.128.0.0/16") |
+| description | text | Network description |
+| ca_id | relation | Link to nebula_ca |
+| active | bool | Enable/disable network |
+
+**Note:** Firewall rules are HOST-BASED, not network-based (Nebula design).
 
 #### `nebula_hosts` (Auth Collection)
-- PocketBase authentication (email/password)
-- Nebula identity (hostname, overlay IP)
-- Certificate and private key (auto-generated)
-- Complete Nebula config YAML
-- Lighthouse configuration
-- Group membership for firewall rules
+Host configurations with PocketBase authentication.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| email | text | PocketBase auth email |
+| password | text | PocketBase auth password |
+| hostname | text | Nebula hostname (unique) |
+| network_id | relation | Link to nebula_networks |
+| overlay_ip | text | Overlay IP (e.g., "10.128.0.100") |
+| groups | json | Array of group names (embedded in cert) |
+| is_lighthouse | bool | Is this a lighthouse? |
+| public_host_port | text | Public IP:PORT (required if lighthouse) |
+| certificate | text | PEM host certificate (auto-generated) |
+| private_key | text | PEM host private key (auto-generated) |
+| ca_certificate | text | PEM CA cert (denormalized) |
+| config_yaml | text | Complete Nebula config (auto-generated) |
+| firewall_outbound | json | Outbound firewall rules |
+| firewall_inbound | json | Inbound firewall rules |
+| validity_years | number | Certificate validity (default: 1) |
+| expires_at | date | Certificate expiration |
+| active | bool | Enable/disable host |
+
+**Security:** Users can only access their own records (self-service).
 
 ## Usage Guide
 
 ### 1. Create Certificate Authority
 
-Via Admin UI or API:
-
 ```bash
 curl -X POST http://127.0.0.1:8090/api/collections/nebula_ca/records \
   -H "Content-Type: application/json" \
-  -u "admin@example.com:password" \
+  -u "admin@example.com:adminpassword" \
   -d '{
     "name": "my-org-ca",
     "validity_years": 10
   }'
 ```
 
-**Result**: CA certificate and private key automatically generated.
+**Result:** CA certificate and private key automatically generated.
+
+**Expected Log:**
+```
+[15:04:05] 🔐 CERT Generating CA certificate for my-org-ca...
+[15:04:05] ✅ SUCCESS Generated CA certificate for my-org-ca
+```
 
 ### 2. Create Network
 
 ```bash
 curl -X POST http://127.0.0.1:8090/api/collections/nebula_networks/records \
   -H "Content-Type: application/json" \
-  -u "admin@example.com:password" \
+  -u "admin@example.com:adminpassword" \
   -d '{
     "name": "production",
     "cidr_range": "10.128.0.0/16",
     "ca_id": "<ca_record_id>",
-    "firewall_outbound": [{"port": "any", "proto": "any", "host": "any"}],
-    "firewall_inbound": [{"port": "22", "proto": "tcp", "groups": ["admin"]}],
+    "description": "Production network",
     "active": true
   }'
 ```
@@ -132,10 +192,10 @@ curl -X POST http://127.0.0.1:8090/api/collections/nebula_networks/records \
 ```bash
 curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/records \
   -H "Content-Type: application/json" \
-  -u "admin@example.com:password" \
+  -u "admin@example.com:adminpassword" \
   -d '{
     "email": "lighthouse@example.com",
-    "password": "secure-password",
+    "password": "secure-password-here",
     "hostname": "lighthouse-01",
     "network_id": "<network_record_id>",
     "overlay_ip": "10.128.0.1",
@@ -147,51 +207,68 @@ curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/records \
   }'
 ```
 
-**Result**: 
+**Result:** 
 - Certificate generated and signed by CA
 - Complete Nebula config with `am_lighthouse: true`
 - Config stored in `config_yaml` field
+
+**Expected Log:**
+```
+[15:04:05] 🔐 CERT Generating certificate and config for lighthouse-01...
+[15:04:05] ✅ SUCCESS Generated certificate and config for lighthouse-01
+[15:04:05] ℹ️  INFO Skipping regeneration for lighthouse-01 (initial certificate generation)
+```
 
 ### 4. Create Regular Host
 
 ```bash
 curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/records \
   -H "Content-Type: application/json" \
-  -u "admin@example.com:password" \
+  -u "admin@example.com:adminpassword" \
   -d '{
     "email": "web01@example.com",
-    "password": "secure-password",
+    "password": "secure-password-here",
     "hostname": "web-01",
     "network_id": "<network_record_id>",
     "overlay_ip": "10.128.0.100",
     "groups": ["web"],
     "is_lighthouse": false,
+    "firewall_outbound": [
+      {"port": "any", "proto": "any", "host": "any"}
+    ],
+    "firewall_inbound": [
+      {"port": "any", "proto": "icmp", "host": "any"},
+      {"port": "443", "proto": "tcp", "host": "any"},
+      {"port": "22", "proto": "tcp", "groups": ["admin"]}
+    ],
     "validity_years": 1,
     "active": true
   }'
 ```
 
-**Result**:
-- Certificate generated and signed by CA
+**Result:**
+- Certificate generated with `["web"]` group embedded
 - Config includes lighthouse discovery via `static_host_map`
-- Config stored in `config_yaml` field
+- Firewall rules applied (HTTPS from any, SSH from admin group only)
 
-### 5. Host Downloads Config
+### 5. Host Downloads Configuration
 
 Hosts authenticate and download their configuration:
 
 ```bash
-# Authenticate
-curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/auth-with-password \
+# Authenticate as host
+AUTH_RESPONSE=$(curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/auth-with-password \
   -H "Content-Type: application/json" \
   -d '{
     "identity": "web01@example.com",
-    "password": "secure-password"
-  }'
+    "password": "secure-password-here"
+  }')
 
-# Download config
+AUTH_TOKEN=$(echo $AUTH_RESPONSE | jq -r '.token')
+
+# Download complete config
 curl http://127.0.0.1:8090/api/collections/nebula_hosts/records/<host_id> \
-  -H "Authorization: Bearer <token>" \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
   | jq -r '.config_yaml' > /etc/nebula/config.yml
 ```
 
@@ -204,6 +281,148 @@ tar xzf nebula-linux-amd64.tar.gz
 
 # Start Nebula with downloaded config
 sudo ./nebula -config /etc/nebula/config.yml
+```
+
+## Smart Regeneration
+
+pb-nebula intelligently regenerates certificates and configs based on what changed:
+
+### 🔐 Certificate Regeneration (Expensive)
+
+These fields are **embedded in the certificate** and require regeneration:
+
+| Field Changed | Action | Why |
+|--------------|--------|-----|
+| `groups` | Regenerate certificate + config | Groups are in the certificate |
+| `validity_years` | Regenerate certificate + config | Changes certificate lifetime |
+
+**Log Output:**
+```
+[15:04:05] ℹ️  INFO Groups changed for web-01, regenerating certificate
+[15:04:05] 🔐 CERT Regenerating certificate and config for web-01...
+[15:04:05] ✅ SUCCESS Regenerated certificate and config for web-01
+```
+
+### 📝 Config Regeneration Only (Cheap)
+
+These fields are **only in the config** and don't require certificate regeneration:
+
+| Field Changed | Action | Why |
+|--------------|--------|-----|
+| `is_lighthouse` | Regenerate config only | Config setting |
+| `public_host_port` | Regenerate config only | Config setting |
+| `firewall_outbound` | Regenerate config only | Config setting |
+| `firewall_inbound` | Regenerate config only | Config setting |
+
+**Log Output:**
+```
+[15:04:05] ℹ️  INFO Firewall inbound rules changed for web-01, regenerating config
+[15:04:05] 📝 CONFIG Regenerating config for web-01...
+[15:04:05] ✅ SUCCESS Regenerated config for web-01
+```
+
+### ⏭️ No Regeneration
+
+These fields don't affect certificates or configs:
+
+- `email`, `password` - Auth only
+- `hostname` - Can't change (in certificate)
+- `overlay_ip` - Can't change (in certificate)
+- `active` - Management flag
+
+**Log Output:**
+```
+[15:04:05] ℹ️  INFO No meaningful changes detected for web-01, skipping regeneration
+```
+
+## Firewall Rules
+
+Firewall rules are **host-based** (not network-based) following Nebula's design.
+
+### Default Behavior
+
+If no firewall rules specified:
+
+**Outbound:** Allow all
+```json
+[{"port": "any", "proto": "any", "host": "any"}]
+```
+
+**Inbound:** Allow ICMP only (Nebula recommended)
+```json
+[{"port": "any", "proto": "icmp", "host": "any"}]
+```
+
+This allows ping for troubleshooting while blocking all TCP/UDP by default.
+
+### Nebula Firewall Format
+
+Rules use Nebula's native JSON format:
+
+```json
+{
+  "firewall_inbound": [
+    {
+      "port": "443",
+      "proto": "tcp",
+      "host": "any"
+    },
+    {
+      "port": "22",
+      "proto": "tcp",
+      "groups": ["admin"]
+    },
+    {
+      "port": "5432",
+      "proto": "tcp",
+      "groups": ["app", "web"]
+    }
+  ]
+}
+```
+
+**Fields:**
+- `port`: Port number, range ("80-443"), or "any"
+- `proto`: "tcp", "udp", "icmp", or "any"
+- `host`: "any" or specific IP
+- `groups`: Array of group names (from certificates)
+
+### Example Firewall Configurations
+
+#### Web Server (Public HTTPS)
+```json
+{
+  "firewall_inbound": [
+    {"port": "any", "proto": "icmp", "host": "any"},
+    {"port": "443", "proto": "tcp", "host": "any"},
+    {"port": "80", "proto": "tcp", "host": "any"},
+    {"port": "22", "proto": "tcp", "groups": ["admin"]}
+  ]
+}
+```
+
+#### Database Server (Internal Only)
+```json
+{
+  "firewall_inbound": [
+    {"port": "any", "proto": "icmp", "host": "any"},
+    {"port": "5432", "proto": "tcp", "groups": ["app", "web"]},
+    {"port": "22", "proto": "tcp", "groups": ["admin"]}
+  ]
+}
+```
+
+#### Admin Host (Locked Down)
+```json
+{
+  "firewall_inbound": [
+    {"port": "any", "proto": "icmp", "host": "any"},
+    {"port": "22", "proto": "tcp", "groups": ["admin"]}
+  ],
+  "firewall_outbound": [
+    {"port": "any", "proto": "any", "host": "any"}
+  ]
+}
 ```
 
 ## Configuration Options
@@ -227,15 +446,15 @@ type Options struct {
 }
 ```
 
-### Custom Options Example
+### Custom Configuration Example
 
 ```go
 options := pbnebula.DefaultOptions()
 
-// Customize collection names
-options.CACollectionName = "my_ca"
-options.NetworkCollectionName = "my_networks"
-options.HostCollectionName = "my_hosts"
+// Customize collection names (for multi-tenant)
+options.CACollectionName = "tenant1_ca"
+options.NetworkCollectionName = "tenant1_networks"
+options.HostCollectionName = "tenant1_hosts"
 
 // Customize validity periods
 options.DefaultCAValidityYears = 20
@@ -244,10 +463,11 @@ options.DefaultHostValidityYears = 2
 // Disable logging
 options.LogToConsole = false
 
-// Custom event filter (disable network update regeneration)
+// Custom event filter
 options.EventFilter = func(collectionName, eventType string) bool {
+    // Disable network update regeneration
     if eventType == "network_update" {
-        return false // Don't regenerate all host configs on network updates
+        return false
     }
     return true
 }
@@ -255,39 +475,9 @@ options.EventFilter = func(collectionName, eventType string) bool {
 pbnebula.Setup(app, options)
 ```
 
-## Firewall Rules
-
-Firewall rules are stored in Nebula's native JSON format:
-
-```json
-{
-  "firewall_outbound": [
-    {
-      "port": "any",
-      "proto": "any",
-      "host": "any"
-    }
-  ],
-  "firewall_inbound": [
-    {
-      "port": "22",
-      "proto": "tcp",
-      "groups": ["admin"]
-    },
-    {
-      "port": "80,443",
-      "proto": "tcp",
-      "groups": ["web"]
-    }
-  ]
-}
-```
-
-Rules apply to all hosts in the network. Groups are matched against host's `groups` field.
-
 ## Multi-Tenant Setup
 
-Use custom collection names to run multiple isolated Nebula instances:
+Run multiple isolated Nebula instances with custom collection names:
 
 ```go
 // Tenant 1
@@ -305,6 +495,8 @@ options2.HostCollectionName = "tenant2_hosts"
 pbnebula.Setup(app, options2)
 ```
 
+Each tenant has complete isolation with their own CA, networks, and hosts.
+
 ## API Reference
 
 ### Setup
@@ -314,6 +506,12 @@ func Setup(app *pocketbase.PocketBase, options Options) error
 ```
 
 Main entry point. Initializes pb-nebula with PocketBase application.
+
+**Parameters:**
+- `app`: PocketBase application instance
+- `options`: Configuration options
+
+**Returns:** Error if initialization fails
 
 ### DefaultOptions
 
@@ -340,6 +538,20 @@ const (
 ```
 
 Used with `EventFilter` for custom event handling.
+
+## Logging
+
+pb-nebula provides detailed logging with emoji prefixes for quick status recognition:
+
+```
+[15:04:05] 🚀 START Initializing pb-nebula...
+[15:04:05] ✅ SUCCESS Collections initialized
+[15:04:05] 🔐 CERT Generating certificate for web-01...
+[15:04:05] 📝 CONFIG Regenerating config for web-01...
+[15:04:05] ℹ️  INFO Groups changed for web-01, regenerating certificate
+[15:04:05] ⚠️  WARNING Failed to find hosts in network
+[15:04:05] ❌ ERROR Failed to generate certificate
+```
 
 ## Development
 
@@ -371,12 +583,6 @@ pb-nebula/
         └── logger.go           # Logging utilities
 ```
 
-### Dependencies
-
-- **PocketBase** `v0.31.0+` - Application framework
-- **Nebula cert** `v1.9.5` - Certificate generation (crypto operations)
-- **yaml.v3** - YAML config generation
-
 ### Build from Source
 
 ```bash
@@ -387,7 +593,69 @@ go build ./examples/basic
 ./basic serve
 ```
 
+## Troubleshooting
+
+### Host Creation Slow
+
+**Problem:** Host creation takes > 5 seconds
+
+**Solution:** This was fixed in the latest version with recursion prevention. Upgrade to latest version.
+
+### Certificate Not Regenerating
+
+**Problem:** Updating groups doesn't regenerate certificate
+
+**Check:**
+1. Verify `groups` field is JSON format (not text)
+2. Check logs for regeneration messages
+3. Ensure groups actually changed
+
+### Firewall Rules Not Applying
+
+**Problem:** Custom firewall rules not in generated config
+
+**Check:**
+1. Verify JSON format is valid
+2. Use PocketBase's JSON field type
+3. Check for validation errors in API response
+
+### ICMP Not Working
+
+**Problem:** Can't ping hosts
+
+**Solution:** 
+- Default config now includes ICMP
+- If using custom firewall rules, explicitly add ICMP rule
+- Verify Nebula is running on both hosts
+
+## Security Considerations
+
+### Production Deployment
+
+1. **Protect CA Private Key**
+   - Stored in HIDDEN field (not via API)
+   - Still in database - protect database access
+   - Consider encryption at rest
+
+2. **Use HTTPS**
+   - Always serve PocketBase behind HTTPS in production
+   - Protects credentials and certificates in transit
+
+3. **Backup Regularly**
+   - CA private key cannot be regenerated
+   - Loss of CA = regenerate all certificates
+   - Backup `pb_data/data.db` regularly
+
+4. **Rotate Certificates**
+   - Plan for certificate renewal before expiration
+   - Default 1 year for hosts provides good balance
+   - Monitor expiration dates
+
+5. **Network Isolation**
+   - Use separate networks for different security zones
+   - Apply firewall rules based on certificate groups
+   - Follow principle of least privilege
+
 ## License
 
 MIT License - See LICENSE file for details
-

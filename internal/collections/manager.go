@@ -328,9 +328,9 @@ func (cm *Manager) createHostsCollection() error {
 		Required: true,
 		Max:      50,
 	})
-	collection.Fields.Add(&core.TextField{
-		Name: "groups",
-		Max:  1000,
+	collection.Fields.Add(&core.JSONField{
+		Name:     "groups",
+		MaxSize:  1000,
 	})
 	collection.Fields.Add(&core.BoolField{
 		Name: "is_lighthouse",
@@ -359,13 +359,13 @@ func (cm *Manager) createHostsCollection() error {
 	})
 
 	// Add host-specific firewall rules (Nebula native JSON format)
-	collection.Fields.Add(&core.TextField{
-		Name: "firewall_outbound",
-		Max:  10000,
+	collection.Fields.Add(&core.JSONField{
+		Name:    "firewall_outbound",
+		MaxSize: 10000,
 	})
-	collection.Fields.Add(&core.TextField{
-		Name: "firewall_inbound",
-		Max:  10000,
+	collection.Fields.Add(&core.JSONField{
+		Name:    "firewall_inbound",
+		MaxSize: 10000,
 	})
 
 	// Add validity fields

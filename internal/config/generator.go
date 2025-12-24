@@ -43,7 +43,9 @@ func NewGenerator() *Generator {
 // FIREWALL RULES (HOST-BASED):
 // Each host defines its own firewall rules stored in the host record.
 // Rules use Nebula's native format and reference GROUPS from certificates.
-// Default behavior is DENY-ALL if no rules are specified.
+// Default behavior follows Nebula recommendations:
+// - Outbound: Allow all
+// - Inbound: Allow ICMP from any (essential for troubleshooting)
 //
 // PARAMETERS:
 //   - host: Host record with certificates and firewall rules
@@ -61,15 +63,16 @@ func (g *Generator) GenerateHostConfig(host *types.HostRecord, lighthouses []typ
 		return "", fmt.Errorf("failed to parse firewall rules: %w", err)
 	}
 
-	// If no rules specified, use sensible defaults (allow outbound, deny inbound)
+	// If no rules specified, use Nebula recommended defaults
 	if len(outbound) == 0 {
 		outbound = []map[string]interface{}{
 			{"port": "any", "proto": "any", "host": "any"},
 		}
 	}
 	if len(inbound) == 0 {
+		// Nebula recommended default: Allow ICMP for troubleshooting
 		inbound = []map[string]interface{}{
-			// Default deny-all (empty array means deny everything)
+			{"port": "any", "proto": "icmp", "host": "any"},
 		}
 	}
 
