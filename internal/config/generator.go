@@ -1,156 +1,198 @@
+// Package config provides Nebula configuration generation
 package config
 
 import (
-	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
-	"text/template"
 
-	pbtypes "github.com/skeeeon/pb-nebula/internal/types"
+	"gopkg.in/yaml.v3"
+	"github.com/skeeeon/pb-nebula/internal/types"
 )
 
-// GenerateConfig creates the Nebula YAML config string
-func GenerateConfig(
-	node *pbtypes.NodeRecord,
-	authority *pbtypes.AuthorityRecord,
-	lighthouses []*pbtypes.NodeRecord,
-	rules []*pbtypes.RuleRecord,
-	groupMap map[string]string, // ID -> Name map
-) (string, error) {
-
-	type tplData struct {
-		IsLighthouse bool
-		Port         int
-		Lighthouses  []string
-		StaticMap    map[string][]string
-		Rules        []*pbtypes.RuleRecord
-		GroupMap     map[string]string
-		TunName      string
-	}
-
-	// 1. Prepare Static Host Map
-	staticMap := make(map[string][]string)
-	var lhIPs []string
-
-	for _, lh := range lighthouses {
-		// Skip self if we are a lighthouse
-		if lh.ID == node.ID {
-			continue
-		}
-		// If lighthouse has static IPs (public internet IPs), map them to its Overlay IP
-		if len(lh.StaticIPs) > 0 {
-			staticMap[lh.IPAddress] = lh.StaticIPs
-			lhIPs = append(lhIPs, lh.IPAddress)
-		}
-	}
-
-	data := tplData{
-		IsLighthouse: node.IsLighthouse,
-		Port:         authority.Port,
-		Lighthouses:  lhIPs,
-		StaticMap:    staticMap,
-		Rules:        rules,
-		GroupMap:     groupMap,
-		TunName:      "nebula0",
-	}
-
-	// 2. Parse Template
-	tmpl, err := template.New("nebula").Parse(configTemplate)
-	if err != nil {
-		return "", err
-	}
-
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, data); err != nil {
-		return "", err
-	}
-
-	return buf.String(), nil
+// Generator handles generating complete Nebula YAML configurations.
+// This component builds production-ready Nebula configs with sensible defaults.
+//
+// CONFIGURATION STRATEGY:
+// - Use Nebula recommended defaults for all optional settings
+// - Build PKI section from certificates
+// - Configure lighthouse discovery appropriately
+// - Apply firewall rules from network configuration
+// - Keep it simple - no clever optimizations
+type Generator struct {
+	// Stateless - no fields needed
 }
 
-// Basic template - can be expanded later
-const configTemplate = `
-pki:
-  ca: /etc/nebula/ca.crt
-  cert: /etc/nebula/host.crt
-  key: /etc/nebula/host.key
+// NewGenerator creates a new config generator.
+//
+// RETURNS:
+// - Generator instance ready for config generation
+func NewGenerator() *Generator {
+	return &Generator{}
+}
 
-static_host_map:
-{{- range $overlay, $publics := .StaticMap }}
-  "{{ $overlay }}": {{ range $publics }}["{{ . }}"]{{ end }}
-{{- end }}
+// GenerateHostConfig generates a complete Nebula YAML configuration for a host.
+// The generated config includes PKI, lighthouse discovery, firewall rules, and all
+// necessary Nebula settings with recommended defaults.
+//
+// LIGHTHOUSE BEHAVIOR:
+// - Lighthouse hosts: am_lighthouse=true, no static_host_map
+// - Regular hosts: am_lighthouse=false, static_host_map with lighthouse IPs
+//
+// FIREWALL RULES:
+// Network-level rules are applied to all hosts in the network.
+// Rules use Nebula's native format without modification.
+//
+// PARAMETERS:
+//   - host: Host record with certificates and configuration
+//   - network: Network record with firewall rules
+//   - lighthouses: List of lighthouse hosts in this network
+//
+// RETURNS:
+// - string: Complete Nebula YAML configuration ready to use
+// - error if config generation fails
+//
+// SIDE EFFECTS: None (pure generation)
+func (g *Generator) GenerateHostConfig(host *types.HostRecord, network *types.NetworkRecord, lighthouses []types.LighthouseInfo) (string, error) {
+	// Parse firewall rules from network
+	outbound, inbound, err := network.GetFirewallRules()
+	if err != nil {
+		return "", fmt.Errorf("failed to parse firewall rules: %w", err)
+	}
 
-lighthouse:
-  am_lighthouse: {{ .IsLighthouse }}
-  interval: 60
-  hosts:
-    {{- range .Lighthouses }}
-    - "{{ . }}"
-    {{- end }}
+	// Build config structure
+	config := map[string]interface{}{
+		"pki": map[string]interface{}{
+			"ca":   host.CACertificate,
+			"cert": host.Certificate,
+			"key":  host.PrivateKey,
+		},
+		"static_host_map": g.buildStaticHostMap(lighthouses, host.IsLighthouse),
+		"lighthouse":      g.buildLighthouseConfig(lighthouses, host.IsLighthouse),
+		"listen": map[string]interface{}{
+			"host": "0.0.0.0",
+			"port": g.extractPort(host.PublicHostPort, host.IsLighthouse),
+		},
+		"punchy": map[string]interface{}{
+			"punch": true,
+			"respond": true,
+		},
+		"tun": map[string]interface{}{
+			"disabled":              false,
+			"dev":                   "nebula1",
+			"drop_local_broadcast":  false,
+			"drop_multicast":        false,
+			"tx_queue":              500,
+			"mtu":                   1300,
+		},
+		"logging": map[string]interface{}{
+			"level":  "info",
+			"format": "text",
+		},
+		"firewall": map[string]interface{}{
+			"outbound": outbound,
+			"inbound":  inbound,
+		},
+	}
 
-listen:
-  host: 0.0.0.0
-  port: {{ .Port }}
+	// Marshal to YAML
+	yamlBytes, err := yaml.Marshal(config)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal config to YAML: %w", err)
+	}
 
-tun:
-  disabled: false
-  dev: {{ .TunName }}
-  drop_local_broadcast: false
-  drop_multicast: false
-  tx_queue: 500
-  mtu: 1300
+	return string(yamlBytes), nil
+}
 
-logging:
-  level: info
-  format: text
+// buildStaticHostMap creates the static_host_map section for lighthouse discovery.
+// This tells Nebula where to find lighthouses via their public IPs.
+//
+// LIGHTHOUSE LOGIC:
+// - Lighthouse hosts don't need static_host_map (they are the discovery points)
+// - Regular hosts need static_host_map entries for all lighthouses
+//
+// PARAMETERS:
+//   - lighthouses: List of lighthouses in the network
+//   - isLighthouse: True if this host is a lighthouse
+//
+// RETURNS:
+// - map[string][]string: Static host map (overlay IP -> public endpoints)
+// - nil if this host is a lighthouse
+func (g *Generator) buildStaticHostMap(lighthouses []types.LighthouseInfo, isLighthouse bool) map[string][]string {
+	if isLighthouse {
+		return nil // Lighthouses don't need static host map
+	}
 
-firewall:
-  conntrack:
-    tcp_timeout: 12m
-    udp_timeout: 3m
-    default_timeout: 10m
+	hostMap := make(map[string][]string)
+	for _, lh := range lighthouses {
+		hostMap[lh.OverlayIP] = []string{lh.PublicHostPort}
+	}
+	return hostMap
+}
 
-  {{- if .Rules }}
-  outbound:
-    {{- range .Rules }}
-    {{- if eq .Direction "outbound" }}
-    - port: {{ .Port }}
-      proto: {{ .Proto }}
-      {{- if .DestGroups }}
-      groups:
-        {{- range .DestGroups }}
-        - "{{ index $.GroupMap . }}"
-        {{- end }}
-      {{- else }}
-      host: any
-      {{- end }}
-    {{- end }}
-    {{- end }}
+// buildLighthouseConfig creates the lighthouse section for discovery configuration.
+// This configures whether this host is a lighthouse and which lighthouses to use.
+//
+// LIGHTHOUSE CONFIGURATION:
+// - Lighthouse hosts: am_lighthouse=true
+// - Regular hosts: am_lighthouse=false, list of lighthouse overlay IPs, interval=60
+//
+// PARAMETERS:
+//   - lighthouses: List of lighthouses in the network
+//   - isLighthouse: True if this host is a lighthouse
+//
+// RETURNS:
+// - map[string]interface{}: Lighthouse configuration section
+func (g *Generator) buildLighthouseConfig(lighthouses []types.LighthouseInfo, isLighthouse bool) map[string]interface{} {
+	if isLighthouse {
+		return map[string]interface{}{
+			"am_lighthouse": true,
+		}
+	}
 
-  inbound:
-    {{- range .Rules }}
-    {{- if eq .Direction "inbound" }}
-    - port: {{ .Port }}
-      proto: {{ .Proto }}
-      {{- if .SourceGroups }}
-      groups:
-        {{- range .SourceGroups }}
-        - "{{ index $.GroupMap . }}"
-        {{- end }}
-      {{- else }}
-      host: any
-      {{- end }}
-    {{- end }}
-    {{- end }}
-  {{- else }}
-  # Default permissive if no rules (Dev mode)
-  outbound:
-    - port: any
-      proto: any
-      host: any
-  inbound:
-    - port: any
-      proto: any
-      host: any
-  {{- end }}
-`
+	// Extract lighthouse overlay IPs
+	hosts := make([]string, len(lighthouses))
+	for i, lh := range lighthouses {
+		hosts[i] = lh.OverlayIP
+	}
+
+	return map[string]interface{}{
+		"am_lighthouse": false,
+		"interval":      60,
+		"hosts":         hosts,
+	}
+}
+
+// extractPort extracts the port number from a "IP:PORT" string.
+// Returns 0 if the host is not a lighthouse (no listening needed).
+//
+// LIGHTHOUSE PORT:
+// Lighthouses listen on a specific port for discovery requests.
+// Regular hosts typically use port 0 (random ephemeral port).
+//
+// PARAMETERS:
+//   - publicHostPort: Public IP:PORT string (e.g., "1.2.3.4:4242")
+//   - isLighthouse: True if this host is a lighthouse
+//
+// RETURNS:
+// - int: Port number, or 0 if not a lighthouse
+func (g *Generator) extractPort(publicHostPort string, isLighthouse bool) int {
+	if !isLighthouse || publicHostPort == "" {
+		return 0
+	}
+
+	// Split on last colon to handle IPv6 addresses
+	parts := strings.Split(publicHostPort, ":")
+	if len(parts) < 2 {
+		return 0
+	}
+
+	// Get last part (port)
+	portStr := parts[len(parts)-1]
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0
+	}
+
+	return port
+}
