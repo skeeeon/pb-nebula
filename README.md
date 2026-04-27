@@ -36,6 +36,7 @@ pb-nebula transforms PocketBase into a complete Nebula overlay network managemen
 - ✅ **PocketBase Auth** - Email/password authentication for hosts
 - ✅ **Self-Service** - Hosts can only access their own records
 - ✅ **Hidden Keys** - CA private key hidden from API
+- ✅ **At-Rest Encryption** - Optional AES-256-GCM encryption of CA + host private keys
 - ✅ **JSON Validation** - Invalid firewall rules rejected immediately
 
 ## Installation
@@ -443,6 +444,9 @@ type Options struct {
 
     // Optional event filter
     EventFilter func(collectionName, eventType string) bool
+
+    // Optional at-rest encryption key (32 chars). Empty = disabled.
+    EncryptionKey string
 }
 ```
 
@@ -474,6 +478,58 @@ options.EventFilter = func(collectionName, eventType string) bool {
 
 pbnebula.Setup(app, options)
 ```
+
+## At-Rest Encryption
+
+pb-nebula can encrypt sensitive private keys at rest using AES-256-GCM. When enabled, the CA `private_key` and each host `private_key` column are stored encrypted in the database.
+
+### Enabling
+
+Provide a 32-character key via `Options.EncryptionKey`. Validation rejects any other length at setup time.
+
+```go
+options := pbnebula.DefaultOptions()
+
+// 32-character key — load from env, secret manager, etc. Do NOT hardcode.
+options.EncryptionKey = os.Getenv("PB_NEBULA_ENCRYPTION_KEY")
+
+if err := pbnebula.Setup(app, options); err != nil {
+    log.Fatal(err)
+}
+```
+
+On startup the log line confirms the mode:
+
+```
+[15:04:05] ℹ️  INFO At-rest encryption: enabled (CA + host private_key)
+```
+
+### What is encrypted
+
+| Field | Encrypted? |
+|-------|-----------|
+| `nebula_ca.private_key` | ✅ Yes |
+| `nebula_hosts.private_key` | ✅ Yes |
+| `nebula_ca.certificate` | ❌ No (public) |
+| `nebula_hosts.certificate` | ❌ No (public) |
+| `nebula_hosts.ca_certificate` | ❌ No (public) |
+| `nebula_hosts.config_yaml` | ❌ No — see limitation below |
+
+### Limitation: `config_yaml` is plaintext
+
+The generated `config_yaml` field embeds the host's private key inline because Nebula's `pki.key` block requires it. That field stays plaintext at rest so hosts can download it directly via the standard PocketBase API. **Encryption protects the standalone `private_key` column, not the same key as embedded inside the YAML.**
+
+If your threat model requires the YAML itself to be encrypted at rest, you'd need to add a custom download route that encrypts on store and decrypts on read — out of scope for the default flow.
+
+### Backward compatibility
+
+Encrypted values are tagged with an `enc::` prefix. Records written before encryption was enabled (no prefix) continue to read transparently — turning the key on does not break existing data, and existing records will be re-encrypted the next time they're regenerated (e.g., on a `groups` or `validity_years` change).
+
+### Operational warnings
+
+- **Loss of the encryption key = loss of the CA private key.** Without the CA key you cannot sign new host certificates and must regenerate the entire CA. Treat the key like the CA itself: back it up, rotate carefully, never commit it.
+- **Rotation is not automatic.** Changing `EncryptionKey` will leave already-encrypted columns unreadable. Plan a re-encryption migration before swapping keys.
+- **Use a strong key.** 32 random bytes (e.g., `openssl rand -base64 24` truncated to 32 chars, or `head -c 32 /dev/urandom | base64 | head -c 32`).
 
 ## Multi-Tenant Setup
 
@@ -634,8 +690,9 @@ go build ./examples/basic
 
 1. **Protect CA Private Key**
    - Stored in HIDDEN field (not via API)
-   - Still in database - protect database access
-   - Consider encryption at rest
+   - Still in database — protect database access
+   - Enable [at-rest encryption](#at-rest-encryption) via `Options.EncryptionKey` for an additional layer
+   - Note: `config_yaml` embeds host private keys inline and remains plaintext at rest
 
 2. **Use HTTPS**
    - Always serve PocketBase behind HTTPS in production
