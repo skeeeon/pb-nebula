@@ -163,6 +163,11 @@ func initializeComponents(app *pocketbase.PocketBase, options Options) error {
 		options.HostCollectionName)
 	logger.Info("Default CA validity: %d years", options.DefaultCAValidityYears)
 	logger.Info("Default host validity: %d years", options.DefaultHostValidityYears)
+	if options.EncryptionKey != "" {
+		logger.Info("At-rest encryption: enabled (CA + host private_key)")
+	} else {
+		logger.Info("At-rest encryption: disabled")
+	}
 
 	return nil
 }
@@ -212,6 +217,11 @@ func validateOptions(options Options) error {
 	if options.DefaultHostValidityYears > options.DefaultCAValidityYears {
 		return fmt.Errorf("DefaultHostValidityYears (%d) cannot exceed DefaultCAValidityYears (%d)",
 			options.DefaultHostValidityYears, options.DefaultCAValidityYears)
+	}
+
+	// Validate encryption key length (AES-256 requires a 32-byte key)
+	if options.EncryptionKey != "" && len(options.EncryptionKey) != 32 {
+		return fmt.Errorf("encryption key must be exactly 32 characters, got %d", len(options.EncryptionKey))
 	}
 
 	return nil

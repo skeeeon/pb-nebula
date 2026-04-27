@@ -409,6 +409,7 @@ func (sm *Manager) setupHostHooks() {
 }
 
 // generateCA generates CA certificate and updates the record.
+// The CA private_key is encrypted at rest if Options.EncryptionKey is set.
 func (sm *Manager) generateCA(record *core.Record) error {
 	name := record.GetString("name")
 	validityYears := record.GetInt("validity_years")
@@ -422,7 +423,9 @@ func (sm *Manager) generateCA(record *core.Record) error {
 	}
 
 	record.Set("certificate", result.CertificatePEM)
-	record.Set("private_key", result.PrivateKeyPEM)
+	if err := types.EncryptAndSet(record, "private_key", result.PrivateKeyPEM, sm.options.EncryptionKey); err != nil {
+		return err
+	}
 	record.Set("expires_at", result.ExpiresAt)
 	record.Set("curve", "CURVE25519")
 	if validityYears > 0 {
@@ -433,6 +436,13 @@ func (sm *Manager) generateCA(record *core.Record) error {
 }
 
 // generateHostCertAndConfig generates host certificate and config, updating the record.
+// The CA private key is decrypted on read; the host private_key is encrypted before
+// it is written back to the record.
+//
+// ORDERING NOTE:
+// The host private key is set as plaintext temporarily so generateHostConfig can read
+// it via recordToHostModel and embed it into config_yaml. It is encrypted on the
+// record afterwards, before the caller saves.
 func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 	// Get network and CA
 	network, err := sm.app.FindRecordById(sm.options.NetworkCollectionName, record.GetString("network_id"))
@@ -443,6 +453,12 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 	ca, err := sm.app.FindRecordById(sm.options.CACollectionName, network.GetString("ca_id"))
 	if err != nil {
 		return fmt.Errorf("CA not found: %w", err)
+	}
+
+	// Decrypt CA private key for signing (no-op if encryption disabled or already plaintext)
+	caPrivateKeyPEM, err := types.DecryptField(ca.GetString("private_key"), sm.options.EncryptionKey)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt CA private key: %w", err)
 	}
 
 	// Parse groups from JSON
@@ -467,14 +483,16 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 		Groups:          groups,
 		ValidityYears:   validityYears,
 		CACertPEM:       ca.GetString("certificate"),
-		CAPrivateKeyPEM: ca.GetString("private_key"),
+		CAPrivateKeyPEM: caPrivateKeyPEM,
 		CAExpiresAt:     ca.GetDateTime("expires_at").Time(),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to generate host certificate: %w", err)
 	}
 
-	// Store certificate and CA cert (denormalized)
+	// Store certificate and CA cert (denormalized).
+	// Set private_key as plaintext temporarily so generateHostConfig can embed it
+	// into config_yaml; we encrypt it on the record at the end of this function.
 	record.Set("certificate", certResult.CertificatePEM)
 	record.Set("private_key", certResult.PrivateKeyPEM)
 	record.Set("ca_certificate", ca.GetString("certificate"))
@@ -483,8 +501,17 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 		record.Set("validity_years", validityYears)
 	}
 
-	// Generate config
-	return sm.generateHostConfig(record)
+	// Generate config (reads plaintext private_key from in-memory record)
+	if err := sm.generateHostConfig(record); err != nil {
+		return err
+	}
+
+	// Encrypt private_key for at-rest storage
+	if err := types.EncryptAndSet(record, "private_key", certResult.PrivateKeyPEM, sm.options.EncryptionKey); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // generateHostConfig generates Nebula config for a host and updates the record.
@@ -541,8 +568,16 @@ func (sm *Manager) shouldHandleEvent(collectionName, eventType string) bool {
 	return true
 }
 
-// Helper: Convert PocketBase record to host model
+// Helper: Convert PocketBase record to host model.
+// Decrypts private_key transparently — DecryptField is a no-op on plaintext or
+// when encryption is disabled, so this is safe regardless of mode.
 func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
+	privateKey, err := types.DecryptField(record.GetString("private_key"), sm.options.EncryptionKey)
+	if err != nil {
+		sm.logger.Warning("Failed to decrypt private_key for host %s: %v", record.Id, err)
+		privateKey = record.GetString("private_key")
+	}
+
 	return &types.HostRecord{
 		ID:               record.Id,
 		Hostname:         record.GetString("hostname"),
@@ -551,7 +586,7 @@ func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
 		IsLighthouse:     record.GetBool("is_lighthouse"),
 		PublicHostPort:   record.GetString("public_host_port"),
 		Certificate:      record.GetString("certificate"),
-		PrivateKey:       record.GetString("private_key"),
+		PrivateKey:       privateKey,
 		CACertificate:    record.GetString("ca_certificate"),
 		ConfigYAML:       record.GetString("config_yaml"),
 		FirewallOutbound: record.GetString("firewall_outbound"),

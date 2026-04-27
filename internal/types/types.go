@@ -140,6 +140,17 @@ type Options struct {
 	// Event filtering (optional custom logic)
 	// Return true to process event, false to ignore
 	EventFilter func(collectionName, eventType string) bool
+
+	// EncryptionKey enables AES-256-GCM at-rest encryption of the CA and host
+	// private_key fields when set. Must be exactly 32 characters. Empty string
+	// disables encryption (plaintext storage). Stored values are tagged with an
+	// "enc::" prefix; legacy unencrypted values continue to read transparently.
+	//
+	// LIMITATION:
+	// The generated config_yaml field contains the host's private key inline
+	// (Nebula's PKI block requires it) and is stored plaintext. Encryption only
+	// protects the standalone private_key column.
+	EncryptionKey string
 }
 
 // Collection names with nebula_ prefix for clear identification
