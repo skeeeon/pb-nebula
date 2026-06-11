@@ -63,18 +63,18 @@ func (m *Manager) ValidateNetworkCIDR(cidr string) error {
 	// Use net.ParseCIDR for comprehensive validation
 	ip, network, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return fmt.Errorf("invalid CIDR format: %w", err)
+		return fmt.Errorf("%w: %v", types.ErrInvalidCIDR, err)
 	}
 
 	// Ensure IPv4 only
 	if ip.To4() == nil {
-		return fmt.Errorf("only IPv4 networks supported, got %s", cidr)
+		return fmt.Errorf("%w: got %s", types.ErrIPv6NotSupported, cidr)
 	}
 
 	// Verify the CIDR represents a network (not a host)
 	// Network address should match the base address
 	if !ip.Equal(network.IP) {
-		return fmt.Errorf("CIDR %s is not a valid network address (should be %s)", cidr, network.String())
+		return fmt.Errorf("%w: %s is not a valid network address (should be %s)", types.ErrInvalidCIDR, cidr, network.String())
 	}
 
 	return nil
@@ -101,29 +101,29 @@ func (m *Manager) ValidateHostIP(hostIP, networkID string) error {
 	// Get network record using configured collection name
 	network, err := m.app.FindRecordById(m.options.NetworkCollectionName, networkID)
 	if err != nil {
-		return fmt.Errorf("network not found: %w", err)
+		return fmt.Errorf("%w: %v", types.ErrNetworkNotFound, err)
 	}
 
 	// Parse network CIDR
 	_, networkCIDR, err := net.ParseCIDR(network.GetString("cidr_range"))
 	if err != nil {
-		return fmt.Errorf("invalid network CIDR: %w", err)
+		return fmt.Errorf("%w: network has invalid CIDR: %v", types.ErrInvalidCIDR, err)
 	}
 
 	// Parse host IP
 	ip := net.ParseIP(hostIP)
 	if ip == nil {
-		return fmt.Errorf("invalid IP address: %s", hostIP)
+		return fmt.Errorf("%w: %s", types.ErrInvalidIP, hostIP)
 	}
 
 	// Ensure IPv4
 	if ip.To4() == nil {
-		return fmt.Errorf("only IPv4 addresses supported, got %s", hostIP)
+		return fmt.Errorf("%w: only IPv4 addresses supported, got %s", types.ErrIPv6NotSupported, hostIP)
 	}
 
 	// Check if IP is within network
 	if !networkCIDR.Contains(ip) {
-		return fmt.Errorf("IP %s is not within network CIDR %s", hostIP, networkCIDR)
+		return fmt.Errorf("%w: IP %s not in %s", types.ErrIPNotInNetwork, hostIP, networkCIDR)
 	}
 
 	return nil
@@ -142,7 +142,7 @@ func (m *Manager) ValidateHostIP(hostIP, networkID string) error {
 func (m *Manager) ValidateCIDRFormat(cidr string) error {
 	_, _, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return fmt.Errorf("invalid CIDR format: %w", err)
+		return fmt.Errorf("%w: %v", types.ErrInvalidCIDR, err)
 	}
 	return nil
 }
@@ -160,7 +160,7 @@ func (m *Manager) ValidateCIDRFormat(cidr string) error {
 func (m *Manager) ValidateIPFormat(ip string) error {
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
-		return fmt.Errorf("invalid IP format: %s", ip)
+		return fmt.Errorf("%w: %s", types.ErrInvalidIP, ip)
 	}
 	return nil
 }

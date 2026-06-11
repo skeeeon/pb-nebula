@@ -84,7 +84,7 @@ Access the admin UI at `http://127.0.0.1:8090/_/`
 
 ```
 PocketBase Collections
-├── nebula_ca           Root CA (admin only, single record)
+├── nebula_ca           CA certificates (admin only, multi-CA supported)
 ├── nebula_networks     Network definitions with CIDR ranges
 └── nebula_hosts        Auth collection with certificates & configs
 
@@ -92,15 +92,17 @@ Automatic Workflow
 ├── Create CA → Certificate auto-generated
 ├── Create Network → CIDR validated
 ├── Create Host → Certificate + Config auto-generated
-├── Update Groups → Certificate regenerated (embedded in cert)
+├── Update Groups/IP/Hostname → Certificate regenerated (embedded in cert)
 ├── Update Firewall → Config regenerated (not in cert)
-└── Update Network → All host configs regenerated
+├── Update Lighthouse → Peer host configs regenerated
+└── Update Network CIDR → All host configs regenerated
 ```
 
 ### Data Model
 
 #### `nebula_ca` (Base Collection)
-Single CA certificate authority per deployment.
+Certificate authorities. Multiple CAs are supported — each CA roots its own
+independent mesh and can serve multiple networks.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -124,6 +126,9 @@ Network definitions for tenant isolation.
 | ca_id | relation | Link to nebula_ca |
 | active | bool | Enable/disable network |
 
+**Uniqueness:** Network `name` and `cidr_range` are unique per CA — the same
+name or CIDR can exist under different CAs (separate meshes).
+
 **Note:** Firewall rules are HOST-BASED, not network-based (Nebula design).
 
 #### `nebula_hosts` (Auth Collection)
@@ -133,7 +138,7 @@ Host configurations with PocketBase authentication.
 |-------|------|-------------|
 | email | text | PocketBase auth email |
 | password | text | PocketBase auth password |
-| hostname | text | Nebula hostname (unique) |
+| hostname | text | Nebula hostname (unique per network) |
 | network_id | relation | Link to nebula_networks |
 | overlay_ip | text | Overlay IP (e.g., "10.128.0.100") |
 | groups | json | Array of group names (embedded in cert) |
@@ -153,12 +158,20 @@ Host configurations with PocketBase authentication.
 
 ## Usage Guide
 
+Admin requests authenticate with a superuser token:
+
+```bash
+ADMIN_TOKEN=$(curl -s -X POST http://127.0.0.1:8090/api/collections/_superusers/auth-with-password \
+  -H "Content-Type: application/json" \
+  -d '{"identity":"admin@example.com","password":"adminpassword"}' | jq -r .token)
+```
+
 ### 1. Create Certificate Authority
 
 ```bash
 curl -X POST http://127.0.0.1:8090/api/collections/nebula_ca/records \
   -H "Content-Type: application/json" \
-  -u "admin@example.com:adminpassword" \
+  -H "Authorization: $ADMIN_TOKEN" \
   -d '{
     "name": "my-org-ca",
     "validity_years": 10
@@ -178,7 +191,7 @@ curl -X POST http://127.0.0.1:8090/api/collections/nebula_ca/records \
 ```bash
 curl -X POST http://127.0.0.1:8090/api/collections/nebula_networks/records \
   -H "Content-Type: application/json" \
-  -u "admin@example.com:adminpassword" \
+  -H "Authorization: $ADMIN_TOKEN" \
   -d '{
     "name": "production",
     "cidr_range": "10.128.0.0/16",
@@ -193,7 +206,7 @@ curl -X POST http://127.0.0.1:8090/api/collections/nebula_networks/records \
 ```bash
 curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/records \
   -H "Content-Type: application/json" \
-  -u "admin@example.com:adminpassword" \
+  -H "Authorization: $ADMIN_TOKEN" \
   -d '{
     "email": "lighthouse@example.com",
     "password": "secure-password-here",
@@ -225,7 +238,7 @@ curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/records \
 ```bash
 curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/records \
   -H "Content-Type: application/json" \
-  -u "admin@example.com:adminpassword" \
+  -H "Authorization: $ADMIN_TOKEN" \
   -d '{
     "email": "web01@example.com",
     "password": "secure-password-here",

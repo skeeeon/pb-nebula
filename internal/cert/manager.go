@@ -50,14 +50,15 @@ type HostCertResult struct {
 }
 
 // HostCertParams contains all parameters needed to generate a host certificate.
+// The host certificate's expiration is clamped to the CA certificate's own
+// NotAfter (parsed from CACertPEM), so the host cert can never outlive its CA.
 type HostCertParams struct {
-	Hostname        string    // Host name for certificate
-	OverlayIP       string    // Overlay IP address (e.g., "10.128.0.100")
-	Groups          []string  // Groups for firewall rules
-	ValidityYears   int       // Certificate validity period
-	CACertPEM       string    // CA certificate PEM (for signing)
-	CAPrivateKeyPEM string    // CA private key PEM (for signing)
-	CAExpiresAt     time.Time // CA expiration (host cert cannot outlive CA)
+	Hostname        string   // Host name for certificate
+	OverlayIP       string   // Overlay IP address (e.g., "10.128.0.100")
+	Groups          []string // Groups for firewall rules
+	ValidityYears   int      // Certificate validity period
+	CACertPEM       string   // CA certificate PEM (for signing)
+	CAPrivateKeyPEM string   // CA private key PEM (for signing)
 }
 
 // GenerateCA creates a new self-signed Nebula CA certificate.
@@ -143,8 +144,12 @@ func (m *Manager) GenerateCA(name string, validityYears int) (*CAResult, error) 
 // VALIDITY CONSTRAINT:
 // Host certificate expiration is the minimum of:
 // - Requested validity period
-// - CA expiration date
-// This ensures host certificates don't outlive their signing CA.
+// - The CA certificate's NotAfter (parsed from the CA cert itself)
+// This ensures host certificates don't outlive their signing CA. The bound
+// must come from the parsed certificate, not an externally stored timestamp:
+// cert NotAfter has whole-second precision, so a stored expiry with sub-second
+// precision can land fractionally after the real NotAfter and the signing
+// library would reject the host certificate.
 //
 // PARAMETERS:
 //   - params: All parameters needed for host certificate generation
@@ -182,13 +187,13 @@ func (m *Manager) GenerateHostCert(params HostCertParams) (*HostCertResult, erro
 	// Create /32 prefix from IP (single host)
 	overlayPrefix := netip.PrefixFrom(addr, addr.BitLen())
 
-	// Calculate expiration - min of requested or CA expiration
+	// Calculate expiration - min of requested or the CA cert's own NotAfter
 	notBefore := time.Now()
 	requestedExpiry := notBefore.AddDate(params.ValidityYears, 0, 0)
 
 	expiresAt := requestedExpiry
-	if requestedExpiry.After(params.CAExpiresAt) {
-		expiresAt = params.CAExpiresAt
+	if caNotAfter := caCert.NotAfter(); requestedExpiry.After(caNotAfter) {
+		expiresAt = caNotAfter
 	}
 
 	// Create TBSCertificate for host

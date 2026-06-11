@@ -4,6 +4,7 @@ package sync
 import (
 	"encoding/json"
 	"fmt"
+	stdsync "sync"
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase"
@@ -19,20 +20,43 @@ import (
 // and Nebula certificate/config generation.
 //
 // SYNCHRONIZATION STRATEGY:
-// - PocketBase Record Change → Certificate Generation → Config Generation
-// - Automatic generation on create/update
-// - Network updates trigger regeneration of all host configs
+//   - PocketBase Record Change → Certificate Generation → Config Generation
+//   - Automatic generation on create/update
+//   - Network CIDR changes trigger regeneration of all host configs
+//   - Lighthouse changes trigger regeneration of peer host configs (their
+//     static_host_map and lighthouse sections embed lighthouse data)
 //
 // RECURSION PREVENTION:
-// - Skip update hooks triggered by our own saves during creation
-// - Only regenerate configs when meaningful fields change
+// Saves issued by pb-nebula itself (cert/config regeneration, peer fan-out)
+// re-fire the update hooks, and e.Record.Original() inside those re-fired
+// hooks still holds the PRE-REQUEST snapshot — so any field-diff check that
+// triggered once would trigger again on the re-entry, looping forever. All
+// internal writes therefore go through saveInternal, which marks the record
+// ID in internalSaves; the update hook skips events for marked records.
 type Manager struct {
-	app         *pocketbase.PocketBase // PocketBase application instance
-	certManager *cert.Manager          // Certificate generation service
-	configGen   *config.Generator      // Config generation service
-	ipamManager *ipam.Manager          // IP validation service
-	options     types.Options          // Configuration options
-	logger      *utils.Logger          // Logger for consistent output
+	app           *pocketbase.PocketBase // PocketBase application instance
+	certManager   *cert.Manager          // Certificate generation service
+	configGen     *config.Generator      // Config generation service
+	ipamManager   *ipam.Manager          // IP validation service
+	options       types.Options          // Configuration options
+	logger        *utils.Logger          // Logger for consistent output
+	internalSaves stdsync.Map            // record IDs currently being saved by pb-nebula itself
+}
+
+// saveInternal saves a record while marking it as a pb-nebula-initiated write,
+// so the update hooks it re-fires are skipped (see RECURSION PREVENTION on
+// Manager). PocketBase hooks run synchronously within Save, so the mark is
+// guaranteed to still be set when the nested hook executes.
+func (sm *Manager) saveInternal(record *core.Record) error {
+	sm.internalSaves.Store(record.Id, struct{}{})
+	defer sm.internalSaves.Delete(record.Id)
+	return sm.app.Save(record)
+}
+
+// isInternalSave reports whether an event was triggered by saveInternal.
+func (sm *Manager) isInternalSave(record *core.Record) bool {
+	_, ok := sm.internalSaves.Load(record.Id)
+	return ok
 }
 
 // NewManager creates a new sync manager with all required dependencies.
@@ -106,7 +130,7 @@ func (sm *Manager) setupCAHooks() {
 			return fmt.Errorf("failed to generate CA certificate: %w", err)
 		}
 
-		if err := sm.app.Save(e.Record); err != nil {
+		if err := sm.saveInternal(e.Record); err != nil {
 			return fmt.Errorf("failed to save CA record: %w", err)
 		}
 
@@ -128,13 +152,8 @@ func (sm *Manager) setupNetworkHooks() {
 			return e.Next()
 		}
 
-		cidr := e.Record.GetString("cidr_range")
-		if err := sm.ipamManager.ValidateCIDRFormat(cidr); err != nil {
-			return fmt.Errorf("invalid CIDR format: %w", err)
-		}
-
-		if err := sm.ipamManager.ValidateNetworkCIDR(cidr); err != nil {
-			return fmt.Errorf("CIDR validation failed: %w", err)
+		if err := sm.validateNetworkRecord(e.Record); err != nil {
+			return err
 		}
 
 		return e.Next()
@@ -145,55 +164,31 @@ func (sm *Manager) setupNetworkHooks() {
 			return e.Next()
 		}
 
-		cidr := e.Record.GetString("cidr_range")
-		if err := sm.ipamManager.ValidateCIDRFormat(cidr); err != nil {
-			return fmt.Errorf("invalid CIDR format: %w", err)
-		}
-
-		if err := sm.ipamManager.ValidateNetworkCIDR(cidr); err != nil {
-			return fmt.Errorf("CIDR validation failed: %w", err)
+		if err := sm.validateNetworkRecord(e.Record); err != nil {
+			return err
 		}
 
 		return e.Next()
 	})
 
-	// Network updates - regenerate all host configs ONLY if meaningful fields changed
+	// Network updates - regenerate all host configs ONLY if the CIDR changed.
+	// Other fields like name/description don't affect host configs.
 	sm.app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error {
 		if e.Record.Collection().Name != sm.options.NetworkCollectionName {
 			return e.Next()
 		}
 
-		// Only regenerate if CIDR changed (major network change)
-		// Other fields like name/description don't affect host configs
 		if !sm.shouldHandleEvent(sm.options.NetworkCollectionName, types.EventTypeNetworkUpdate) {
 			return e.Next()
 		}
 
-		sm.logger.Info("Network updated, regenerating host configs...")
-
-		// Find all hosts in this network
-		hosts, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
-			dbx.HashExp{"network_id": e.Record.Id})
-		if err != nil {
-			sm.logger.Warning("Failed to find hosts in network %s: %v", e.Record.Id, err)
+		orig := e.Record.Original()
+		if orig != nil && orig.GetString("cidr_range") == e.Record.GetString("cidr_range") {
 			return e.Next()
 		}
 
-		// Regenerate config for each host
-		regenerated := 0
-		for _, host := range hosts {
-			if err := sm.generateHostConfig(host); err != nil {
-				sm.logger.Warning("Failed to regenerate config for host %s: %v", host.Id, err)
-				continue
-			}
-			if err := sm.app.Save(host); err != nil {
-				sm.logger.Warning("Failed to save host %s: %v", host.Id, err)
-				continue
-			}
-			regenerated++
-		}
-
-		sm.logger.Success("Regenerated configs for %d/%d hosts in network %s", regenerated, len(hosts), e.Record.GetString("name"))
+		sm.logger.Info("Network CIDR changed for %s, regenerating host configs...", e.Record.GetString("name"))
+		sm.regenerateNetworkHostConfigs(e.Record.Id, "")
 
 		return e.Next()
 	})
@@ -204,40 +199,29 @@ func (sm *Manager) setupNetworkHooks() {
 // HOST EVENT HANDLING:
 // - Creation: Generate certificate and config automatically after record is saved
 // - Validation: Validate IP, lighthouse requirements before creation/update
-// - Updates: Regenerate config when meaningful fields change (NOT during initial creation)
+// - Updates: Regenerate certificate or config when meaningful fields change
+// - Deletion: Regenerate peer configs when an active lighthouse is removed
+//
+// REGENERATION TIERS:
+//   - Certificate (expensive): hostname, overlay_ip, groups, validity_years —
+//     these are embedded in the certificate itself
+//   - Config only (cheap): is_lighthouse, public_host_port, firewall rules
+//   - Peer fan-out: lighthouse-relevant changes (is_lighthouse, active,
+//     public_host_port, overlay_ip on a lighthouse) regenerate every other
+//     host's config in the network, since peers embed lighthouse data
 //
 // RECURSION PREVENTION:
 // - Skip update processing if triggered by our own save during creation
-// - Only regenerate when groups, lighthouse status, or firewall rules change
+// - Fan-out saves only touch config_yaml, which never triggers regeneration
 func (sm *Manager) setupHostHooks() {
-	// Host validation - validate IP and lighthouse requirements
+	// Host validation - validate IP, lighthouse requirements, and groups format
 	sm.app.OnRecordCreateRequest().BindFunc(func(e *core.RecordRequestEvent) error {
 		if e.Collection.Name != sm.options.HostCollectionName {
 			return e.Next()
 		}
 
-		// Validate IP format
-		if err := sm.ipamManager.ValidateIPFormat(e.Record.GetString("overlay_ip")); err != nil {
-			return fmt.Errorf("invalid IP format: %w", err)
-		}
-
-		// Validate IP is within network
-		if err := sm.ipamManager.ValidateHostIP(e.Record.GetString("overlay_ip"), e.Record.GetString("network_id")); err != nil {
-			return fmt.Errorf("IP validation failed: %w", err)
-		}
-
-		// Validate lighthouse requirements
-		if e.Record.GetBool("is_lighthouse") && e.Record.GetString("public_host_port") == "" {
-			return fmt.Errorf("lighthouse hosts must specify public_host_port")
-		}
-
-		// Validate groups is valid JSON array
-		groupsJSON := e.Record.GetString("groups")
-		if groupsJSON != "" && groupsJSON != "null" {
-			var groups []string
-			if err := json.Unmarshal([]byte(groupsJSON), &groups); err != nil {
-				return fmt.Errorf("groups must be a valid JSON array of strings: %w", err)
-			}
+		if err := sm.validateHostRecord(e.Record); err != nil {
+			return err
 		}
 
 		return e.Next()
@@ -248,28 +232,8 @@ func (sm *Manager) setupHostHooks() {
 			return e.Next()
 		}
 
-		// Validate IP format
-		if err := sm.ipamManager.ValidateIPFormat(e.Record.GetString("overlay_ip")); err != nil {
-			return fmt.Errorf("invalid IP format: %w", err)
-		}
-
-		// Validate IP is within network
-		if err := sm.ipamManager.ValidateHostIP(e.Record.GetString("overlay_ip"), e.Record.GetString("network_id")); err != nil {
-			return fmt.Errorf("IP validation failed: %w", err)
-		}
-
-		// Validate lighthouse requirements
-		if e.Record.GetBool("is_lighthouse") && e.Record.GetString("public_host_port") == "" {
-			return fmt.Errorf("lighthouse hosts must specify public_host_port")
-		}
-
-		// Validate groups is valid JSON array
-		groupsJSON := e.Record.GetString("groups")
-		if groupsJSON != "" && groupsJSON != "null" {
-			var groups []string
-			if err := json.Unmarshal([]byte(groupsJSON), &groups); err != nil {
-				return fmt.Errorf("groups must be a valid JSON array of strings: %w", err)
-			}
+		if err := sm.validateHostRecord(e.Record); err != nil {
+			return err
 		}
 
 		return e.Next()
@@ -294,20 +258,31 @@ func (sm *Manager) setupHostHooks() {
 			return fmt.Errorf("failed to generate host certificate/config: %w", err)
 		}
 
-		if err := sm.app.Save(e.Record); err != nil {
+		if err := sm.saveInternal(e.Record); err != nil {
 			return fmt.Errorf("failed to save host record: %w", err)
 		}
 
 		sm.logger.Success("Generated certificate and config for host %s", e.Record.GetString("hostname"))
 
+		// New active lighthouse - peers need it in their static_host_map
+		if e.Record.GetBool("is_lighthouse") && e.Record.GetBool("active") {
+			sm.logger.Config("New lighthouse %s, regenerating peer configs...", e.Record.GetString("hostname"))
+			sm.regenerateNetworkHostConfigs(e.Record.GetString("network_id"), e.Record.Id)
+		}
+
 		return e.Next()
 	})
 
 	// Host updates - regenerate certificate OR config depending on what changed
-	// Certificate regeneration: groups, validity_years (embedded in cert)
-	// Config regeneration: lighthouse, firewall rules (only in config)
 	sm.app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error {
 		if e.Record.Collection().Name != sm.options.HostCollectionName {
+			return e.Next()
+		}
+
+		// CRITICAL: Skip events from our own saves. Original() in a re-fired
+		// hook still holds the pre-request snapshot, so re-running the diff
+		// checks below would loop forever (see RECURSION PREVENTION on Manager).
+		if sm.isInternalSave(e.Record) {
 			return e.Next()
 		}
 
@@ -315,9 +290,9 @@ func (sm *Manager) setupHostHooks() {
 
 		// CRITICAL: Skip if certificate was JUST generated (prevents recursion during creation)
 		// Only skip if: certificate went from empty -> populated (initial generation)
-		if orig != nil && 
-		   orig.GetString("certificate") == "" && 
-		   e.Record.GetString("certificate") != "" {
+		if orig != nil &&
+			orig.GetString("certificate") == "" &&
+			e.Record.GetString("certificate") != "" {
 			sm.logger.Info("Skipping regeneration for %s (initial certificate generation)", e.Record.GetString("hostname"))
 			return e.Next()
 		}
@@ -329,9 +304,19 @@ func (sm *Manager) setupHostHooks() {
 
 		needsCertRegeneration := false
 		needsConfigRegeneration := false
+		needsPeerFanOut := false
 
 		if orig != nil {
-			// Check if CERTIFICATE regeneration is needed (expensive - new cert)
+			// Check if CERTIFICATE regeneration is needed (expensive - new cert).
+			// These fields are embedded in the certificate itself.
+			if orig.GetString("hostname") != e.Record.GetString("hostname") {
+				sm.logger.Info("Hostname changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
+				needsCertRegeneration = true
+			}
+			if orig.GetString("overlay_ip") != e.Record.GetString("overlay_ip") {
+				sm.logger.Info("Overlay IP changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
+				needsCertRegeneration = true
+			}
 			if orig.GetString("groups") != e.Record.GetString("groups") {
 				sm.logger.Info("Groups changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
 				needsCertRegeneration = true
@@ -360,13 +345,25 @@ func (sm *Manager) setupHostHooks() {
 					needsConfigRegeneration = true
 				}
 			}
+
+			// Check if peer configs are now stale. Peers embed this host's
+			// lighthouse data (overlay_ip -> public_host_port) in their own
+			// configs, so changes to a lighthouse must fan out.
+			if orig.GetBool("is_lighthouse") || e.Record.GetBool("is_lighthouse") {
+				if orig.GetBool("is_lighthouse") != e.Record.GetBool("is_lighthouse") ||
+					orig.GetBool("active") != e.Record.GetBool("active") ||
+					orig.GetString("public_host_port") != e.Record.GetString("public_host_port") ||
+					orig.GetString("overlay_ip") != e.Record.GetString("overlay_ip") {
+					needsPeerFanOut = true
+				}
+			}
 		} else {
 			// If we don't have original data, regenerate cert to be safe
 			sm.logger.Info("No original data available for host %s, regenerating certificate", e.Record.GetString("hostname"))
 			needsCertRegeneration = true
 		}
 
-		if !needsCertRegeneration && !needsConfigRegeneration {
+		if !needsCertRegeneration && !needsConfigRegeneration && !needsPeerFanOut {
 			sm.logger.Info("No meaningful changes detected for host %s, skipping regeneration", e.Record.GetString("hostname"))
 			return e.Next()
 		}
@@ -374,38 +371,131 @@ func (sm *Manager) setupHostHooks() {
 		// Regenerate certificate (which also regenerates config)
 		if needsCertRegeneration {
 			sm.logger.Cert("Regenerating certificate and config for host %s...", e.Record.GetString("hostname"))
-			
+
 			if err := sm.generateHostCertAndConfig(e.Record); err != nil {
 				sm.logger.Error("Failed to regenerate certificate for host %s: %v", e.Record.Id, err)
 				return e.Next()
 			}
-			
-			if err := sm.app.Save(e.Record); err != nil {
+
+			if err := sm.saveInternal(e.Record); err != nil {
 				sm.logger.Warning("Failed to save host %s: %v", e.Record.Id, err)
 			}
-			
-			sm.logger.Success("Regenerated certificate and config for host %s", e.Record.GetString("hostname"))
-			return e.Next()
-		}
 
-		// Only regenerate config (cheaper operation)
-		if needsConfigRegeneration {
+			sm.logger.Success("Regenerated certificate and config for host %s", e.Record.GetString("hostname"))
+		} else if needsConfigRegeneration {
+			// Only regenerate config (cheaper operation)
 			sm.logger.Config("Regenerating config for host %s...", e.Record.GetString("hostname"))
-			
+
 			if err := sm.generateHostConfig(e.Record); err != nil {
 				sm.logger.Warning("Failed to regenerate config for host %s: %v", e.Record.Id, err)
 				return e.Next()
 			}
-			
-			if err := sm.app.Save(e.Record); err != nil {
+
+			if err := sm.saveInternal(e.Record); err != nil {
 				sm.logger.Warning("Failed to save host %s: %v", e.Record.Id, err)
 			}
-			
+
 			sm.logger.Success("Regenerated config for host %s", e.Record.GetString("hostname"))
+		}
+
+		// Fan out to peers AFTER this host's own regeneration so peers see
+		// the host's final state (e.g. updated overlay_ip)
+		if needsPeerFanOut {
+			sm.logger.Config("Lighthouse settings changed for host %s, regenerating peer configs...", e.Record.GetString("hostname"))
+			sm.regenerateNetworkHostConfigs(e.Record.GetString("network_id"), e.Record.Id)
 		}
 
 		return e.Next()
 	})
+
+	// Host deletion - removing an active lighthouse leaves stale entries in
+	// peer static_host_maps, so regenerate them
+	sm.app.OnRecordAfterDeleteSuccess().BindFunc(func(e *core.RecordEvent) error {
+		if e.Record.Collection().Name != sm.options.HostCollectionName {
+			return e.Next()
+		}
+
+		if !sm.shouldHandleEvent(sm.options.HostCollectionName, types.EventTypeHostDelete) {
+			return e.Next()
+		}
+
+		if e.Record.GetBool("is_lighthouse") && e.Record.GetBool("active") {
+			sm.logger.Config("Lighthouse %s deleted, regenerating peer configs...", e.Record.GetString("hostname"))
+			sm.regenerateNetworkHostConfigs(e.Record.GetString("network_id"), e.Record.Id)
+		}
+
+		return e.Next()
+	})
+}
+
+// validateNetworkRecord validates a network record before create/update.
+// Returned errors wrap the sentinel errors from internal/types.
+func (sm *Manager) validateNetworkRecord(record *core.Record) error {
+	if err := sm.ipamManager.ValidateNetworkCIDR(record.GetString("cidr_range")); err != nil {
+		return fmt.Errorf("CIDR validation failed: %w", err)
+	}
+	return nil
+}
+
+// validateHostRecord validates a host record before create/update.
+// Checks IP assignment, lighthouse requirements, and groups format.
+// Returned errors wrap the sentinel errors from internal/types.
+func (sm *Manager) validateHostRecord(record *core.Record) error {
+	// Validate IP is well-formed and within the network CIDR
+	if err := sm.ipamManager.ValidateHostIP(record.GetString("overlay_ip"), record.GetString("network_id")); err != nil {
+		return fmt.Errorf("IP validation failed: %w", err)
+	}
+
+	// Validate lighthouse requirements
+	if record.GetBool("is_lighthouse") && record.GetString("public_host_port") == "" {
+		return types.ErrLighthouseNoPublicIP
+	}
+
+	// Validate groups is valid JSON array
+	groupsJSON := record.GetString("groups")
+	if groupsJSON != "" && groupsJSON != "null" {
+		var groups []string
+		if err := json.Unmarshal([]byte(groupsJSON), &groups); err != nil {
+			return fmt.Errorf("groups must be a valid JSON array of strings: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// regenerateNetworkHostConfigs regenerates and saves config_yaml for every host
+// in a network, optionally excluding one host (the record that triggered the
+// fan-out, which handles its own regeneration).
+//
+// Failures on individual hosts are logged and skipped so one bad record
+// doesn't block the rest of the network.
+func (sm *Manager) regenerateNetworkHostConfigs(networkID, excludeHostID string) {
+	hosts, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
+		dbx.HashExp{"network_id": networkID})
+	if err != nil {
+		sm.logger.Warning("Failed to find hosts in network %s: %v", networkID, err)
+		return
+	}
+
+	regenerated := 0
+	total := 0
+	for _, host := range hosts {
+		if host.Id == excludeHostID {
+			continue
+		}
+		total++
+		if err := sm.generateHostConfig(host); err != nil {
+			sm.logger.Warning("Failed to regenerate config for host %s: %v", host.Id, err)
+			continue
+		}
+		if err := sm.saveInternal(host); err != nil {
+			sm.logger.Warning("Failed to save host %s: %v", host.Id, err)
+			continue
+		}
+		regenerated++
+	}
+
+	sm.logger.Success("Regenerated configs for %d/%d hosts in network %s", regenerated, total, networkID)
 }
 
 // generateCA generates CA certificate and updates the record.
@@ -419,7 +509,7 @@ func (sm *Manager) generateCA(record *core.Record) error {
 
 	result, err := sm.certManager.GenerateCA(name, validityYears)
 	if err != nil {
-		return fmt.Errorf("failed to generate CA: %w", err)
+		return fmt.Errorf("%w: %v", types.ErrCertGeneration, err)
 	}
 
 	record.Set("certificate", result.CertificatePEM)
@@ -447,12 +537,12 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 	// Get network and CA
 	network, err := sm.app.FindRecordById(sm.options.NetworkCollectionName, record.GetString("network_id"))
 	if err != nil {
-		return fmt.Errorf("network not found: %w", err)
+		return fmt.Errorf("%w: %v", types.ErrNetworkNotFound, err)
 	}
 
 	ca, err := sm.app.FindRecordById(sm.options.CACollectionName, network.GetString("ca_id"))
 	if err != nil {
-		return fmt.Errorf("CA not found: %w", err)
+		return fmt.Errorf("%w: %v", types.ErrCANotFound, err)
 	}
 
 	// Decrypt CA private key for signing (no-op if encryption disabled or already plaintext)
@@ -476,7 +566,7 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 		validityYears = sm.options.DefaultHostValidityYears
 	}
 
-	// Generate host certificate
+	// Generate host certificate (expiry is clamped to the CA cert's NotAfter)
 	certResult, err := sm.certManager.GenerateHostCert(cert.HostCertParams{
 		Hostname:        record.GetString("hostname"),
 		OverlayIP:       record.GetString("overlay_ip"),
@@ -484,10 +574,9 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 		ValidityYears:   validityYears,
 		CACertPEM:       ca.GetString("certificate"),
 		CAPrivateKeyPEM: caPrivateKeyPEM,
-		CAExpiresAt:     ca.GetDateTime("expires_at").Time(),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to generate host certificate: %w", err)
+		return fmt.Errorf("%w: %v", types.ErrCertGeneration, err)
 	}
 
 	// Store certificate and CA cert (denormalized).
@@ -519,7 +608,7 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 	// Get network
 	network, err := sm.app.FindRecordById(sm.options.NetworkCollectionName, record.GetString("network_id"))
 	if err != nil {
-		return fmt.Errorf("network not found: %w", err)
+		return fmt.Errorf("%w: %v", types.ErrNetworkNotFound, err)
 	}
 
 	// Query lighthouses in this network
@@ -534,14 +623,14 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 	// Generate config (now uses host-level firewall rules)
 	configYAML, err := sm.configGen.GenerateHostConfig(hostModel, lighthouses)
 	if err != nil {
-		return fmt.Errorf("failed to generate config: %w", err)
+		return fmt.Errorf("%w: %v", types.ErrConfigGeneration, err)
 	}
 
 	record.Set("config_yaml", configYAML)
 	return nil
 }
 
-// getLighthouses queries all lighthouse hosts in a network.
+// getLighthouses queries all active lighthouse hosts in a network.
 func (sm *Manager) getLighthouses(networkID string) ([]types.LighthouseInfo, error) {
 	records, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
 		dbx.HashExp{"network_id": networkID, "is_lighthouse": true, "active": true})

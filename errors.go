@@ -4,10 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/skeeeon/pb-nebula/internal/types"
 )
 
 // Common errors returned by the library organized by operational category.
-// This error taxonomy enables consistent error handling across all components.
+// The component-level sentinels are defined in internal/types (so internal
+// packages can wrap them without an import cycle) and re-exported here for
+// consumers to match with errors.Is.
 //
 // ERROR CLASSIFICATION PHILOSOPHY:
 // Errors are classified to indicate appropriate handling:
@@ -15,35 +19,25 @@ import (
 // - Validation errors: Invalid input data that should be corrected
 // - Operational errors: Runtime issues that may be transient
 var (
-	// Collection errors - Database and schema related issues
-	ErrCollectionNotFound = errors.New("collection not found")
-	ErrRecordNotFound     = errors.New("record not found")
-	ErrInvalidRecord      = errors.New("invalid record data")
-
 	// Certificate errors - Cryptographic operations
-	ErrCertGeneration  = errors.New("failed to generate certificate")
-	ErrInvalidCert     = errors.New("invalid certificate")
-	ErrCertExpired     = errors.New("certificate expired")
-	ErrCANotFound      = errors.New("CA not found")
-	ErrInvalidCA       = errors.New("invalid CA certificate")
-	ErrMultipleCAs     = errors.New("multiple CA records found, only one allowed")
+	ErrCertGeneration = types.ErrCertGeneration
+	ErrCANotFound     = types.ErrCANotFound
 
 	// Network errors - Network management
-	ErrNetworkNotFound  = errors.New("network not found")
-	ErrInvalidCIDR      = errors.New("invalid CIDR format")
-	ErrIPv6NotSupported = errors.New("IPv6 networks not supported yet")
+	ErrNetworkNotFound  = types.ErrNetworkNotFound
+	ErrInvalidCIDR      = types.ErrInvalidCIDR
+	ErrIPv6NotSupported = types.ErrIPv6NotSupported
 
 	// Host errors - Host management
-	ErrHostNotFound         = errors.New("host not found")
-	ErrInvalidIP            = errors.New("invalid IP address")
-	ErrIPNotInNetwork       = errors.New("IP address not within network CIDR")
-	ErrLighthouseNoPublicIP = errors.New("lighthouse hosts require public_host_port")
+	ErrInvalidIP            = types.ErrInvalidIP
+	ErrIPNotInNetwork       = types.ErrIPNotInNetwork
+	ErrLighthouseNoPublicIP = types.ErrLighthouseNoPublicIP
 
 	// Config errors - Configuration generation
-	ErrConfigGeneration = errors.New("failed to generate config")
-	ErrInvalidFirewall  = errors.New("invalid firewall rules")
+	ErrConfigGeneration = types.ErrConfigGeneration
+	ErrInvalidFirewall  = types.ErrInvalidFirewall
 
-	// Validation errors - Input validation
+	// Validation errors - Input validation (root-level, used by option validation)
 	ErrInvalidOptions       = errors.New("invalid options provided")
 	ErrMissingRequiredField = errors.New("missing required field")
 )
@@ -86,6 +80,7 @@ func WrapErrorf(err error, format string, args ...interface{}) error {
 
 // ValidateRequired ensures string fields are not empty after trimming whitespace.
 // Primary validation function used throughout pb-nebula for required field checking.
+// Returned errors match ErrMissingRequiredField via errors.Is.
 //
 // PARAMETERS:
 //   - value: String value to validate
@@ -95,7 +90,7 @@ func WrapErrorf(err error, format string, args ...interface{}) error {
 // - error: nil if valid, descriptive error if empty
 func ValidateRequired(value, fieldName string) error {
 	if strings.TrimSpace(value) == "" {
-		return fmt.Errorf("%s is required and cannot be empty", fieldName)
+		return fmt.Errorf("%w: %s is required and cannot be empty", ErrMissingRequiredField, fieldName)
 	}
 	return nil
 }

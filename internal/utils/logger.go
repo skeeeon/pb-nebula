@@ -46,7 +46,8 @@ func NewLogger(enabled bool) *Logger {
 // logWithPrefix writes a log message with timestamp and visual prefix if logging enabled.
 //
 // LOG FORMAT:
-//   [HH:MM:SS] PREFIX MESSAGE
+//
+//	[HH:MM:SS] PREFIX MESSAGE
 //
 // PARAMETERS:
 //   - prefix: Visual prefix with emoji and category name

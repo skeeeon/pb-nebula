@@ -14,8 +14,8 @@ import (
 // This component ensures all necessary database structures exist before other components use them.
 //
 // COLLECTION ARCHITECTURE:
-// - nebula_ca: Single CA record (root of trust, admin only)
-// - nebula_networks: Network definitions (isolation boundaries)
+// - nebula_ca: CA records (roots of trust, admin only; multiple CAs supported)
+// - nebula_networks: Network definitions (isolation boundaries, unique per CA)
 // - nebula_hosts: Host configurations (auth collection with Nebula credentials)
 //
 // INITIALIZATION ORDER:
@@ -76,13 +76,14 @@ func (cm *Manager) InitializeCollections() error {
 	return nil
 }
 
-// createCACollection creates the CA collection (admin only, single record).
-// This collection stores the root Nebula Certificate Authority.
+// createCACollection creates the CA collection (admin only).
+// This collection stores Nebula Certificate Authorities. Multiple CAs are
+// supported — each CA roots its own mesh and can serve multiple networks.
 //
 // SECURITY MODEL:
 // - No public access rules (only admin can access)
 // - Contains root cryptographic keys
-// - Single record per deployment (enforced by application logic)
+// - CA names are unique (the only cross-CA constraint)
 // - private_key field is HIDDEN (not exposed via API)
 //
 // SCHEMA:
@@ -151,7 +152,7 @@ func (cm *Manager) createCACollection() error {
 		OnUpdate: true,
 	})
 
-	// Create unique index on name (enforce single CA)
+	// Create unique index on name (CA names distinguish meshes)
 	collection.Indexes = types.JSONArray[string]{
 		"CREATE UNIQUE INDEX idx_ca_name ON " + cm.options.CACollectionName + " (name)",
 	}
@@ -253,9 +254,11 @@ func (cm *Manager) createNetworksCollection() error {
 		CascadeDelete: false,
 	})
 
-	// Create unique index on cidr_range
+	// Networks are unique per CA: the same name or CIDR can exist under
+	// different CAs (separate meshes), but not twice under one CA
 	collection.Indexes = types.JSONArray[string]{
-		"CREATE UNIQUE INDEX idx_network_cidr ON " + cm.options.NetworkCollectionName + " (cidr_range)",
+		"CREATE UNIQUE INDEX idx_network_ca_name ON " + cm.options.NetworkCollectionName + " (ca_id, name)",
+		"CREATE UNIQUE INDEX idx_network_ca_cidr ON " + cm.options.NetworkCollectionName + " (ca_id, cidr_range)",
 	}
 
 	return cm.app.Save(collection)
@@ -329,8 +332,8 @@ func (cm *Manager) createHostsCollection() error {
 		Max:      50,
 	})
 	collection.Fields.Add(&core.JSONField{
-		Name:     "groups",
-		MaxSize:  1000,
+		Name:    "groups",
+		MaxSize: 1000,
 	})
 	collection.Fields.Add(&core.BoolField{
 		Name: "is_lighthouse",
@@ -403,10 +406,11 @@ func (cm *Manager) createHostsCollection() error {
 		CascadeDelete: false,
 	})
 
-	// Create composite unique index on (network_id, overlay_ip) and unique index on hostname
+	// Hosts are unique per network: overlay IPs and hostnames can repeat
+	// across networks (separate meshes), but not within one network
 	collection.Indexes = types.JSONArray[string]{
 		"CREATE UNIQUE INDEX idx_host_network_ip ON " + cm.options.HostCollectionName + " (network_id, overlay_ip)",
-		"CREATE UNIQUE INDEX idx_host_hostname ON " + cm.options.HostCollectionName + " (hostname)",
+		"CREATE UNIQUE INDEX idx_host_network_hostname ON " + cm.options.HostCollectionName + " (network_id, hostname)",
 	}
 
 	return cm.app.Save(collection)

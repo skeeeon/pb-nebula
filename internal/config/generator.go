@@ -60,7 +60,7 @@ func (g *Generator) GenerateHostConfig(host *types.HostRecord, lighthouses []typ
 	// Parse host-specific firewall rules
 	outbound, inbound, err := host.GetFirewallRules()
 	if err != nil {
-		return "", fmt.Errorf("failed to parse firewall rules: %w", err)
+		return "", fmt.Errorf("%w: %v", types.ErrInvalidFirewall, err)
 	}
 
 	// If no rules specified, use Nebula recommended defaults
@@ -83,8 +83,7 @@ func (g *Generator) GenerateHostConfig(host *types.HostRecord, lighthouses []typ
 			"cert": host.Certificate,
 			"key":  host.PrivateKey,
 		},
-		"static_host_map": g.buildStaticHostMap(lighthouses, host.IsLighthouse),
-		"lighthouse":      g.buildLighthouseConfig(lighthouses, host.IsLighthouse),
+		"lighthouse": g.buildLighthouseConfig(lighthouses, host.IsLighthouse),
 		"listen": map[string]interface{}{
 			"host": "0.0.0.0",
 			"port": g.extractPort(host.PublicHostPort, host.IsLighthouse),
@@ -94,12 +93,12 @@ func (g *Generator) GenerateHostConfig(host *types.HostRecord, lighthouses []typ
 			"respond": true,
 		},
 		"tun": map[string]interface{}{
-			"disabled":              false,
-			"dev":                   "nebula1",
-			"drop_local_broadcast":  false,
-			"drop_multicast":        false,
-			"tx_queue":              500,
-			"mtu":                   1300,
+			"disabled":             false,
+			"dev":                  "nebula1",
+			"drop_local_broadcast": false,
+			"drop_multicast":       false,
+			"tx_queue":             500,
+			"mtu":                  1300,
 		},
 		"logging": map[string]interface{}{
 			"level":  "info",
@@ -109,6 +108,12 @@ func (g *Generator) GenerateHostConfig(host *types.HostRecord, lighthouses []typ
 			"outbound": outbound,
 			"inbound":  inbound,
 		},
+	}
+
+	// Lighthouses don't need a static_host_map (they are the discovery
+	// points), so the section is omitted entirely for them
+	if staticHostMap := g.buildStaticHostMap(lighthouses, host.IsLighthouse); staticHostMap != nil {
+		config["static_host_map"] = staticHostMap
 	}
 
 	// Marshal to YAML

@@ -202,26 +202,26 @@ func validateOptions(options Options) error {
 	if options.CACollectionName == options.NetworkCollectionName ||
 		options.CACollectionName == options.HostCollectionName ||
 		options.NetworkCollectionName == options.HostCollectionName {
-		return fmt.Errorf("collection names must be unique")
+		return fmt.Errorf("%w: collection names must be unique", ErrInvalidOptions)
 	}
 
 	// Validate validity periods
 	if options.DefaultCAValidityYears <= 0 {
-		return fmt.Errorf("DefaultCAValidityYears must be positive, got %d", options.DefaultCAValidityYears)
+		return fmt.Errorf("%w: DefaultCAValidityYears must be positive, got %d", ErrInvalidOptions, options.DefaultCAValidityYears)
 	}
 	if options.DefaultHostValidityYears <= 0 {
-		return fmt.Errorf("DefaultHostValidityYears must be positive, got %d", options.DefaultHostValidityYears)
+		return fmt.Errorf("%w: DefaultHostValidityYears must be positive, got %d", ErrInvalidOptions, options.DefaultHostValidityYears)
 	}
 
 	// Ensure host validity doesn't exceed CA validity
 	if options.DefaultHostValidityYears > options.DefaultCAValidityYears {
-		return fmt.Errorf("DefaultHostValidityYears (%d) cannot exceed DefaultCAValidityYears (%d)",
-			options.DefaultHostValidityYears, options.DefaultCAValidityYears)
+		return fmt.Errorf("%w: DefaultHostValidityYears (%d) cannot exceed DefaultCAValidityYears (%d)",
+			ErrInvalidOptions, options.DefaultHostValidityYears, options.DefaultCAValidityYears)
 	}
 
 	// Validate encryption key length (AES-256 requires a 32-byte key)
 	if options.EncryptionKey != "" && len(options.EncryptionKey) != 32 {
-		return fmt.Errorf("encryption key must be exactly 32 characters, got %d", len(options.EncryptionKey))
+		return fmt.Errorf("%w: encryption key must be exactly 32 characters, got %d", ErrInvalidOptions, len(options.EncryptionKey))
 	}
 
 	return nil

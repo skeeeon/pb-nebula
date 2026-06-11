@@ -16,40 +16,47 @@ import (
 // 4. Regenerate configs when networks or hosts are updated
 //
 // USAGE:
-//   go run main.go serve
+//
+//	go run main.go serve
 //
 // WORKFLOW:
-//   1. Access admin UI: http://127.0.0.1:8090/_/
-//   2. Create CA record (certificate generated automatically)
-//   3. Create network with CIDR range
-//   4. Create lighthouse host (with public_host_port)
-//   5. Create regular hosts (configs reference lighthouse)
-//   6. Hosts authenticate and download their config_yaml
+//  1. Access admin UI: http://127.0.0.1:8090/_/
+//  2. Create CA record (certificate generated automatically)
+//  3. Create network with CIDR range
+//  4. Create lighthouse host (with public_host_port)
+//  5. Create regular hosts (configs reference lighthouse)
+//  6. Hosts authenticate and download their config_yaml
 //
 // TESTING:
-//   # Create CA via API
-//   curl -X POST http://127.0.0.1:8090/api/collections/nebula_ca/records \
-//     -H "Content-Type: application/json" \
-//     -u "admin@example.com:password123" \
-//     -d '{"name":"my-ca","validity_years":10}'
 //
-//   # Create network
-//   curl -X POST http://127.0.0.1:8090/api/collections/nebula_networks/records \
-//     -H "Content-Type: application/json" \
-//     -u "admin@example.com:password123" \
-//     -d '{"name":"prod","cidr_range":"10.128.0.0/16","ca_id":"<ca_id>","active":true}'
+//	# Authenticate as superuser (PocketBase does not accept HTTP basic auth)
+//	ADMIN_TOKEN=$(curl -s -X POST http://127.0.0.1:8090/api/collections/_superusers/auth-with-password \
+//	  -H "Content-Type: application/json" \
+//	  -d '{"identity":"admin@example.com","password":"password123"}' | jq -r .token)
 //
-//   # Create lighthouse
-//   curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/records \
-//     -H "Content-Type: application/json" \
-//     -u "admin@example.com:password123" \
-//     -d '{"email":"lh@example.com","password":"secure123","hostname":"lighthouse-01","network_id":"<network_id>","overlay_ip":"10.128.0.1","groups":["lighthouse"],"is_lighthouse":true,"public_host_port":"1.2.3.4:4242","validity_years":1}'
+//	# Create CA via API
+//	curl -X POST http://127.0.0.1:8090/api/collections/nebula_ca/records \
+//	  -H "Content-Type: application/json" \
+//	  -H "Authorization: $ADMIN_TOKEN" \
+//	  -d '{"name":"my-ca","validity_years":10}'
 //
-//   # Create regular host
-//   curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/records \
-//     -H "Content-Type: application/json" \
-//     -u "admin@example.com:password123" \
-//     -d '{"email":"web01@example.com","password":"secure123","hostname":"web-01","network_id":"<network_id>","overlay_ip":"10.128.0.100","groups":["web"],"is_lighthouse":false,"validity_years":1}'
+//	# Create network
+//	curl -X POST http://127.0.0.1:8090/api/collections/nebula_networks/records \
+//	  -H "Content-Type: application/json" \
+//	  -H "Authorization: $ADMIN_TOKEN" \
+//	  -d '{"name":"prod","cidr_range":"10.128.0.0/16","ca_id":"<ca_id>","active":true}'
+//
+//	# Create lighthouse (active:true makes it visible to peer configs)
+//	curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/records \
+//	  -H "Content-Type: application/json" \
+//	  -H "Authorization: $ADMIN_TOKEN" \
+//	  -d '{"email":"lh@example.com","password":"secure123","hostname":"lighthouse-01","network_id":"<network_id>","overlay_ip":"10.128.0.1","groups":["lighthouse"],"is_lighthouse":true,"public_host_port":"1.2.3.4:4242","validity_years":1,"active":true}'
+//
+//	# Create regular host
+//	curl -X POST http://127.0.0.1:8090/api/collections/nebula_hosts/records \
+//	  -H "Content-Type: application/json" \
+//	  -H "Authorization: $ADMIN_TOKEN" \
+//	  -d '{"email":"web01@example.com","password":"secure123","hostname":"web-01","network_id":"<network_id>","overlay_ip":"10.128.0.100","groups":["web"],"is_lighthouse":false,"validity_years":1,"active":true}'
 func main() {
 	// Create PocketBase app
 	app := pocketbase.New()

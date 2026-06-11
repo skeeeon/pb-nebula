@@ -7,11 +7,11 @@ import (
 )
 
 // CARecord represents a Nebula Certificate Authority (root of trust).
-// Each pb-nebula deployment has exactly one CA that signs all host certificates.
 //
-// SINGLE CA DESIGN:
-// Like pb-nats with a single operator, pb-nebula uses a single CA per deployment.
-// This simplifies key management and trust relationships.
+// MULTI-CA DESIGN:
+// A deployment can hold multiple CAs. Each CA roots its own independent mesh
+// and can serve multiple networks (nebula_networks.ca_id points at its CA).
+// Networks are unique per CA; hosts are unique per network.
 //
 // CERTIFICATE HIERARCHY:
 // CA (self-signed root) → Host Certificates (signed by CA)
@@ -82,7 +82,7 @@ type HostRecord struct {
 	Verified bool   `json:"verified"` // Email verification status
 
 	// Nebula identity and network assignment
-	Hostname  string `json:"hostname"`   // Nebula hostname (must be unique)
+	Hostname  string `json:"hostname"`   // Nebula hostname (unique within its network)
 	NetworkID string `json:"network_id"` // Foreign key to nebula_networks
 	OverlayIP string `json:"overlay_ip"` // Overlay network IP (e.g., "10.128.0.100")
 	Groups    string `json:"groups"`     // JSON array of group names for firewall rules
