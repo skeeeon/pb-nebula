@@ -4,6 +4,7 @@ package sync
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	stdsync "sync"
 
 	"github.com/pocketbase/dbx"
@@ -214,6 +215,28 @@ func (sm *Manager) setupNetworkHooks() {
 // - Skip update processing if triggered by our own save during creation
 // - Fan-out saves only touch config_yaml, which never triggers regeneration
 func (sm *Manager) setupHostHooks() {
+	// A host is born active.
+	//
+	// PocketBase bools have no schema-level default, so a create that omits
+	// `active` lands as false -- and every host minted through the API omits it,
+	// because nothing in the payload suggests it is required. That was nearly
+	// harmless while `active` only gated getLighthouses: a non-lighthouse host
+	// worked fine with the flag clear. It stopped being harmless when `active`
+	// started driving pki.blocklist, because a freshly issued certificate would
+	// then be blocklisted by every peer from the moment it was created.
+	//
+	// Forced rather than defaulted-if-absent for the reason PocketBase makes
+	// unavoidable: by the time a hook sees the record, "field omitted" and
+	// "explicitly false" are indistinguishable. Creating a host that is already
+	// revoked is not a meaningful operation anyway -- deactivation is an update.
+	sm.app.OnRecordCreate().BindFunc(func(e *core.RecordEvent) error {
+		if e.Record.Collection().Name != sm.options.HostCollectionName {
+			return e.Next()
+		}
+		e.Record.Set("active", true)
+		return e.Next()
+	})
+
 	// Host validation - validate IP, lighthouse requirements, and groups format
 	sm.app.OnRecordCreateRequest().BindFunc(func(e *core.RecordRequestEvent) error {
 		if e.Collection.Name != sm.options.HostCollectionName {
@@ -344,6 +367,20 @@ func (sm *Manager) setupHostHooks() {
 					sm.logger.Info("Firewall inbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
 					needsConfigRegeneration = true
 				}
+			}
+
+			// Deactivating a host revokes its certificate, and revocation in
+			// Nebula lives in every OTHER host's pki.blocklist -- so an active
+			// flip on ANY host, lighthouse or not, makes every peer config in the
+			// network stale. This used to fan out only for lighthouses, which is
+			// why active was a flag that removed a host from lighthouse lists and
+			// otherwise did nothing: the certificate stayed trusted until expiry.
+			// The host's own config is regenerated too, because the fan-out
+			// deliberately excludes the record that changed.
+			if orig.GetBool("active") != e.Record.GetBool("active") {
+				sm.logger.Info("Active flag changed for host %s, refreshing revocation blocklist across the network", e.Record.GetString("hostname"))
+				needsConfigRegeneration = true
+				needsPeerFanOut = true
 			}
 
 			// Check if peer configs are now stale. Peers embed this host's
@@ -617,17 +654,75 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 		return fmt.Errorf("failed to get lighthouses: %w", err)
 	}
 
+	// Certificate fingerprints this network refuses. Nebula has no CRL, so a
+	// deactivated host is only actually off the mesh once every peer config
+	// carries its fingerprint -- see getBlocklist.
+	blocklist, err := sm.getBlocklist(network.Id)
+	if err != nil {
+		// Never fatal: a config without a blocklist is the config this library
+		// generated for years, and failing here would stop a host getting ANY
+		// config at all.
+		sm.logger.Warning("Failed to build revocation blocklist for network %s: %v", network.Id, err)
+	}
+
 	// Convert records to models
 	hostModel := sm.recordToHostModel(record)
 
 	// Generate config (now uses host-level firewall rules)
-	configYAML, err := sm.configGen.GenerateHostConfig(hostModel, lighthouses)
+	configYAML, err := sm.configGen.GenerateHostConfig(hostModel, lighthouses, blocklist)
 	if err != nil {
 		return fmt.Errorf("%w: %v", types.ErrConfigGeneration, err)
 	}
 
 	record.Set("config_yaml", configYAML)
 	return nil
+}
+
+// getBlocklist returns the certificate fingerprints of every DEACTIVATED
+// host in a network, sorted.
+//
+// This is the revocation list. Nebula has no CRL and no OCSP: the only way to
+// refuse a certificate it has already signed is pki.blocklist, a list of
+// fingerprints carried by every other host and loaded into the CA pool at
+// startup and again on SIGHUP. Marking a host inactive used to drop it from
+// its peers lighthouse lists and nothing else -- its certificate stayed valid
+// until it expired, so a decommissioned device kept its place on the mesh.
+//
+// Sorted so an unchanged network renders a byte-identical config. Without
+// that, map iteration order would make every regeneration look like a change.
+//
+// A host with no certificate yet (mid-creation) is skipped rather than treated
+// as an error: there is nothing to revoke.
+//
+// NOTE the boundary this cannot cross. A DELETED host record takes its
+// certificate with it, and a fingerprint absent from the database cannot be
+// blocklisted. To take a device off the mesh, DEACTIVATE it; deleting is for
+// hosts whose certificate you are content to leave valid until it expires.
+func (sm *Manager) getBlocklist(networkID string) ([]string, error) {
+	records, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
+		dbx.HashExp{"network_id": networkID, "active": false})
+	if err != nil {
+		return nil, err
+	}
+
+	fingerprints := make([]string, 0, len(records))
+	for _, record := range records {
+		certPEM := record.GetString("certificate")
+		if certPEM == "" {
+			continue // never issued one; nothing to revoke
+		}
+		fp, err := cert.FingerprintFromPEM(certPEM)
+		if err != nil {
+			// One unparseable certificate must not cost the network its whole
+			// blocklist, so log it and keep the rest.
+			sm.logger.Warning("Cannot fingerprint certificate for host %s, omitting from blocklist: %v", record.Id, err)
+			continue
+		}
+		fingerprints = append(fingerprints, fp)
+	}
+
+	sort.Strings(fingerprints)
+	return fingerprints, nil
 }
 
 // getLighthouses queries all active lighthouse hosts in a network.
