@@ -37,6 +37,7 @@ pb-nebula transforms PocketBase into a complete Nebula overlay network managemen
 - ✅ **Self-Service** - Hosts can only access their own records
 - ✅ **Hidden Keys** - CA private key hidden from API
 - ✅ **At-Rest Encryption** - Optional AES-256-GCM encryption of CA + host private keys
+- ✅ **Certificate Revocation** - Deactivating a host blocklists its certificate across the network
 - ✅ **JSON Validation** - Invalid firewall rules rejected immediately
 
 ## Installation
@@ -152,7 +153,7 @@ Host configurations with PocketBase authentication.
 | firewall_inbound | json | Inbound firewall rules |
 | validity_years | number | Certificate validity (default: 1) |
 | expires_at | date | Certificate expiration |
-| active | bool | Enable/disable host |
+| active | bool | Host is a member of the network. Setting it `false` blocklists its certificate — see [Certificate Revocation](#certificate-revocation) |
 
 **Security:** Users can only access their own records (self-service).
 
@@ -327,6 +328,7 @@ These fields are **only in the config** and don't require certificate regenerati
 | `public_host_port` | Regenerate config only | Config setting |
 | `firewall_outbound` | Regenerate config only | Config setting |
 | `firewall_inbound` | Regenerate config only | Config setting |
+| `active` | Regenerate config for **every host in the network** | Revocation lives in each peer's `pki.blocklist` — see [Certificate Revocation](#certificate-revocation) |
 
 **Log Output:**
 ```
@@ -342,12 +344,84 @@ These fields don't affect certificates or configs:
 - `email`, `password` - Auth only
 - `hostname` - Can't change (in certificate)
 - `overlay_ip` - Can't change (in certificate)
-- `active` - Management flag
 
 **Log Output:**
 ```
 [15:04:05] ℹ️  INFO No meaningful changes detected for web-01, skipping regeneration
 ```
+
+## Certificate Revocation
+
+**Nebula has no CRL and no OCSP.** The only way to refuse a certificate the CA
+has already signed is `pki.blocklist` — a list of certificate fingerprints
+carried by every *other* host, loaded into the CA pool at startup and again on
+`SIGHUP`. Revocation is therefore a property of the whole network that every
+member config has to restate. This is the opposite shape from a JWT-based system
+like NATS, where a revocation list lives inside one signed document and a single
+write reaches every server.
+
+Flip `active` on a host — in either direction — and pb-nebula:
+
+1. Computes the SHA-256 fingerprint of that host's certificate, from the stored
+   PEM rather than a cached column.
+2. Regenerates every *other* config in the network, with the fingerprints of all
+   inactive hosts in `pki.blocklist`.
+3. Regenerates the changed host's own config, since the peer fan-out
+   deliberately excludes the record that triggered it.
+
+Reactivating a host drops its fingerprint from the list on the same pass.
+
+```yaml
+pki:
+  ca: |
+    -----BEGIN NEBULA CERTIFICATE-----
+    ...
+  cert: |
+    -----BEGIN NEBULA CERTIFICATE-----
+    ...
+  key: |
+    ...
+  blocklist:
+    - 7d0dc0bd1ae0bbd1a4a2ec8dd4a4b1d1e7d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6
+```
+
+An empty blocklist is **omitted** rather than written as an empty list, so a
+network with nothing revoked renders exactly the config it did before this
+feature. Fingerprints are sorted — unsorted, map iteration order would make
+every regeneration look like a change.
+
+A host with no certificate yet is skipped. One unparseable certificate is logged
+and omitted rather than costing the network its entire blocklist, and a failure
+to build the list is never fatal: a config without a blocklist is the config
+this library generated for years, and failing would stop a host getting any
+config at all.
+
+### Deactivate to revoke — do not delete
+
+A deleted host record takes its certificate with it, and a fingerprint that is
+not in the database cannot be blocklisted. **Deleting a host leaves its
+certificate valid until it expires.** Deletion is for hosts you are content to
+leave trusted.
+
+### The config is not the delivery
+
+Regenerating `config_yaml` updates the database; it does not push anything to a
+device. Revocation takes effect when each peer's config is redeployed and the
+process reloads — `SIGHUP` is enough, no restart required. So "revoked" here
+means "revoked in the material pb-nebula hands out", not "already off the mesh".
+Plan for that gap: a network whose configs are never redeployed has no
+revocation at all.
+
+### A host is born active
+
+PocketBase bools have no schema-level default, so a create that omits `active`
+lands as `false` — and every host minted through the API omits it. pb-nebula
+forces `active = true` on create, because otherwise a freshly issued certificate
+would be blocklisted by every peer from the moment it was signed. It is forced
+rather than defaulted-if-absent because by the time a hook sees the record,
+"field omitted" and "explicitly false" are indistinguishable; creating an
+already-revoked host is not a meaningful operation, and deactivation is an
+update.
 
 ## Firewall Rules
 
@@ -721,7 +795,13 @@ go build ./examples/basic
    - Default 1 year for hosts provides good balance
    - Monitor expiration dates
 
-5. **Network Isolation**
+5. **Decommission by Deactivating**
+   - Set `active = false` — do not delete the host record
+   - A deleted certificate cannot be fingerprinted, so it stays trusted until it expires
+   - Redeploy peer configs (`SIGHUP` is enough) for the revocation to take effect
+   - See [Certificate Revocation](#certificate-revocation)
+
+6. **Network Isolation**
    - Use separate networks for different security zones
    - Apply firewall rules based on certificate groups
    - Follow principle of least privilege
