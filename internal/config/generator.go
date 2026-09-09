@@ -48,15 +48,25 @@ func NewGenerator() *Generator {
 // - Inbound: Allow ICMP from any (essential for troubleshooting)
 //
 // PARAMETERS:
+// REVOCATION (pki.blocklist):
+// Nebula has no CRL and no OCSP. A revoked certificate is one whose fingerprint
+// appears in `pki.blocklist` on every OTHER host that might handshake with it,
+// loaded into the CA pool at startup and again on SIGHUP. So revocation is a
+// property of the network that every member config has to carry, not a central
+// record -- which is why blocklist arrives here as a parameter and why
+// deactivating a host fans out to its peers.
+//
+// PARAMETERS:
 //   - host: Host record with certificates and firewall rules
 //   - lighthouses: List of lighthouse hosts in this network
+//   - blocklist: Certificate fingerprints to refuse (deactivated hosts)
 //
 // RETURNS:
 // - string: Complete Nebula YAML configuration ready to use
 // - error if config generation fails
 //
 // SIDE EFFECTS: None (pure generation)
-func (g *Generator) GenerateHostConfig(host *types.HostRecord, lighthouses []types.LighthouseInfo) (string, error) {
+func (g *Generator) GenerateHostConfig(host *types.HostRecord, lighthouses []types.LighthouseInfo, blocklist []string) (string, error) {
 	// Parse host-specific firewall rules
 	outbound, inbound, err := host.GetFirewallRules()
 	if err != nil {
@@ -76,13 +86,21 @@ func (g *Generator) GenerateHostConfig(host *types.HostRecord, lighthouses []typ
 		}
 	}
 
+	// pki.blocklist is omitted entirely when empty rather than written as an
+	// empty list, so a network with nothing revoked produces the same config it
+	// always did and no existing deployment sees a spurious diff.
+	pki := map[string]interface{}{
+		"ca":   host.CACertificate,
+		"cert": host.Certificate,
+		"key":  host.PrivateKey,
+	}
+	if len(blocklist) > 0 {
+		pki["blocklist"] = blocklist
+	}
+
 	// Build config structure
 	config := map[string]interface{}{
-		"pki": map[string]interface{}{
-			"ca":   host.CACertificate,
-			"cert": host.Certificate,
-			"key":  host.PrivateKey,
-		},
+		"pki":        pki,
 		"lighthouse": g.buildLighthouseConfig(lighthouses, host.IsLighthouse),
 		"listen": map[string]interface{}{
 			"host": "0.0.0.0",

@@ -40,7 +40,7 @@ func parseConfig(t *testing.T, yamlStr string) map[string]interface{} {
 func TestGenerateHostConfigRegularHost(t *testing.T) {
 	g := NewGenerator()
 
-	out, err := g.GenerateHostConfig(testHost(), testLighthouses())
+	out, err := g.GenerateHostConfig(testHost(), testLighthouses(), nil)
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestGenerateHostConfigLighthouse(t *testing.T) {
 	host.IsLighthouse = true
 	host.PublicHostPort = "1.2.3.4:4242"
 
-	out, err := g.GenerateHostConfig(host, testLighthouses())
+	out, err := g.GenerateHostConfig(host, testLighthouses(), nil)
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestGenerateHostConfigLighthouse(t *testing.T) {
 func TestGenerateHostConfigDefaultFirewall(t *testing.T) {
 	g := NewGenerator()
 
-	out, err := g.GenerateHostConfig(testHost(), nil)
+	out, err := g.GenerateHostConfig(testHost(), nil, nil)
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestGenerateHostConfigCustomFirewall(t *testing.T) {
 	host := testHost()
 	host.FirewallInbound = `[{"port": "22", "proto": "tcp", "groups": ["admin"]}]`
 
-	out, err := g.GenerateHostConfig(host, testLighthouses())
+	out, err := g.GenerateHostConfig(host, testLighthouses(), nil)
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestGenerateHostConfigInvalidFirewall(t *testing.T) {
 	host := testHost()
 	host.FirewallInbound = `{not json`
 
-	_, err := g.GenerateHostConfig(host, nil)
+	_, err := g.GenerateHostConfig(host, nil, nil)
 	if !errors.Is(err, types.ErrInvalidFirewall) {
 		t.Errorf("expected ErrInvalidFirewall, got %v", err)
 	}
@@ -193,11 +193,86 @@ func TestGenerateHostConfigEmbedsPrivateKeyInline(t *testing.T) {
 	// inline (Nebula's PKI block requires it), so it is plaintext at rest.
 	g := NewGenerator()
 
-	out, err := g.GenerateHostConfig(testHost(), nil)
+	out, err := g.GenerateHostConfig(testHost(), nil, nil)
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
 	if !strings.Contains(out, "KEY-PEM") {
 		t.Error("expected private key embedded in config YAML")
+	}
+}
+
+// The blocklist has to land under `pki` with the exact key Nebula reads
+// (`pki.blocklist`), or it is inert YAML that looks like it works. Nothing
+// validates a Nebula config against Nebula's own schema, and a misplaced or
+// misspelled key produces no error at any layer -- the host simply keeps
+// trusting a certificate you believe you revoked.
+func TestGenerateHostConfigWritesTheBlocklistUnderPKI(t *testing.T) {
+	g := NewGenerator()
+
+	fingerprints := []string{
+		"1111111111111111111111111111111111111111111111111111111111111111",
+		"2222222222222222222222222222222222222222222222222222222222222222",
+	}
+
+	out, err := g.GenerateHostConfig(testHost(), testLighthouses(), fingerprints)
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+
+	cfg := parseConfig(t, out)
+	pki, ok := cfg["pki"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("pki section missing or not a map: %T", cfg["pki"])
+	}
+
+	raw, ok := pki["blocklist"]
+	if !ok {
+		t.Fatal("pki.blocklist is absent; the revocation list never reached the config")
+	}
+	list, ok := raw.([]interface{})
+	if !ok {
+		t.Fatalf("pki.blocklist is %T, want a list", raw)
+	}
+	if len(list) != len(fingerprints) {
+		t.Fatalf("pki.blocklist has %d entries, want %d", len(list), len(fingerprints))
+	}
+	for i, want := range fingerprints {
+		if got, _ := list[i].(string); got != want {
+			t.Errorf("pki.blocklist[%d] = %q, want %q", i, got, want)
+		}
+	}
+
+	// The keys Nebula needs alongside it must survive.
+	for _, k := range []string{"ca", "cert", "key"} {
+		if _, ok := pki[k]; !ok {
+			t.Errorf("pki.%s went missing when the blocklist was added", k)
+		}
+	}
+}
+
+// An empty blocklist must be omitted, not written as an empty list. A network
+// with nothing revoked should render the config it always did, so upgrading the
+// library does not show every host a spurious diff.
+func TestGenerateHostConfigOmitsAnEmptyBlocklist(t *testing.T) {
+	g := NewGenerator()
+
+	for name, blocklist := range map[string][]string{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			out, err := g.GenerateHostConfig(testHost(), testLighthouses(), blocklist)
+			if err != nil {
+				t.Fatalf("GenerateHostConfig failed: %v", err)
+			}
+			pki, ok := parseConfig(t, out)["pki"].(map[string]interface{})
+			if !ok {
+				t.Fatal("pki section missing")
+			}
+			if _, present := pki["blocklist"]; present {
+				t.Error("pki.blocklist was written for an empty revocation list")
+			}
+			if strings.Contains(out, "blocklist") {
+				t.Error("the rendered config mentions blocklist despite there being nothing to revoke")
+			}
+		})
 	}
 }

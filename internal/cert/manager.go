@@ -231,3 +231,35 @@ func (m *Manager) GenerateHostCert(params HostCertParams) (*HostCertResult, erro
 		ExpiresAt:      expiresAt,
 	}, nil
 }
+
+// FingerprintFromPEM returns the SHA-256 fingerprint of a PEM-encoded
+// certificate, in the form Nebula's `pki.blocklist` expects.
+//
+// This is how a host certificate is revoked. Nebula has no CRL and no OCSP:
+// revocation is a list of certificate fingerprints in every OTHER host's
+// config, loaded into the CA pool at startup and on SIGHUP
+// (nebula/pki.go, reloadCAPool). So "revoke this host" means "add its
+// fingerprint to the blocklist of every peer that might handshake with it",
+// which is a fan-out rather than a single central write.
+//
+// The fingerprint is derived from the stored certificate rather than cached in
+// a column, because InitializeCollections never alters an existing collection's
+// schema -- a new field would silently be absent on every deployment that
+// already exists. Parsing a PEM is cheap and the config generator already runs
+// only on change.
+//
+// SIDE EFFECTS: None (pure).
+func FingerprintFromPEM(certPEM string) (string, error) {
+	if certPEM == "" {
+		return "", fmt.Errorf("certificate is empty")
+	}
+	parsed, _, err := nebulacert.UnmarshalCertificateFromPEM([]byte(certPEM))
+	if err != nil {
+		return "", fmt.Errorf("failed to parse certificate: %w", err)
+	}
+	fp, err := parsed.Fingerprint()
+	if err != nil {
+		return "", fmt.Errorf("failed to fingerprint certificate: %w", err)
+	}
+	return fp, nil
+}

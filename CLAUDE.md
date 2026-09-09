@@ -48,9 +48,29 @@ The update hook in `internal/sync/manager.go` (`setupHostHooks`) distinguishes w
 - **Cert regeneration (expensive)** when `hostname`, `overlay_ip`, `groups`, or `validity_years` change — these are embedded in the certificate.
 - **Config-only regeneration (cheap)** when `is_lighthouse`, `public_host_port`, `firewall_outbound`, or `firewall_inbound` change — these are config-only.
 - **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. Fan-out also fires on active-lighthouse create and delete, and on network `cidr_range` change.
-- **No regeneration** for `email`, `password`, or anything else. `active` alone triggers only the peer fan-out (it gates `getLighthouses`), never the host's own regen.
+- **`active` on ANY host** — lighthouse or not — triggers both the peer fan-out *and* that host's own config regeneration. Deactivating a host revokes its certificate, and Nebula revocation lives in every OTHER host's `pki.blocklist` (see **Revocation** below), so an active flip makes every config in the network stale. The host's own config is regenerated separately because the fan-out deliberately excludes the record that changed.
+- **No regeneration** for `email`, `password`, or anything else.
 
 If you add a new host field, decide which tier it belongs in and update the diff logic in `setupHostHooks`. Otherwise the field will silently never trigger regeneration, or will trigger an expensive cert regen it doesn't need.
+
+### Revocation is a fan-out, not a record
+
+**Nebula has no CRL and no OCSP.** The only way to refuse a certificate the CA already signed is `pki.blocklist`: a list of certificate fingerprints carried by every *other* host, loaded into the CA pool at startup and again on SIGHUP (`nebula/pki.go`, `loadCAPoolFromConfig` / `reloadCAPool`). Revocation is therefore a property of the whole network that every member config has to restate — the opposite shape from NATS, where a revocation list lives inside the signed account JWT and one write reaches every server.
+
+Consequences worth keeping:
+
+- `getBlocklist(networkID)` (`internal/sync/manager.go`) returns the fingerprints of every host in the network with `active = false`, **sorted** — unsorted, map iteration order would make every regeneration look like a change.
+- The fingerprint is **derived from the stored certificate** (`cert.FingerprintFromPEM`), not cached in a column. `InitializeCollections` never alters an existing collection's schema, so a new field would be silently absent on every deployment that already exists.
+- An empty blocklist is **omitted** from the config rather than written as an empty list, so a network with nothing revoked renders exactly the config it did before this feature.
+- A failure to build the blocklist is **logged, never fatal**. A config without a blocklist is the config this library generated for years; failing would stop a host getting any config at all.
+
+**A host is born active.** PocketBase bools have no schema-level default, so a create that omits `active` lands as false -- and every host minted through the API omits it. That was nearly harmless while `active` only gated `getLighthouses`; it stopped being harmless once `active` drove `pki.blocklist`, because a freshly issued certificate would be blocklisted by every peer from the moment it was created. `setupHostHooks` therefore forces `active = true` on create. It is forced rather than defaulted-if-absent because by the time a hook sees the record, "field omitted" and "explicitly false" are indistinguishable; creating an already-revoked host is not a meaningful operation, and deactivation is an update.
+
+**Deactivate to revoke; do not delete.** A deleted host record takes its certificate with it, and a fingerprint that is not in the database cannot be blocklisted — so deleting a host leaves its certificate valid until it expires. Deletion is for hosts you are content to leave trusted.
+
+**The config is not the delivery.** Regenerating `config_yaml` updates the database; it does not push anything to a device. Revocation takes effect when each peer's config is redeployed and the process reloads. That boundary is deliberate and matches the NATS side, where the platform mints a credential and does not care what connects with it — but it means "revoked" here means "revoked in the material we hand out", not "already off the mesh".
+
+`internal/config/blocklist_honoured_test.go` is the test that earns this: it reproduces `loadCAPoolFromConfig` with Nebula's own `cert` package and asserts the blocklisted certificate actually fails `VerifyCertificate`, paired with one that still passes. A YAML assertion cannot catch a fingerprint computed the wrong way — Nebula compares the string opaquely, so a wrong-but-plausible hex value blocks nothing and reports no error.
 
 ### Recursion prevention (saveInternal — do not bypass)
 Saves issued by pb-nebula itself re-fire the update hooks, and `e.Record.Original()` inside a re-fired hook still holds the **pre-request** snapshot — so any field-diff that triggered once would trigger again, looping forever (this exact loop shipped in the pre-`saveInternal` code: changing `public_host_port` regenerated ~37k times until killed). All internal writes go through `sm.saveInternal(record)`, which marks the record ID in `internalSaves`; the host update hook skips marked events via `isInternalSave`. If you add a hook that saves records, use `saveInternal`, never `sm.app.Save` directly. The older "certificate empty → populated" guard is kept as defense in depth for the creation flow (commits `f9823fb`, `1780bff`).

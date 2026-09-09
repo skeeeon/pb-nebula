@@ -160,3 +160,88 @@ func TestGenerateHostCertInvalidIP(t *testing.T) {
 		t.Error("expected error for invalid overlay IP, got nil")
 	}
 }
+
+// The fingerprint must match what nebula's own CA pool computes, because that
+// is the value `pki.blocklist` is compared against at handshake time. Deriving
+// it any other way -- hashing the PEM text, hashing the DER by hand -- produces
+// a string that looks plausible, blocks nothing, and reports no error.
+func TestFingerprintFromPEMMatchesNebulasOwnValue(t *testing.T) {
+	m := NewManager()
+
+	ca, err := m.GenerateCA("fp-ca", 10)
+	if err != nil {
+		t.Fatalf("GenerateCA failed: %v", err)
+	}
+	host, err := m.GenerateHostCert(HostCertParams{
+		Hostname:        "door-01",
+		OverlayIP:       "10.128.0.7",
+		ValidityYears:   1,
+		CACertPEM:       ca.CertificatePEM,
+		CAPrivateKeyPEM: ca.PrivateKeyPEM,
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostCert failed: %v", err)
+	}
+
+	got, err := FingerprintFromPEM(host.CertificatePEM)
+	if err != nil {
+		t.Fatalf("FingerprintFromPEM failed: %v", err)
+	}
+
+	parsed, _, err := nebulacert.UnmarshalCertificateFromPEM([]byte(host.CertificatePEM))
+	if err != nil {
+		t.Fatalf("host certificate does not parse: %v", err)
+	}
+	want, err := parsed.Fingerprint()
+	if err != nil {
+		t.Fatalf("Fingerprint failed: %v", err)
+	}
+
+	if got != want {
+		t.Errorf("fingerprint = %q, want %q", got, want)
+	}
+	if got == "" {
+		t.Error("fingerprint is empty; a blocklist of empty strings blocks nothing")
+	}
+}
+
+// Two different hosts must not share a fingerprint, or blocklisting one would
+// take the other off the mesh with it.
+func TestFingerprintFromPEMIsPerCertificate(t *testing.T) {
+	m := NewManager()
+	ca, err := m.GenerateCA("fp-ca", 10)
+	if err != nil {
+		t.Fatalf("GenerateCA failed: %v", err)
+	}
+
+	fps := make(map[string]string)
+	for _, name := range []string{"door-01", "door-02"} {
+		host, err := m.GenerateHostCert(HostCertParams{
+			Hostname:        name,
+			OverlayIP:       "10.128.0.7",
+			ValidityYears:   1,
+			CACertPEM:       ca.CertificatePEM,
+			CAPrivateKeyPEM: ca.PrivateKeyPEM,
+		})
+		if err != nil {
+			t.Fatalf("GenerateHostCert(%s) failed: %v", name, err)
+		}
+		fp, err := FingerprintFromPEM(host.CertificatePEM)
+		if err != nil {
+			t.Fatalf("FingerprintFromPEM(%s) failed: %v", name, err)
+		}
+		if prev, dup := fps[fp]; dup {
+			t.Fatalf("%s and %s share fingerprint %s", prev, name, fp)
+		}
+		fps[fp] = name
+	}
+}
+
+func TestFingerprintFromPEMRejectsGarbage(t *testing.T) {
+	if _, err := FingerprintFromPEM(""); err == nil {
+		t.Error("expected an error for an empty certificate")
+	}
+	if _, err := FingerprintFromPEM("not a pem"); err == nil {
+		t.Error("expected an error for a non-PEM string")
+	}
+}
