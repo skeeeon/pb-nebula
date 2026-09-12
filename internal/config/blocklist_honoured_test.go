@@ -75,7 +75,7 @@ func TestNebulasCAPoolRefusesABlocklistedCertificate(t *testing.T) {
 		CACertificate: ca.CertificatePEM,
 	}
 
-	out, err := NewGenerator().GenerateHostConfig(host, testLighthouses(), []string{revokedFP})
+	out, err := NewGenerator().GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses(), Blocklist: []string{revokedFP}})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}

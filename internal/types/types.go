@@ -87,9 +87,12 @@ type HostRecord struct {
 	OverlayIP string `json:"overlay_ip"` // Overlay network IP (e.g., "10.128.0.100")
 	Groups    string `json:"groups"`     // JSON array of group names for firewall rules
 
-	// Lighthouse configuration
+	// Lighthouse and relay configuration. Both roles need public_host_port:
+	// peers reach a lighthouse through static_host_map and a relay at the
+	// address they were handed, so neither can use an ephemeral port.
 	IsLighthouse   bool   `json:"is_lighthouse"`    // True if this host is a lighthouse
-	PublicHostPort string `json:"public_host_port"` // Public IP:PORT (required if lighthouse)
+	IsRelay        bool   `json:"is_relay"`         // True if this host relays for peers that cannot punch
+	PublicHostPort string `json:"public_host_port"` // Public IP:PORT (required if lighthouse or relay)
 
 	// Per-host tun overrides. The zero value means "inherit the generator
 	// default" so an existing host renders exactly the config it always did.

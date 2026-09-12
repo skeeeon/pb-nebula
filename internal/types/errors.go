@@ -28,6 +28,7 @@ var (
 	ErrInvalidIP            = errors.New("invalid IP address")
 	ErrIPNotInNetwork       = errors.New("IP address not within network CIDR")
 	ErrLighthouseNoPublicIP = errors.New("lighthouse hosts require public_host_port")
+	ErrRelayNoPublicIP      = errors.New("relay hosts require public_host_port")
 
 	// Config errors - Configuration generation
 	ErrConfigGeneration = errors.New("failed to generate config")

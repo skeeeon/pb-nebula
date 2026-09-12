@@ -52,8 +52,10 @@ Fields whose zero value means "inherit the default" (`mtu`, `tun_device`) rely o
 The update hook in `internal/sync/manager.go` (`setupHostHooks`) distinguishes what *has* to be regenerated:
 
 - **Cert regeneration (expensive)** when `hostname`, `overlay_ip`, `groups`, or `validity_years` change — these are embedded in the certificate.
-- **Config-only regeneration (cheap)** when `is_lighthouse`, `public_host_port`, `firewall_outbound`, `firewall_inbound`, `mtu`, or `tun_device` change — these are config-only.
-- **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. Fan-out also fires on active-lighthouse create and delete, and on network `cidr_range` change.
+- **Config-only regeneration (cheap)** when `is_lighthouse`, `is_relay`, `public_host_port`, `firewall_outbound`, `firewall_inbound`, `mtu`, or `tun_device` change — these are config-only.
+- **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. The same applies to relays (`is_relay`, `active`, `overlay_ip` — but *not* `public_host_port`, since peers carry only a relay's overlay IP, not its endpoint). Fan-out also fires on active lighthouse/relay create and delete, and on network `cidr_range` change.
+
+  **A fan-out field almost always needs a config-only entry too.** `regenerateNetworkHostConfigs` deliberately excludes the record that changed, so a field that only appears in the fan-out list updates every host *except* the one that was edited. This shipped briefly for `is_relay`: clearing the flag left `am_relay: true` in the host's own config, so it kept relaying for peers that had already dropped it.
 - **`active` on ANY host** — lighthouse or not — triggers both the peer fan-out *and* that host's own config regeneration. Deactivating a host revokes its certificate, and Nebula revocation lives in every OTHER host's `pki.blocklist` (see **Revocation** below), so an active flip makes every config in the network stale. The host's own config is regenerated separately because the fan-out deliberately excludes the record that changed.
 - **No regeneration** for `email`, `password`, or anything else.
 
@@ -80,6 +82,14 @@ Consequences worth keeping:
 
 ### Recursion prevention (saveInternal — do not bypass)
 Saves issued by pb-nebula itself re-fire the update hooks, and `e.Record.Original()` inside a re-fired hook still holds the **pre-request** snapshot — so any field-diff that triggered once would trigger again, looping forever (this exact loop shipped in the pre-`saveInternal` code: changing `public_host_port` regenerated ~37k times until killed). All internal writes go through `sm.saveInternal(record)`, which marks the record ID in `internalSaves`; the host update hook skips marked events via `isInternalSave`. If you add a hook that saves records, use `saveInternal`, never `sm.app.Save` directly. The older "certificate empty → populated" guard is kept as defense in depth for the creation flow (commits `f9823fb`, `1780bff`).
+
+### Relays are config-only; lighthouses are not the same shape
+
+`is_relay` is pure config — nothing about relaying reaches the certificate, so toggling it never triggers a cert regeneration. That is the whole difference from a cert-bound field like `groups`.
+
+`config.buildRelayConfig` emits `am_relay: true` for a relay and `relays: [...]` for everyone else, and **omits the section entirely** when a network has no relays, so existing deployments see no diff. It never emits `use_relays`: Nebula defaults it to true and forces `useRelays = use_relays && !amRelay` (`relay_manager.go`), and ignores `relay.relays` outright when `am_relay` is set (`lighthouse.go`) — so a relay can never route through another relay no matter what we write. Emitting only `am_relay` states that directly instead of restating Nebula's defaults in every config.
+
+Relays are **not** added to `static_host_map` — unlike a lighthouse, a relay's address is learned through the lighthouse at runtime. But a relay does need `public_host_port`, because `extractPort` would otherwise give it `listen.port: 0` (ephemeral) while every peer is handed its overlay IP as a usable path. `validateHostRecord` rejects a relay without one rather than letting that fail silently.
 
 ### Firewall rules are host-based, not network-based
 This mirrors Nebula's own design. `nebula_networks` has no firewall fields. Every host carries `firewall_outbound` and `firewall_inbound` as JSON arrays in Nebula's native format. The config generator (`internal/config/generator.go`) applies Nebula-recommended defaults (allow-all outbound, ICMP-only inbound) when a host's rules are empty.

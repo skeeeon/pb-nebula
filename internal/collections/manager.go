@@ -443,6 +443,9 @@ func hostFields() []core.Field {
 		&core.BoolField{
 			Name: "is_lighthouse",
 		},
+		&core.BoolField{
+			Name: "is_relay",
+		},
 		&core.TextField{
 			Name: "public_host_port",
 			Max:  100,

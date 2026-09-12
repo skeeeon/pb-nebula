@@ -40,7 +40,7 @@ func parseConfig(t *testing.T, yamlStr string) map[string]interface{} {
 func TestGenerateHostConfigRegularHost(t *testing.T) {
 	g := NewGenerator()
 
-	out, err := g.GenerateHostConfig(testHost(), testLighthouses(), nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses(), Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestGenerateHostConfigLighthouse(t *testing.T) {
 	host.IsLighthouse = true
 	host.PublicHostPort = "1.2.3.4:4242"
 
-	out, err := g.GenerateHostConfig(host, testLighthouses(), nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses(), Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestGenerateHostConfigLighthouse(t *testing.T) {
 func TestGenerateHostConfigDefaultFirewall(t *testing.T) {
 	g := NewGenerator()
 
-	out, err := g.GenerateHostConfig(testHost(), nil, nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: nil, Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestGenerateHostConfigCustomFirewall(t *testing.T) {
 	host := testHost()
 	host.FirewallInbound = `[{"port": "22", "proto": "tcp", "groups": ["admin"]}]`
 
-	out, err := g.GenerateHostConfig(host, testLighthouses(), nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses(), Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestGenerateHostConfigInvalidFirewall(t *testing.T) {
 	host := testHost()
 	host.FirewallInbound = `{not json`
 
-	_, err := g.GenerateHostConfig(host, nil, nil)
+	_, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: nil, Blocklist: nil})
 	if !errors.Is(err, types.ErrInvalidFirewall) {
 		t.Errorf("expected ErrInvalidFirewall, got %v", err)
 	}
@@ -172,18 +172,23 @@ func TestExtractPort(t *testing.T) {
 	tests := []struct {
 		hostPort     string
 		isLighthouse bool
+		isRelay      bool
 		want         int
 	}{
-		{"1.2.3.4:4242", true, 4242},
-		{"1.2.3.4:4242", false, 0}, // regular hosts use ephemeral port
-		{"", true, 0},
-		{"no-port", true, 0},
-		{"[fd00::1]:4242", true, 4242}, // IPv6 public endpoint
+		{"1.2.3.4:4242", true, false, 4242},
+		{"1.2.3.4:4242", false, false, 0}, // regular hosts use ephemeral port
+		{"1.2.3.4:4242", false, true, 4242},
+		{"1.2.3.4:4242", true, true, 4242}, // lighthouse that also relays
+		{"", true, false, 0},
+		{"", false, true, 0},
+		{"no-port", true, false, 0},
+		{"[fd00::1]:4242", true, false, 4242}, // IPv6 public endpoint
 	}
 
 	for _, tt := range tests {
-		if got := g.extractPort(tt.hostPort, tt.isLighthouse); got != tt.want {
-			t.Errorf("extractPort(%q, %v) = %d, want %d", tt.hostPort, tt.isLighthouse, got, tt.want)
+		if got := g.extractPort(tt.hostPort, tt.isLighthouse, tt.isRelay); got != tt.want {
+			t.Errorf("extractPort(%q, lighthouse=%v, relay=%v) = %d, want %d",
+				tt.hostPort, tt.isLighthouse, tt.isRelay, got, tt.want)
 		}
 	}
 }
@@ -193,7 +198,7 @@ func TestGenerateHostConfigEmbedsPrivateKeyInline(t *testing.T) {
 	// inline (Nebula's PKI block requires it), so it is plaintext at rest.
 	g := NewGenerator()
 
-	out, err := g.GenerateHostConfig(testHost(), nil, nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: nil, Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -215,7 +220,7 @@ func TestGenerateHostConfigWritesTheBlocklistUnderPKI(t *testing.T) {
 		"2222222222222222222222222222222222222222222222222222222222222222",
 	}
 
-	out, err := g.GenerateHostConfig(testHost(), testLighthouses(), fingerprints)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses(), Blocklist: fingerprints})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -259,7 +264,7 @@ func TestGenerateHostConfigOmitsAnEmptyBlocklist(t *testing.T) {
 
 	for name, blocklist := range map[string][]string{"nil": nil, "empty": {}} {
 		t.Run(name, func(t *testing.T) {
-			out, err := g.GenerateHostConfig(testHost(), testLighthouses(), blocklist)
+			out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses(), Blocklist: blocklist})
 			if err != nil {
 				t.Fatalf("GenerateHostConfig failed: %v", err)
 			}
@@ -288,7 +293,7 @@ func TestGenerateHostConfigAppliesTunOverrides(t *testing.T) {
 	host.MTU = 1200
 	host.TunDevice = "neb0"
 
-	out, err := g.GenerateHostConfig(host, testLighthouses(), nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses(), Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -315,7 +320,7 @@ func TestGenerateHostConfigAppliesTunOverrides(t *testing.T) {
 func TestGenerateHostConfigKeepsTunDefaultsWhenUnset(t *testing.T) {
 	g := NewGenerator()
 
-	out, err := g.GenerateHostConfig(testHost(), testLighthouses(), nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses(), Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -327,5 +332,99 @@ func TestGenerateHostConfigKeepsTunDefaultsWhenUnset(t *testing.T) {
 	}
 	if tun["dev"] != "nebula1" {
 		t.Errorf("expected default tun.dev nebula1, got %v", tun["dev"])
+	}
+}
+
+// TestGenerateHostConfigRelayHost checks that a relay advertises itself and
+// nothing else. Nebula ignores relay.relays when am_relay is true and forces
+// useRelays off for a relay, so emitting a list here would be config that reads
+// as meaningful and is silently discarded.
+func TestGenerateHostConfigRelayHost(t *testing.T) {
+	g := NewGenerator()
+
+	host := testHost()
+	host.IsRelay = true
+	host.PublicHostPort = "203.0.113.7:4242"
+
+	out, err := g.GenerateHostConfig(HostConfigInput{
+		Host:        host,
+		Lighthouses: testLighthouses(),
+		Relays:      []string{"10.128.0.9"},
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	relay := cfg["relay"].(map[string]interface{})
+	if relay["am_relay"] != true {
+		t.Errorf("expected am_relay true, got %v", relay["am_relay"])
+	}
+	if _, ok := relay["relays"]; ok {
+		t.Error("a relay must not be given relays of its own")
+	}
+	if _, ok := relay["use_relays"]; ok {
+		t.Error("use_relays should never be emitted; Nebula's default already handles it")
+	}
+
+	// A relay needs a stable listening port, like a lighthouse
+	listen := cfg["listen"].(map[string]interface{})
+	if listen["port"] != 4242 {
+		t.Errorf("expected relay to listen on 4242, got %v", listen["port"])
+	}
+}
+
+// TestGenerateHostConfigPeerGetsRelayList checks the other half: an ordinary
+// host is handed the network's relays as paths it may use.
+func TestGenerateHostConfigPeerGetsRelayList(t *testing.T) {
+	g := NewGenerator()
+
+	out, err := g.GenerateHostConfig(HostConfigInput{
+		Host:        testHost(),
+		Lighthouses: testLighthouses(),
+		Relays:      []string{"10.128.0.7", "10.128.0.9"},
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	relay := cfg["relay"].(map[string]interface{})
+	relays := relay["relays"].([]interface{})
+	if len(relays) != 2 || relays[0] != "10.128.0.7" || relays[1] != "10.128.0.9" {
+		t.Errorf("unexpected relays list: %v", relays)
+	}
+	if _, ok := relay["am_relay"]; ok {
+		t.Error("a non-relay host should not carry am_relay")
+	}
+
+	// Relays are reached via the lighthouse, not a static_host_map entry
+	shm := cfg["static_host_map"].(map[string]interface{})
+	if _, ok := shm["10.128.0.7"]; ok {
+		t.Error("relays must not be added to static_host_map")
+	}
+}
+
+// TestGenerateHostConfigOmitsRelaySectionWhenNoRelays is the no-spurious-diff
+// guarantee: a network that uses no relays must render exactly the config it
+// rendered before relay support existed, key for key.
+func TestGenerateHostConfigOmitsRelaySectionWhenNoRelays(t *testing.T) {
+	g := NewGenerator()
+
+	out, err := g.GenerateHostConfig(HostConfigInput{
+		Host:        testHost(),
+		Lighthouses: testLighthouses(),
+		Relays:      nil,
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	if relay, ok := cfg["relay"]; ok {
+		t.Errorf("expected relay section omitted entirely, got %v", relay)
+	}
+	if strings.Contains(out, "relay") {
+		t.Errorf("config mentions relay despite the network having none:\n%s", out)
 	}
 }

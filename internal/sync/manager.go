@@ -287,9 +287,11 @@ func (sm *Manager) setupHostHooks() {
 
 		sm.logger.Success("Generated certificate and config for host %s", e.Record.GetString("hostname"))
 
-		// New active lighthouse - peers need it in their static_host_map
-		if e.Record.GetBool("is_lighthouse") && e.Record.GetBool("active") {
-			sm.logger.Config("New lighthouse %s, regenerating peer configs...", e.Record.GetString("hostname"))
+		// A new active lighthouse or relay changes what every peer renders:
+		// lighthouses land in static_host_map and the lighthouse section,
+		// relays in the relay section
+		if (e.Record.GetBool("is_lighthouse") || e.Record.GetBool("is_relay")) && e.Record.GetBool("active") {
+			sm.logger.Config("New lighthouse/relay %s, regenerating peer configs...", e.Record.GetString("hostname"))
 			sm.regenerateNetworkHostConfigs(e.Record.GetString("network_id"), e.Record.Id)
 		}
 
@@ -355,6 +357,14 @@ func (sm *Manager) setupHostHooks() {
 					sm.logger.Info("Lighthouse status changed for host %s, regenerating config", e.Record.GetString("hostname"))
 					needsConfigRegeneration = true
 				}
+				// The peer fan-out below deliberately excludes this record, so
+				// the host's OWN config has to be regenerated here or it keeps
+				// am_relay after it stops being a relay -- still relaying for
+				// peers that no longer list it.
+				if orig.GetBool("is_relay") != e.Record.GetBool("is_relay") {
+					sm.logger.Info("Relay status changed for host %s, regenerating config", e.Record.GetString("hostname"))
+					needsConfigRegeneration = true
+				}
 				if orig.GetString("public_host_port") != e.Record.GetString("public_host_port") {
 					sm.logger.Info("Public host/port changed for host %s, regenerating config", e.Record.GetString("hostname"))
 					needsConfigRegeneration = true
@@ -398,6 +408,19 @@ func (sm *Manager) setupHostHooks() {
 				if orig.GetBool("is_lighthouse") != e.Record.GetBool("is_lighthouse") ||
 					orig.GetBool("active") != e.Record.GetBool("active") ||
 					orig.GetString("public_host_port") != e.Record.GetString("public_host_port") ||
+					orig.GetString("overlay_ip") != e.Record.GetString("overlay_ip") {
+					needsPeerFanOut = true
+				}
+			}
+
+			// Same shape for relays: peers list this host's overlay_ip in their
+			// relay section, so becoming or ceasing to be a relay -- or moving
+			// -- makes every peer config in the network stale. public_host_port
+			// is absent here on purpose: unlike a lighthouse, a relay's address
+			// is not embedded in peer configs, only its overlay IP is.
+			if orig.GetBool("is_relay") || e.Record.GetBool("is_relay") {
+				if orig.GetBool("is_relay") != e.Record.GetBool("is_relay") ||
+					orig.GetBool("active") != e.Record.GetBool("active") ||
 					orig.GetString("overlay_ip") != e.Record.GetString("overlay_ip") {
 					needsPeerFanOut = true
 				}
@@ -464,8 +487,8 @@ func (sm *Manager) setupHostHooks() {
 			return e.Next()
 		}
 
-		if e.Record.GetBool("is_lighthouse") && e.Record.GetBool("active") {
-			sm.logger.Config("Lighthouse %s deleted, regenerating peer configs...", e.Record.GetString("hostname"))
+		if (e.Record.GetBool("is_lighthouse") || e.Record.GetBool("is_relay")) && e.Record.GetBool("active") {
+			sm.logger.Config("Lighthouse/relay %s deleted, regenerating peer configs...", e.Record.GetString("hostname"))
 			sm.regenerateNetworkHostConfigs(e.Record.GetString("network_id"), e.Record.Id)
 		}
 
@@ -494,6 +517,14 @@ func (sm *Manager) validateHostRecord(record *core.Record) error {
 	// Validate lighthouse requirements
 	if record.GetBool("is_lighthouse") && record.GetString("public_host_port") == "" {
 		return types.ErrLighthouseNoPublicIP
+	}
+
+	// A relay needs a stable listening port for the same practical reason a
+	// lighthouse does. Rejecting here rather than accepting and rendering
+	// listen.port 0 keeps this from failing silently: the relay would be
+	// advertised to every peer and then be unreachable at the port they try.
+	if record.GetBool("is_relay") && record.GetString("public_host_port") == "" {
+		return types.ErrRelayNoPublicIP
 	}
 
 	// Validate groups is valid JSON array
@@ -662,6 +693,12 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 		return fmt.Errorf("failed to get lighthouses: %w", err)
 	}
 
+	// Relays this host can route through when it cannot hole-punch to a peer
+	relays, err := sm.getRelays(network.Id)
+	if err != nil {
+		return fmt.Errorf("failed to get relays: %w", err)
+	}
+
 	// Certificate fingerprints this network refuses. Nebula has no CRL, so a
 	// deactivated host is only actually off the mesh once every peer config
 	// carries its fingerprint -- see getBlocklist.
@@ -677,7 +714,12 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 	hostModel := sm.recordToHostModel(record)
 
 	// Generate config (now uses host-level firewall rules)
-	configYAML, err := sm.configGen.GenerateHostConfig(hostModel, lighthouses, blocklist)
+	configYAML, err := sm.configGen.GenerateHostConfig(config.HostConfigInput{
+		Host:        hostModel,
+		Lighthouses: lighthouses,
+		Relays:      relays,
+		Blocklist:   blocklist,
+	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", types.ErrConfigGeneration, err)
 	}
@@ -752,6 +794,39 @@ func (sm *Manager) getLighthouses(networkID string) ([]types.LighthouseInfo, err
 	return lighthouses, nil
 }
 
+// getRelays returns the overlay IPs of every active relay in a network, sorted.
+//
+// Only active relays are advertised: an inactive host's certificate is
+// blocklisted, so naming it as a relay path would hand every peer a route
+// through a host none of them will complete a handshake with.
+//
+// SORTED, FOR THE SAME REASON getBlocklist IS:
+// Query order is not guaranteed, and an unsorted list would reorder itself
+// between regenerations -- making every config look changed and every peer
+// reload for nothing.
+//
+// PARAMETERS:
+//   - networkID: Network to search
+//
+// RETURNS:
+// - []string: Overlay IPs of active relays, sorted
+// - error if the query fails
+func (sm *Manager) getRelays(networkID string) ([]string, error) {
+	records, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
+		dbx.HashExp{"network_id": networkID, "is_relay": true, "active": true})
+	if err != nil {
+		return nil, err
+	}
+
+	relays := make([]string, 0, len(records))
+	for _, record := range records {
+		relays = append(relays, record.GetString("overlay_ip"))
+	}
+	sort.Strings(relays)
+
+	return relays, nil
+}
+
 // shouldHandleEvent determines if an event should be processed based on configured filters.
 func (sm *Manager) shouldHandleEvent(collectionName, eventType string) bool {
 	if sm.options.EventFilter != nil {
@@ -776,6 +851,7 @@ func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
 		OverlayIP:        record.GetString("overlay_ip"),
 		Groups:           record.GetString("groups"),
 		IsLighthouse:     record.GetBool("is_lighthouse"),
+		IsRelay:          record.GetBool("is_relay"),
 		PublicHostPort:   record.GetString("public_host_port"),
 		MTU:              record.GetInt("mtu"),
 		TunDevice:        record.GetString("tun_device"),
