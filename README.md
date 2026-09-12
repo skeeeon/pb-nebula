@@ -545,6 +545,14 @@ type Options struct {
     // Logging
     LogToConsole bool // Default: true
 
+    // Host certificate renewal (background job, serve only)
+    DisableHostCertRenewal bool    // Default: false (renewal is ON)
+    HostRenewalThreshold   float64 // Default: 0.20 — renew once 80% of the lifetime is gone
+    HostRenewalCron        string  // Default: "0 3 * * *"
+
+    // CA expiry warning (log only; never gated by DisableHostCertRenewal)
+    CAExpiryWarningDays int // Default: 90
+
     // Optional event filter
     EventFilter func(collectionName, eventType string) bool
 
@@ -552,6 +560,14 @@ type Options struct {
     EncryptionKey string
 }
 ```
+
+`CAExpiryWarningDays` is separate from renewal on purpose. A host certificate
+can be renewed; a CA cannot — the only remedy is rotation, which is a
+three-step operator procedure with a deliberate wait in the middle. Nebula's
+rotation guide asks you to start two to three months out, so the warning has to
+arrive with room for the wait, not just room for the work. Turning automatic
+host renewal off is a reason to want *more* warning about an expiring CA, which
+is why `DisableHostCertRenewal` does not silence it.
 
 ### Custom Configuration Example
 

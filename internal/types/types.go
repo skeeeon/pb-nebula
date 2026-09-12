@@ -210,6 +210,19 @@ type Options struct {
 	// HostRenewalCron is the cron expression for the renewal sweep.
 	// Default "0 3 * * *" (daily at 03:00).
 	HostRenewalCron string
+
+	// CAExpiryWarningDays is how far ahead of a CA's expiry to start warning.
+	// Default 90.
+	//
+	// A CA cannot be renewed, only rotated, and rotation is a three-step
+	// operator procedure with a deliberate wait in the middle -- Nebula's own
+	// guide says to begin two to three months out. Nothing else surfaces an
+	// aging CA in time: host renewal only notices once certificates are
+	// already clamped to the CA's NotAfter, which is both late and indirect.
+	//
+	// Not gated by DisableHostCertRenewal. Turning off automatic re-issue is a
+	// reason to want MORE warning about an expiring CA, not less.
+	CAExpiryWarningDays int
 }
 
 // Collection names with nebula_ prefix for clear identification
@@ -240,6 +253,23 @@ const (
 	// HostRenewalCronJobID namespaces the job so a host application registering
 	// its own cron entries cannot collide with ours.
 	HostRenewalCronJobID = "pbnebula_renew_host_certs"
+)
+
+// CA expiry warning defaults
+const (
+	// DefaultCAExpiryWarningDays starts warning 90 days out, matching the "two
+	// to three months in advance" Nebula's CA rotation guide asks for. The wait
+	// between prepare and commit is operator judgment and cannot be compressed,
+	// so the warning has to arrive with room for it.
+	DefaultCAExpiryWarningDays = 90
+
+	// DefaultCAExpiryCron runs the check daily at 03:30, after the renewal
+	// sweep rather than alongside it, so the two do not interleave their log
+	// output on the one morning both have something to say.
+	DefaultCAExpiryCron = "30 3 * * *"
+
+	// CAExpiryCronJobID namespaces the job, like HostRenewalCronJobID.
+	CAExpiryCronJobID = "pbnebula_warn_ca_expiry"
 )
 
 // Event types for logging and filtering

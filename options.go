@@ -39,6 +39,11 @@ func DefaultOptions() Options {
 		HostRenewalThreshold:   types.DefaultHostRenewalThreshold,
 		HostRenewalCron:        types.DefaultHostRenewalCron,
 
+		// Not gated by DisableHostCertRenewal: a CA cannot be renewed, only
+		// rotated, and rotation is a manual three-step procedure that needs
+		// warning ahead of time no matter how host certificates are handled.
+		CAExpiryWarningDays: types.DefaultCAExpiryWarningDays,
+
 		EventFilter: nil, // No filter by default, process all events
 	}
 }
@@ -85,6 +90,9 @@ func applyDefaultOptions(options Options) Options {
 	}
 	if options.HostRenewalCron == "" {
 		options.HostRenewalCron = defaults.HostRenewalCron
+	}
+	if options.CAExpiryWarningDays <= 0 {
+		options.CAExpiryWarningDays = defaults.CAExpiryWarningDays
 	}
 
 	return options

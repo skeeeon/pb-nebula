@@ -27,6 +27,20 @@ import (
 //
 // SIDE EFFECTS: Registers scheduled jobs on the PocketBase app.
 func (sm *Manager) SetupCron() error {
+	// The CA expiry warning is registered FIRST and unconditionally, because it
+	// is not part of renewal and must not be switched off with it. A CA cannot
+	// be renewed at all -- only rotated, by hand, with a wait in the middle --
+	// so an operator who has turned automatic re-issue off wants more warning
+	// about an expiring CA, not none.
+	if err := sm.app.Cron().Add(types.CAExpiryCronJobID, types.DefaultCAExpiryCron, func() {
+		sm.WarnOnExpiringCAs()
+	}); err != nil {
+		return fmt.Errorf("failed to schedule CA expiry check: %w", err)
+	}
+
+	sm.logger.Success("CA expiry check scheduled (%s, warning %d days ahead)",
+		types.DefaultCAExpiryCron, sm.options.CAExpiryWarningDays)
+
 	if sm.options.DisableHostCertRenewal {
 		sm.logger.Info("Host certificate renewal is disabled")
 		return nil

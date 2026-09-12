@@ -168,6 +168,7 @@ func initializeComponents(app *pocketbase.PocketBase, options Options) error {
 	// Read-only on purpose -- re-signing moves fingerprints, so it is staged by
 	// the operator through the `renew` field, not by a library upgrade.
 	syncManager.AuditHostCertNetworkMasks("")
+	syncManager.WarnOnExpiringCAs()
 
 	logger.Success("🎉 pb-nebula initialized successfully!")
 	logger.Info("Collections: %s, %s, %s",
