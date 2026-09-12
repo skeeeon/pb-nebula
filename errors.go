@@ -33,6 +33,8 @@ var (
 	ErrIPNotInNetwork       = types.ErrIPNotInNetwork
 	ErrLighthouseNoPublicIP = types.ErrLighthouseNoPublicIP
 	ErrRelayNoPublicIP      = types.ErrRelayNoPublicIP
+	ErrInvalidUnsafeNetwork = types.ErrInvalidUnsafeNetwork
+	ErrInvalidUnsafeRoute   = types.ErrInvalidUnsafeRoute
 
 	// Config errors - Configuration generation
 	ErrConfigGeneration = types.ErrConfigGeneration

@@ -109,6 +109,21 @@ type HostRecord struct {
 	FirewallOutbound string `json:"firewall_outbound"` // JSON array of outbound firewall rules
 	FirewallInbound  string `json:"firewall_inbound"`  // JSON array of inbound firewall rules
 
+	// Gateway routing to non-Nebula subnets. These two are the PROVIDER and
+	// CONSUMER halves of the same feature and live on DIFFERENT hosts:
+	//
+	//   - UnsafeNetworks is signed INTO this host's certificate. Nebula
+	//     authorizes routing on the certificate, not on config, so a gateway
+	//     whose cert omits a prefix silently refuses to route it -- the packet
+	//     is dropped before any firewall rule is consulted. Cert-bound.
+	//   - UnsafeRoutes tells THIS host to send traffic for a prefix through
+	//     some other host. Config-only.
+	//
+	// Both are required, on their respective hosts, for traffic to flow, and
+	// neither derives the other. See the Phase 3 notes in CLAUDE.md.
+	UnsafeNetworks string `json:"unsafe_networks"` // JSON array of CIDRs this host may route for
+	UnsafeRoutes   string `json:"unsafe_routes"`   // JSON array of {route, via} this host sends into the tunnel
+
 	// Certificate validity
 	ValidityYears int       `json:"validity_years"` // Certificate validity period
 	ExpiresAt     time.Time `json:"expires_at"`     // Certificate expiration timestamp
@@ -117,6 +132,23 @@ type HostRecord struct {
 	Active  bool      `json:"active"`  // Host enable/disable flag
 	Created time.Time `json:"created"` // Creation timestamp
 	Updated time.Time `json:"updated"` // Last update timestamp
+}
+
+// UnsafeRoute is one entry of Nebula's tun.unsafe_routes: traffic for Route is
+// sent through the mesh host whose overlay IP is Via.
+//
+// This is the CONSUMER half of gateway routing. The PROVIDER half is
+// HostRecord.UnsafeNetworks on the host named by Via, because Nebula authorizes
+// routing on the certificate: a via node whose cert does not carry the prefix
+// silently refuses to route it. Both halves are configured independently and
+// both are required.
+//
+// Only route and via are supported. Nebula also accepts optional mtu and metric
+// per route; they are omitted until someone needs them, rather than carried as
+// fields nothing sets.
+type UnsafeRoute struct {
+	Route string `json:"route"` // CIDR to route through the mesh (e.g., "192.168.50.0/24")
+	Via   string `json:"via"`   // Overlay IP of the gateway host (e.g., "10.128.0.5")
 }
 
 // LighthouseInfo contains the information needed to configure lighthouse discovery.
@@ -296,4 +328,43 @@ func (h *HostRecord) SetFirewallRules(outbound, inbound []map[string]interface{}
 	}
 
 	return nil
+}
+
+// GetUnsafeNetworks parses the JSON unsafe_networks array into a string slice.
+// These are the non-overlay prefixes this host is authorized to route for, and
+// they are signed into its certificate.
+//
+// RETURNS:
+// - []string: CIDR strings, empty slice if none are configured
+// - error if the JSON is malformed
+func (h *HostRecord) GetUnsafeNetworks() ([]string, error) {
+	if h.UnsafeNetworks == "" || h.UnsafeNetworks == "null" {
+		return []string{}, nil
+	}
+
+	var networks []string
+	if err := json.Unmarshal([]byte(h.UnsafeNetworks), &networks); err != nil {
+		return nil, err
+	}
+
+	return networks, nil
+}
+
+// GetUnsafeRoutes parses the JSON unsafe_routes array into UnsafeRoute values.
+// These tell this host to send traffic for a prefix through another mesh host.
+//
+// RETURNS:
+// - []UnsafeRoute: Routes, empty slice if none are configured
+// - error if the JSON is malformed
+func (h *HostRecord) GetUnsafeRoutes() ([]UnsafeRoute, error) {
+	if h.UnsafeRoutes == "" || h.UnsafeRoutes == "null" {
+		return []UnsafeRoute{}, nil
+	}
+
+	var routes []UnsafeRoute
+	if err := json.Unmarshal([]byte(h.UnsafeRoutes), &routes); err != nil {
+		return nil, err
+	}
+
+	return routes, nil
 }

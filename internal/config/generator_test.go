@@ -428,3 +428,70 @@ func TestGenerateHostConfigOmitsRelaySectionWhenNoRelays(t *testing.T) {
 		t.Errorf("config mentions relay despite the network having none:\n%s", out)
 	}
 }
+
+// TestGenerateHostConfigWritesUnsafeRoutes checks the consumer half lands under
+// tun.unsafe_routes with the exact keys Nebula's overlay/route.go reads. A
+// misspelled key here is inert YAML that looks like a working route.
+func TestGenerateHostConfigWritesUnsafeRoutes(t *testing.T) {
+	g := NewGenerator()
+
+	host := testHost()
+	host.UnsafeRoutes = `[{"route":"192.168.50.0/24","via":"10.128.0.5"},{"route":"172.16.0.0/16","via":"10.128.0.6"}]`
+
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	tun := cfg["tun"].(map[string]interface{})
+	raw, ok := tun["unsafe_routes"]
+	if !ok {
+		t.Fatalf("tun.unsafe_routes missing; tun section was %v", tun)
+	}
+	routes := raw.([]interface{})
+	if len(routes) != 2 {
+		t.Fatalf("expected 2 routes, got %d", len(routes))
+	}
+
+	first := routes[0].(map[string]interface{})
+	if first["route"] != "192.168.50.0/24" || first["via"] != "10.128.0.5" {
+		t.Errorf("unexpected first route: %v", first)
+	}
+	// Only route and via are emitted; Nebula treats mtu/metric as optional and
+	// we do not carry fields nothing sets
+	if len(first) != 2 {
+		t.Errorf("expected exactly route and via, got %v", first)
+	}
+}
+
+// TestGenerateHostConfigOmitsUnsafeRoutesWhenUnset is the no-spurious-diff
+// guarantee for the consumer half.
+func TestGenerateHostConfigOmitsUnsafeRoutesWhenUnset(t *testing.T) {
+	g := NewGenerator()
+
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses()})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	tun := cfg["tun"].(map[string]interface{})
+	if v, ok := tun["unsafe_routes"]; ok {
+		t.Errorf("expected tun.unsafe_routes omitted for a host with no routes, got %v", v)
+	}
+}
+
+// TestGenerateHostConfigInvalidUnsafeRoutes checks malformed stored JSON
+// surfaces as the matching sentinel rather than a bare marshal error.
+func TestGenerateHostConfigInvalidUnsafeRoutes(t *testing.T) {
+	g := NewGenerator()
+
+	host := testHost()
+	host.UnsafeRoutes = `{not json`
+
+	_, err := g.GenerateHostConfig(HostConfigInput{Host: host})
+	if !errors.Is(err, types.ErrInvalidUnsafeRoute) {
+		t.Errorf("expected ErrInvalidUnsafeRoute, got %v", err)
+	}
+}

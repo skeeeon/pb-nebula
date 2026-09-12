@@ -53,12 +53,20 @@ type HostCertResult struct {
 // The host certificate's expiration is clamped to the CA certificate's own
 // NotAfter (parsed from CACertPEM), so the host cert can never outlive its CA.
 type HostCertParams struct {
-	Hostname        string   // Host name for certificate
-	OverlayIP       string   // Overlay IP address (e.g., "10.128.0.100")
-	Groups          []string // Groups for firewall rules
-	ValidityYears   int      // Certificate validity period
-	CACertPEM       string   // CA certificate PEM (for signing)
-	CAPrivateKeyPEM string   // CA private key PEM (for signing)
+	Hostname      string   // Host name for certificate
+	OverlayIP     string   // Overlay IP address (e.g., "10.128.0.100")
+	Groups        []string // Groups for firewall rules
+	ValidityYears int      // Certificate validity period
+
+	// UnsafeNetworks are the non-overlay prefixes this host is authorized to
+	// route for. Nebula enforces routing on the certificate rather than on
+	// config: a gateway whose cert omits the prefix silently refuses to route
+	// it, and the packet is dropped before any firewall rule is consulted.
+	// Empty for ordinary hosts.
+	UnsafeNetworks []netip.Prefix
+
+	CACertPEM       string // CA certificate PEM (for signing)
+	CAPrivateKeyPEM string // CA private key PEM (for signing)
 }
 
 // GenerateCA creates a new self-signed Nebula CA certificate.
@@ -198,15 +206,16 @@ func (m *Manager) GenerateHostCert(params HostCertParams) (*HostCertResult, erro
 
 	// Create TBSCertificate for host
 	tbs := &nebulacert.TBSCertificate{
-		Version:   nebulacert.Version2,
-		Name:      params.Hostname,
-		Networks:  []netip.Prefix{overlayPrefix},
-		Groups:    params.Groups,
-		IsCA:      false,
-		NotBefore: notBefore,
-		NotAfter:  expiresAt,
-		PublicKey: pubKey,
-		Curve:     nebulacert.Curve_CURVE25519,
+		Version:        nebulacert.Version2,
+		Name:           params.Hostname,
+		Networks:       []netip.Prefix{overlayPrefix},
+		UnsafeNetworks: params.UnsafeNetworks,
+		Groups:         params.Groups,
+		IsCA:           false,
+		NotBefore:      notBefore,
+		NotAfter:       expiresAt,
+		PublicKey:      pubKey,
+		Curve:          nebulacert.Curve_CURVE25519,
 	}
 
 	// Sign with CA

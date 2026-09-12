@@ -20,7 +20,11 @@ go build -o basic ./examples/basic  # build the example server
 
 Admin UI at `http://127.0.0.1:8090/_/`. Data is written to `./pb_data` by default (see `examples/basic/main.go:163` `init()` — it sets `PB_DATA_DIR` if unset).
 
-`go test ./...` runs the test suite — the pure packages (`internal/cert`, `internal/ipam`, `internal/config`, `internal/types`, root options) are covered; hook behavior in `internal/sync` is not (needs a live PocketBase app). `gofmt -l .` should print nothing before committing.
+`go test ./...` runs the test suite — the pure packages (`internal/cert`, `internal/ipam`, `internal/config`, `internal/types`, root options) are covered; hook behavior in `internal/sync` is not (needs a live PocketBase app), so **tier and fan-out changes have to be verified by hand against `examples/basic`**. That gap is not theoretical: a missing config-only tier entry for `is_relay` was caught only by driving the running app.
+
+DB-backed validators keep their rules in a pure unexported half (`validateUnsafeNetworks`, `validateUnsafeRoutes`) with the exported method doing only the record lookup, so the rules stay testable.
+
+`gofmt -l .` should print nothing before committing — but on a Windows checkout with `core.autocrlf=true` it flags **every** file, because the working tree is CRLF while gofmt wants LF. Git normalizes on commit, so the repo is fine; to actually check formatting there, copy the tree through `tr -d '\r'` and run `gofmt -l` on the copy. Note also that gofmt rewrites multi-line `// -` doc bullets into `//   - ` form; the codebase uses single-line bullets with prose underneath, so keep bullets to one line.
 
 ## Architecture
 
@@ -51,8 +55,8 @@ Fields whose zero value means "inherit the default" (`mtu`, `tun_device`) rely o
 ### Tiered regeneration (do not break this)
 The update hook in `internal/sync/manager.go` (`setupHostHooks`) distinguishes what *has* to be regenerated:
 
-- **Cert regeneration (expensive)** when `hostname`, `overlay_ip`, `groups`, or `validity_years` change — these are embedded in the certificate.
-- **Config-only regeneration (cheap)** when `is_lighthouse`, `is_relay`, `public_host_port`, `firewall_outbound`, `firewall_inbound`, `mtu`, or `tun_device` change — these are config-only.
+- **Cert regeneration (expensive)** when `hostname`, `overlay_ip`, `groups`, `unsafe_networks`, or `validity_years` change — these are embedded in the certificate.
+- **Config-only regeneration (cheap)** when `is_lighthouse`, `is_relay`, `public_host_port`, `firewall_outbound`, `firewall_inbound`, `mtu`, `tun_device`, or `unsafe_routes` change — these are config-only.
 - **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. The same applies to relays (`is_relay`, `active`, `overlay_ip` — but *not* `public_host_port`, since peers carry only a relay's overlay IP, not its endpoint). Fan-out also fires on active lighthouse/relay create and delete, and on network `cidr_range` change.
 
   **A fan-out field almost always needs a config-only entry too.** `regenerateNetworkHostConfigs` deliberately excludes the record that changed, so a field that only appears in the fan-out list updates every host *except* the one that was edited. This shipped briefly for `is_relay`: clearing the flag left `am_relay: true` in the host's own config, so it kept relaying for peers that had already dropped it.
@@ -68,7 +72,7 @@ If you add a new host field, decide which tier it belongs in and update the diff
 Consequences worth keeping:
 
 - `getBlocklist(networkID)` (`internal/sync/manager.go`) returns the fingerprints of every host in the network with `active = false`, **sorted** — unsorted, map iteration order would make every regeneration look like a change.
-- The fingerprint is **derived from the stored certificate** (`cert.FingerprintFromPEM`), not cached in a column. `InitializeCollections` never alters an existing collection's schema, so a new field would be silently absent on every deployment that already exists.
+- The fingerprint is **derived from the stored certificate** (`cert.FingerprintFromPEM`), not cached in a column. That was originally forced — `InitializeCollections` could not add a field to an existing deployment — but it is still the right shape now that it can: a cached fingerprint is a second copy of something the certificate already states, and the two can disagree after any re-issue. Derive, don't cache. (`rotation_state` is absent from `nebula_ca` for the same reason.)
 - An empty blocklist is **omitted** from the config rather than written as an empty list, so a network with nothing revoked renders exactly the config it did before this feature.
 - A failure to build the blocklist is **logged, never fatal**. A config without a blocklist is the config this library generated for years; failing would stop a host getting any config at all.
 
@@ -82,6 +86,19 @@ Consequences worth keeping:
 
 ### Recursion prevention (saveInternal — do not bypass)
 Saves issued by pb-nebula itself re-fire the update hooks, and `e.Record.Original()` inside a re-fired hook still holds the **pre-request** snapshot — so any field-diff that triggered once would trigger again, looping forever (this exact loop shipped in the pre-`saveInternal` code: changing `public_host_port` regenerated ~37k times until killed). All internal writes go through `sm.saveInternal(record)`, which marks the record ID in `internalSaves`; the host update hook skips marked events via `isInternalSave`. If you add a hook that saves records, use `saveInternal`, never `sm.app.Save` directly. The older "certificate empty → populated" guard is kept as defense in depth for the creation flow (commits `f9823fb`, `1780bff`).
+
+### Gateway routing is two halves on two different hosts
+
+`unsafe_networks` and `unsafe_routes` are the **provider** and **consumer** halves of the same feature, they live on *different* hosts, and neither derives the other. Both are required for traffic to flow.
+
+- `unsafe_networks` (on the gateway) is signed **into the certificate**. Nebula authorizes routing on the certificate, not on config — a gateway whose cert omits the prefix silently refuses to route it, and the packet is dropped before any firewall rule runs. This is why it sits in the **cert regeneration** tier: editing it is completely inert until a new certificate is issued.
+- `unsafe_routes` (on every host that wants to reach that subnet) is plain config: `[{route, via}]`, where `via` is the gateway's overlay IP. Config-only tier, **no fan-out** — no peer embeds another host's routes.
+
+**Routes are not auto-derived, deliberately.** Two gateways can legitimately advertise the same prefix (two branch offices both on `192.168.1.0/24` is the common case), and inference would emit two entries for one route with different `via` values for Nebula to pick between arbitrarily. It would also push a prefix over the mesh for a host already sitting on that LAN.
+
+What compensates for that is validation, in `internal/ipam`: host bits rejected, duplicates and overlaps rejected, and **overlap with the network's own CIDR rejected** — an unsafe network inside the overlay shadows real mesh peers, because Nebula builds one routing table from the certificate's networks and unsafe networks together. `via` must be an overlay IP inside the network, since a typo there is otherwise inert.
+
+The cross-host half is a **warning, never a rejection** (`warnOnUnroutableUnsafeRoutes`). A route may legitimately be added before the gateway's certificate is updated, so rejecting would force an ordering — but staying silent leaves the operator with the failure this exists to surface: Nebula drops the packet with no log line, which reads like a peer or LAN outage rather than a config error.
 
 ### Relays are config-only; lighthouses are not the same shape
 

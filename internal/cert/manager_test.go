@@ -245,3 +245,90 @@ func TestFingerprintFromPEMRejectsGarbage(t *testing.T) {
 		t.Error("expected an error for a non-PEM string")
 	}
 }
+
+// TestGenerateHostCertCarriesUnsafeNetworks reads the prefixes back out of the
+// signed certificate using Nebula's own parser.
+//
+// This matters more than a struct-field assertion would suggest. Nebula
+// authorizes routing on the CERTIFICATE, not on config: a gateway whose cert
+// omits the prefix silently refuses to route it and the packet is dropped
+// before any firewall rule is consulted. There is no error and no log line, so
+// a prefix that fails to reach the cert looks exactly like a LAN outage.
+func TestGenerateHostCertCarriesUnsafeNetworks(t *testing.T) {
+	m := NewManager()
+
+	ca, err := m.GenerateCA("gateway-ca", 10)
+	if err != nil {
+		t.Fatalf("GenerateCA failed: %v", err)
+	}
+
+	want := []netip.Prefix{
+		netip.MustParsePrefix("192.168.50.0/24"),
+		netip.MustParsePrefix("172.16.0.0/16"),
+	}
+
+	result, err := m.GenerateHostCert(HostCertParams{
+		Hostname:        "gateway-01",
+		OverlayIP:       "10.128.0.5",
+		ValidityYears:   1,
+		UnsafeNetworks:  want,
+		CACertPEM:       ca.CertificatePEM,
+		CAPrivateKeyPEM: ca.PrivateKeyPEM,
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostCert failed: %v", err)
+	}
+
+	parsed, _, err := nebulacert.UnmarshalCertificateFromPEM([]byte(result.CertificatePEM))
+	if err != nil {
+		t.Fatalf("generated certificate does not parse: %v", err)
+	}
+
+	got := parsed.UnsafeNetworks()
+	if len(got) != len(want) {
+		t.Fatalf("expected %d unsafe networks in the certificate, got %d: %v", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("unsafe network %d: got %v, want %v", i, got[i], want[i])
+		}
+	}
+
+	// The overlay IP must still be the host's own address, not widened by the
+	// unsafe networks -- Nebula builds one routing table from both
+	networks := parsed.Networks()
+	if len(networks) != 1 || networks[0].Addr().String() != "10.128.0.5" {
+		t.Errorf("expected exactly the overlay /32, got %v", networks)
+	}
+}
+
+// TestGenerateHostCertOmitsUnsafeNetworksWhenUnset is the paired negative: an
+// ordinary host must not acquire routing authority it never asked for.
+func TestGenerateHostCertOmitsUnsafeNetworksWhenUnset(t *testing.T) {
+	m := NewManager()
+
+	ca, err := m.GenerateCA("plain-ca", 10)
+	if err != nil {
+		t.Fatalf("GenerateCA failed: %v", err)
+	}
+
+	result, err := m.GenerateHostCert(HostCertParams{
+		Hostname:        "plain-01",
+		OverlayIP:       "10.128.0.6",
+		ValidityYears:   1,
+		CACertPEM:       ca.CertificatePEM,
+		CAPrivateKeyPEM: ca.PrivateKeyPEM,
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostCert failed: %v", err)
+	}
+
+	parsed, _, err := nebulacert.UnmarshalCertificateFromPEM([]byte(result.CertificatePEM))
+	if err != nil {
+		t.Fatalf("generated certificate does not parse: %v", err)
+	}
+
+	if got := parsed.UnsafeNetworks(); len(got) != 0 {
+		t.Errorf("expected no unsafe networks on an ordinary host, got %v", got)
+	}
+}

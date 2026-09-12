@@ -495,6 +495,17 @@ func hostFields() []core.Field {
 			MaxSize: 10000,
 		},
 
+		// Gateway routing. unsafe_networks is cert-bound (the provider half);
+		// unsafe_routes is config-only (the consumer half, on other hosts).
+		&core.JSONField{
+			Name:    "unsafe_networks",
+			MaxSize: 1000,
+		},
+		&core.JSONField{
+			Name:    "unsafe_routes",
+			MaxSize: 2000,
+		},
+
 		// Certificate validity
 		&core.NumberField{
 			Name:    "validity_years",

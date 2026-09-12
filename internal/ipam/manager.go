@@ -164,3 +164,195 @@ func (m *Manager) ValidateIPFormat(ip string) error {
 	}
 	return nil
 }
+
+// MaxUnsafeNetworksPerHost bounds how many prefixes one host may route for.
+// These ride inside the signed certificate, which is handed to every peer on
+// every handshake, so an unbounded list inflates every handshake in the mesh.
+const MaxUnsafeNetworksPerHost = 16
+
+// MaxUnsafeRoutesPerHost bounds how many routes one host may consume. Config
+// only, so the cost is local, but a bound keeps one host from bloating its own
+// rendered config without limit.
+const MaxUnsafeRoutesPerHost = 32
+
+// ValidateUnsafeNetworks validates the prefixes a host is authorized to route for.
+//
+// WHAT IS CHECKED:
+// - Each entry parses as a CIDR and is IPv4 (consistent with the rest of pb-nebula)
+// - Canonical masked form: 192.168.1.0/24, never 192.168.1.5/24
+// - No duplicates and no pairwise overlaps
+// - No overlap with the network's own CIDR
+// - At most MaxUnsafeNetworksPerHost entries
+//
+// WHY THE OVERLAY CHECK IS FOLDED IN RATHER THAN OFFERED SEPARATELY:
+// No caller can then run half the validation. An unsafe network overlapping the
+// overlay would shadow real mesh peers, because Nebula builds ONE routing table
+// from the certificate's networks and unsafe networks together.
+//
+// WHAT IS DELIBERATELY NOT CHECKED:
+// Containment within the parent network. An unsafe network is by definition
+// outside the overlay - that is what makes it unsafe.
+//
+// PARAMETERS:
+//   - cidrs: Prefixes this host claims to route for
+//   - networkID: Network the host belongs to (for the overlay overlap check)
+//
+// RETURNS:
+// - nil if every prefix is valid
+// - error wrapping ErrInvalidUnsafeNetwork otherwise
+func (m *Manager) ValidateUnsafeNetworks(cidrs []string, networkID string) error {
+	if len(cidrs) == 0 {
+		return nil
+	}
+
+	overlay, err := m.networkCIDR(networkID)
+	if err != nil {
+		return err
+	}
+
+	return validateUnsafeNetworks(cidrs, overlay)
+}
+
+// validateUnsafeNetworks is the DB-free half of ValidateUnsafeNetworks, split
+// out so the rules can be tested without a live PocketBase app.
+func validateUnsafeNetworks(cidrs []string, overlay *net.IPNet) error {
+	if len(cidrs) > MaxUnsafeNetworksPerHost {
+		return fmt.Errorf("%w: at most %d allowed, got %d",
+			types.ErrInvalidUnsafeNetwork, MaxUnsafeNetworksPerHost, len(cidrs))
+	}
+
+	parsed := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		ip, prefix, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return fmt.Errorf("%w: %s: %v", types.ErrInvalidUnsafeNetwork, cidr, err)
+		}
+		if ip.To4() == nil {
+			return fmt.Errorf("%w: only IPv4 supported, got %s", types.ErrInvalidUnsafeNetwork, cidr)
+		}
+		// Reject host bits so the stored value says what it means
+		if !ip.Equal(prefix.IP) {
+			return fmt.Errorf("%w: %s has host bits set, use %s",
+				types.ErrInvalidUnsafeNetwork, cidr, prefix.String())
+		}
+		if networksOverlap(prefix, overlay) {
+			return fmt.Errorf("%w: %s overlaps the network's own CIDR %s and would shadow mesh peers",
+				types.ErrInvalidUnsafeNetwork, cidr, overlay.String())
+		}
+		for _, seen := range parsed {
+			if networksOverlap(prefix, seen) {
+				return fmt.Errorf("%w: %s overlaps %s", types.ErrInvalidUnsafeNetwork, cidr, seen.String())
+			}
+		}
+		parsed = append(parsed, prefix)
+	}
+
+	return nil
+}
+
+// ValidateUnsafeRoutes validates the routes a host sends into the tunnel.
+//
+// WHAT IS CHECKED:
+// - route parses as an IPv4 CIDR in canonical masked form
+// - route does not overlap the network's own CIDR
+// - via parses as an IPv4 address inside the network's own CIDR
+// - At most MaxUnsafeRoutesPerHost entries
+//
+// via is required to be inside the network CIDR because it names a mesh peer by
+// its overlay IP. A typo there is otherwise completely inert: Nebula finds no
+// such peer and drops the traffic without complaint.
+//
+// WHAT IS NOT CHECKED HERE:
+// Whether the host named by via actually declares the prefix in its own
+// unsafe_networks. That is a cross-host question needing a DB lookup, and it is
+// legitimately false while a gateway's certificate is being updated - so the
+// sync manager warns about it rather than rejecting.
+//
+// PARAMETERS:
+//   - routes: Routes this host wants to send through the mesh
+//   - networkID: Network the host belongs to
+//
+// RETURNS:
+// - nil if every route is valid
+// - error wrapping ErrInvalidUnsafeRoute otherwise
+func (m *Manager) ValidateUnsafeRoutes(routes []types.UnsafeRoute, networkID string) error {
+	if len(routes) == 0 {
+		return nil
+	}
+
+	overlay, err := m.networkCIDR(networkID)
+	if err != nil {
+		return err
+	}
+
+	return validateUnsafeRoutes(routes, overlay)
+}
+
+// validateUnsafeRoutes is the DB-free half of ValidateUnsafeRoutes, split out so
+// the rules can be tested without a live PocketBase app.
+func validateUnsafeRoutes(routes []types.UnsafeRoute, overlay *net.IPNet) error {
+	if len(routes) > MaxUnsafeRoutesPerHost {
+		return fmt.Errorf("%w: at most %d allowed, got %d",
+			types.ErrInvalidUnsafeRoute, MaxUnsafeRoutesPerHost, len(routes))
+	}
+
+	for _, route := range routes {
+		if route.Route == "" || route.Via == "" {
+			return fmt.Errorf("%w: both route and via are required, got route=%q via=%q",
+				types.ErrInvalidUnsafeRoute, route.Route, route.Via)
+		}
+
+		ip, prefix, err := net.ParseCIDR(route.Route)
+		if err != nil {
+			return fmt.Errorf("%w: route %s: %v", types.ErrInvalidUnsafeRoute, route.Route, err)
+		}
+		if ip.To4() == nil {
+			return fmt.Errorf("%w: only IPv4 supported, got route %s", types.ErrInvalidUnsafeRoute, route.Route)
+		}
+		if !ip.Equal(prefix.IP) {
+			return fmt.Errorf("%w: route %s has host bits set, use %s",
+				types.ErrInvalidUnsafeRoute, route.Route, prefix.String())
+		}
+		if networksOverlap(prefix, overlay) {
+			return fmt.Errorf("%w: route %s overlaps the network's own CIDR %s and would shadow mesh peers",
+				types.ErrInvalidUnsafeRoute, route.Route, overlay.String())
+		}
+
+		via := net.ParseIP(route.Via)
+		if via == nil {
+			return fmt.Errorf("%w: via %s is not a valid IP", types.ErrInvalidUnsafeRoute, route.Via)
+		}
+		if via.To4() == nil {
+			return fmt.Errorf("%w: only IPv4 supported, got via %s", types.ErrInvalidUnsafeRoute, route.Via)
+		}
+		// via names a mesh peer by overlay IP, so it has to be in this network
+		if !overlay.Contains(via) {
+			return fmt.Errorf("%w: via %s is not in the network CIDR %s; it must be a peer's overlay IP",
+				types.ErrInvalidUnsafeRoute, route.Via, overlay.String())
+		}
+	}
+
+	return nil
+}
+
+// networkCIDR loads a network record and parses its CIDR range.
+func (m *Manager) networkCIDR(networkID string) (*net.IPNet, error) {
+	network, err := m.app.FindRecordById(m.options.NetworkCollectionName, networkID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", types.ErrNetworkNotFound, err)
+	}
+
+	_, cidr, err := net.ParseCIDR(network.GetString("cidr_range"))
+	if err != nil {
+		return nil, fmt.Errorf("%w: network has invalid CIDR: %v", types.ErrInvalidCIDR, err)
+	}
+
+	return cidr, nil
+}
+
+// networksOverlap reports whether two prefixes share any address. One contains
+// the other's base address exactly when they overlap, so checking both
+// directions covers every case regardless of which prefix is wider.
+func networksOverlap(a, b *net.IPNet) bool {
+	return a.Contains(b.IP) || b.Contains(a.IP)
+}

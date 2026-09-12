@@ -4,6 +4,8 @@ package sync
 import (
 	"encoding/json"
 	"fmt"
+	"net/netip"
+	"slices"
 	"sort"
 	stdsync "sync"
 
@@ -346,6 +348,13 @@ func (sm *Manager) setupHostHooks() {
 				sm.logger.Info("Groups changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
 				needsCertRegeneration = true
 			}
+			// unsafe_networks is signed INTO the certificate -- Nebula
+			// authorizes routing on the cert, so an edit here is completely
+			// inert until a new certificate is issued
+			if orig.GetString("unsafe_networks") != e.Record.GetString("unsafe_networks") {
+				sm.logger.Info("Unsafe networks changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
+				needsCertRegeneration = true
+			}
 			if orig.GetInt("validity_years") != e.Record.GetInt("validity_years") && e.Record.GetInt("validity_years") > 0 {
 				sm.logger.Info("Validity years changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
 				needsCertRegeneration = true
@@ -383,6 +392,12 @@ func (sm *Manager) setupHostHooks() {
 				}
 				if orig.GetString("tun_device") != e.Record.GetString("tun_device") {
 					sm.logger.Info("Tun device changed for host %s, regenerating config", e.Record.GetString("hostname"))
+					needsConfigRegeneration = true
+				}
+				// The consumer half of gateway routing lives only in this
+				// host's own config -- no peer embeds it, so no fan-out
+				if orig.GetString("unsafe_routes") != e.Record.GetString("unsafe_routes") {
+					sm.logger.Info("Unsafe routes changed for host %s, regenerating config", e.Record.GetString("hostname"))
 					needsConfigRegeneration = true
 				}
 			}
@@ -536,6 +551,37 @@ func (sm *Manager) validateHostRecord(record *core.Record) error {
 		}
 	}
 
+	// Gateway routing. The two halves are validated independently because they
+	// live on different hosts: unsafe_networks is what THIS host may route for
+	// (and is signed into its certificate), unsafe_routes is what it sends to
+	// other hosts.
+	hostModel := &types.HostRecord{
+		UnsafeNetworks: record.GetString("unsafe_networks"),
+		UnsafeRoutes:   record.GetString("unsafe_routes"),
+	}
+
+	unsafeNetworks, err := hostModel.GetUnsafeNetworks()
+	if err != nil {
+		return fmt.Errorf("%w: unsafe_networks must be a JSON array of CIDR strings: %v",
+			types.ErrInvalidUnsafeNetwork, err)
+	}
+	if err := sm.ipamManager.ValidateUnsafeNetworks(unsafeNetworks, record.GetString("network_id")); err != nil {
+		return err
+	}
+
+	unsafeRoutes, err := hostModel.GetUnsafeRoutes()
+	if err != nil {
+		return fmt.Errorf("%w: unsafe_routes must be a JSON array of {route, via} objects: %v",
+			types.ErrInvalidUnsafeRoute, err)
+	}
+	if err := sm.ipamManager.ValidateUnsafeRoutes(unsafeRoutes, record.GetString("network_id")); err != nil {
+		return err
+	}
+
+	// Advisory only: the gateway's certificate may legitimately be updated after
+	// the route is added, so this never blocks the write
+	sm.warnOnUnroutableUnsafeRoutes(record, unsafeRoutes)
+
 	return nil
 }
 
@@ -642,12 +688,21 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 		validityYears = sm.options.DefaultHostValidityYears
 	}
 
+	// Prefixes this host may route for. These are signed INTO the certificate:
+	// Nebula authorizes routing on the cert, so a gateway whose cert omits a
+	// prefix silently refuses to route it.
+	unsafeNetworks, err := sm.parseUnsafeNetworks(record)
+	if err != nil {
+		return err
+	}
+
 	// Generate host certificate (expiry is clamped to the CA cert's NotAfter)
 	certResult, err := sm.certManager.GenerateHostCert(cert.HostCertParams{
 		Hostname:        record.GetString("hostname"),
 		OverlayIP:       record.GetString("overlay_ip"),
 		Groups:          groups,
 		ValidityYears:   validityYears,
+		UnsafeNetworks:  unsafeNetworks,
 		CACertPEM:       ca.GetString("certificate"),
 		CAPrivateKeyPEM: caPrivateKeyPEM,
 	})
@@ -794,6 +849,82 @@ func (sm *Manager) getLighthouses(networkID string) ([]types.LighthouseInfo, err
 	return lighthouses, nil
 }
 
+// parseUnsafeNetworks reads a host record's unsafe_networks into the prefix type
+// the cert package signs. Validation has already run in the request hook, so a
+// failure here means the stored JSON is malformed rather than the input was.
+//
+// PARAMETERS:
+//   - record: Host record
+//
+// RETURNS:
+// - []netip.Prefix: Prefixes to embed in the certificate, nil if none
+// - error wrapping ErrInvalidUnsafeNetwork if the stored value cannot be parsed
+func (sm *Manager) parseUnsafeNetworks(record *core.Record) ([]netip.Prefix, error) {
+	raw := record.GetString("unsafe_networks")
+	if raw == "" || raw == "null" {
+		return nil, nil
+	}
+
+	var cidrs []string
+	if err := json.Unmarshal([]byte(raw), &cidrs); err != nil {
+		return nil, fmt.Errorf("%w: %v", types.ErrInvalidUnsafeNetwork, err)
+	}
+
+	prefixes := make([]netip.Prefix, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s: %v", types.ErrInvalidUnsafeNetwork, cidr, err)
+		}
+		prefixes = append(prefixes, prefix)
+	}
+
+	return prefixes, nil
+}
+
+// warnOnUnroutableUnsafeRoutes logs a warning for each route whose gateway does
+// not declare the prefix in its own unsafe_networks.
+//
+// WHY THIS WARNS RATHER THAN REJECTS:
+// The two halves of gateway routing live on different hosts and are configured
+// independently, so a route can legitimately be added before the gateway's
+// certificate is updated. Rejecting would force a specific ordering; staying
+// silent would leave the operator with the failure this whole function exists to
+// surface -- Nebula drops the packet with no log line, which reads like a peer
+// or LAN outage rather than a configuration error.
+//
+// Failures to look up a peer are themselves only logged: this is advisory.
+//
+// SIDE EFFECTS: Logging only.
+func (sm *Manager) warnOnUnroutableUnsafeRoutes(record *core.Record, routes []types.UnsafeRoute) {
+	if len(routes) == 0 {
+		return
+	}
+
+	for _, route := range routes {
+		peers, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
+			dbx.HashExp{"network_id": record.GetString("network_id"), "overlay_ip": route.Via})
+		if err != nil || len(peers) == 0 {
+			sm.logger.Warning("Host %s routes %s via %s, but no host in this network has that overlay IP",
+				record.GetString("hostname"), route.Route, route.Via)
+			continue
+		}
+
+		gateway := peers[0]
+		declared, err := (&types.HostRecord{UnsafeNetworks: gateway.GetString("unsafe_networks")}).GetUnsafeNetworks()
+		if err != nil {
+			continue
+		}
+
+		if !slices.Contains(declared, route.Route) {
+			sm.logger.Warning("Host %s routes %s via %s, but %s does not declare %s in unsafe_networks -- "+
+				"Nebula will drop this traffic until it does",
+				record.GetString("hostname"), route.Route, route.Via,
+				gateway.GetString("hostname"), route.Route)
+		}
+	}
+}
+
 // getRelays returns the overlay IPs of every active relay in a network, sorted.
 //
 // Only active relays are advertised: an inactive host's certificate is
@@ -861,5 +992,7 @@ func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
 		ConfigYAML:       record.GetString("config_yaml"),
 		FirewallOutbound: record.GetString("firewall_outbound"),
 		FirewallInbound:  record.GetString("firewall_inbound"),
+		UnsafeNetworks:   record.GetString("unsafe_networks"),
+		UnsafeRoutes:     record.GetString("unsafe_routes"),
 	}
 }

@@ -140,6 +140,25 @@ func (g *Generator) GenerateHostConfig(in HostConfigInput) (string, error) {
 		tun["dev"] = host.TunDevice
 	}
 
+	// Routes this host sends into the tunnel. Omitted when empty so a host that
+	// gateways nothing renders the tun section it always did. Each entry needs
+	// the gateway named by `via` to carry the prefix in its own certificate --
+	// see HostRecord.UnsafeNetworks.
+	unsafeRoutes, err := host.GetUnsafeRoutes()
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", types.ErrInvalidUnsafeRoute, err)
+	}
+	if len(unsafeRoutes) > 0 {
+		entries := make([]map[string]interface{}, len(unsafeRoutes))
+		for i, r := range unsafeRoutes {
+			entries[i] = map[string]interface{}{
+				"route": r.Route,
+				"via":   r.Via,
+			}
+		}
+		tun["unsafe_routes"] = entries
+	}
+
 	// Build config structure
 	config := map[string]interface{}{
 		"pki":        pki,
