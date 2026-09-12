@@ -215,6 +215,36 @@ func caFields() []core.Field {
 			Name: "curve",
 			Max:  50,
 		},
+
+		// Rotation state. Only one of next_certificate / previous_certificate
+		// is ever set, and which one identifies the phase -- there is no
+		// separate status column, because a stored copy of something the
+		// certificate fields already say can only disagree with them.
+		&core.TextField{
+			Name: "next_certificate",
+			Max:  10000,
+		},
+		&core.TextField{
+			Name:   "next_private_key",
+			Hidden: true, // HIDDEN, like private_key: it is a live CA key
+			Max:    10000,
+		},
+		&core.TextField{
+			Name: "previous_certificate",
+			Max:  10000,
+		},
+		&core.DateField{
+			Name: "rotated_at",
+		},
+
+		// Action field. Text rather than bool because rotation has three verbs
+		// and a stuck `true` is dangerous. The hook resets it to "".
+		&core.TextField{
+			Name:    "rotate",
+			Max:     10,
+			Pattern: `^(prepare|commit|finish)$`,
+		},
+
 		&core.AutodateField{
 			Name:     "created",
 			OnCreate: true,

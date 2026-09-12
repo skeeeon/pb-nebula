@@ -16,8 +16,9 @@ import "errors"
 // - Operational errors: Runtime generation failures that may be transient
 var (
 	// Certificate errors - Cryptographic operations
-	ErrCertGeneration = errors.New("failed to generate certificate")
-	ErrCANotFound     = errors.New("CA not found")
+	ErrCertGeneration  = errors.New("failed to generate certificate")
+	ErrCANotFound      = errors.New("CA not found")
+	ErrInvalidRotation = errors.New("invalid CA rotation")
 
 	// Network errors - Network management
 	ErrNetworkNotFound  = errors.New("network not found")

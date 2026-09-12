@@ -135,8 +135,73 @@ func (sm *Manager) SetupHooks() error {
 // setupCAHooks registers hooks for CA lifecycle.
 //
 // CA EVENT HANDLING:
+// - Validation: reject illegal rotation verbs and hand-edits of managed fields
 // - Creation: Generate CA certificate and keys automatically after record is saved
+// - Rotation: perform the requested rotation step and reset the action field
 func (sm *Manager) setupCAHooks() {
+	// Rotation validation. This belongs in the REQUEST hooks because
+	// OnRecordAfterUpdateSuccess runs after the write has committed and so
+	// cannot refuse anything -- the same split validateHostRecord uses.
+	sm.app.OnRecordCreateRequest().BindFunc(func(e *core.RecordRequestEvent) error {
+		if e.Collection.Name != sm.options.CACollectionName {
+			return e.Next()
+		}
+		if err := sm.validateCARotation(e.Record, nil); err != nil {
+			return err
+		}
+		return e.Next()
+	})
+
+	sm.app.OnRecordUpdateRequest().BindFunc(func(e *core.RecordRequestEvent) error {
+		if e.Collection.Name != sm.options.CACollectionName {
+			return e.Next()
+		}
+		if err := sm.validateCARotation(e.Record, e.Record.Original()); err != nil {
+			return err
+		}
+		return e.Next()
+	})
+
+	// Rotation execution
+	sm.app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error {
+		if e.Record.Collection().Name != sm.options.CACollectionName {
+			return e.Next()
+		}
+
+		// CRITICAL, and not optional: the CA CREATE hook below calls
+		// saveInternal on an already-persisted record, which fires an update
+		// event. Without this guard, creating a CA would enter the rotation
+		// path. It is also what keeps the generation mutex from deadlocking
+		// against itself, since a re-fired hook returns before reaching Lock.
+		if sm.isInternalSave(e.Record) {
+			return e.Next()
+		}
+
+		if !sm.shouldHandleEvent(sm.options.CACollectionName, types.EventTypeCARotate) {
+			return e.Next()
+		}
+
+		// Key on the TRANSITION, not the value. This hook runs after the
+		// commit, so a crash between the two leaves `rotate` durably set --
+		// and without this check the next unrelated CA edit would fire a
+		// rotation nobody asked for. Same reason the network CIDR check
+		// compares against Original().
+		orig := e.Record.Original()
+		verb := e.Record.GetString("rotate")
+		if verb == "" || (orig != nil && orig.GetString("rotate") == verb) {
+			return e.Next()
+		}
+
+		sm.generation.Lock()
+		defer sm.generation.Unlock()
+
+		if err := sm.rotateCA(e.Record, verb); err != nil {
+			sm.logger.Error("CA rotation (%s) failed for %s: %v", verb, e.Record.GetString("name"), err)
+		}
+
+		return e.Next()
+	})
+
 	// CA creation - generate certificate automatically
 	sm.app.OnRecordAfterCreateSuccess().BindFunc(func(e *core.RecordEvent) error {
 		if e.Record.Collection().Name != sm.options.CACollectionName {
@@ -467,6 +532,19 @@ func (sm *Manager) setupHostHooks() {
 				sm.logger.Info("Active flag changed for host %s, refreshing revocation blocklist across the network", e.Record.GetString("hostname"))
 				needsConfigRegeneration = true
 				needsPeerFanOut = true
+			}
+
+			// Reactivation needs a NEW certificate, not just a config refresh.
+			// A deactivated host is skipped by the CA rotation re-sign sweep on
+			// purpose (re-signing it would change the fingerprint its peers
+			// blocklist), so a host parked across a rotation comes back holding
+			// a certificate signed by a CA that may since have been retired --
+			// off the blocklist, looking healthy in the Admin UI, and able to
+			// handshake with nobody. Its certificate may also simply have
+			// expired while it was parked. Either way, re-issue.
+			if !orig.GetBool("active") && e.Record.GetBool("active") {
+				sm.logger.Info("Host %s reactivated, regenerating certificate", e.Record.GetString("hostname"))
+				needsCertRegeneration = true
 			}
 
 			// Check if peer configs are now stale. Peers embed this host's
@@ -806,6 +884,20 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 		return fmt.Errorf("%w: %v", types.ErrNetworkNotFound, err)
 	}
 
+	// Trust bundle for pki.ca, read from the CA record on every generation.
+	// That is what makes rotation self-healing: any regeneration, for any
+	// reason, hands out the CURRENT bundle, so finishing a rotation or
+	// recovering a partial one needs no re-signing. A lookup failure is not
+	// fatal -- fall back to the denormalized single certificate, matching the
+	// never-fatal discipline getBlocklist already follows.
+	bundle := ""
+	if ca, err := sm.app.FindRecordById(sm.options.CACollectionName, network.GetString("ca_id")); err == nil {
+		bundle = caBundle(ca)
+	} else {
+		sm.logger.Warning("Cannot load CA for network %s, falling back to the host's stored CA certificate: %v",
+			network.Id, err)
+	}
+
 	// Query lighthouses in this network
 	lighthouses, err := sm.getLighthouses(network.Id)
 	if err != nil {
@@ -838,6 +930,7 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 		Lighthouses: lighthouses,
 		Relays:      relays,
 		Blocklist:   blocklist,
+		CABundle:    bundle,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", types.ErrConfigGeneration, err)

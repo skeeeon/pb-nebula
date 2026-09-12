@@ -20,8 +20,9 @@ import (
 // - Operational errors: Runtime issues that may be transient
 var (
 	// Certificate errors - Cryptographic operations
-	ErrCertGeneration = types.ErrCertGeneration
-	ErrCANotFound     = types.ErrCANotFound
+	ErrCertGeneration  = types.ErrCertGeneration
+	ErrCANotFound      = types.ErrCANotFound
+	ErrInvalidRotation = types.ErrInvalidRotation
 
 	// Network errors - Network management
 	ErrNetworkNotFound  = types.ErrNetworkNotFound

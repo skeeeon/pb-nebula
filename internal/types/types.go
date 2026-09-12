@@ -254,6 +254,7 @@ const (
 	EventTypeHostUpdate    = "host_update"    // Host modification events
 	EventTypeHostDelete    = "host_delete"    // Host deletion events
 	EventTypeHostRenew     = "host_renew"     // Host certificate renewal (cron sweep and the renew action field)
+	EventTypeCARotate      = "ca_rotate"      // CA rotation step (prepare, commit, finish)
 )
 
 // GetGroups extracts the groups array from the JSON field.

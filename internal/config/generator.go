@@ -48,6 +48,17 @@ type HostConfigInput struct {
 	Lighthouses []types.LighthouseInfo // Active lighthouses in this network
 	Relays      []string               // Overlay IPs of active relays in this network (sorted)
 	Blocklist   []string               // Certificate fingerprints to refuse (sorted)
+
+	// CABundle is what goes into pki.ca. During a CA rotation it carries two
+	// concatenated certificates so every host trusts the outgoing and incoming
+	// CA at once; Nebula's NewCAPoolFromPEM reads a bundle natively.
+	//
+	// It is sourced from the CA record on every generation rather than from a
+	// denormalized host column, which is what makes rotation self-healing: any
+	// config regeneration, for any reason, hands out the current bundle. Empty
+	// falls back to Host.CACertificate, so a caller that has no CA record
+	// handy still produces a valid config.
+	CABundle string
 }
 
 // GenerateHostConfig generates a complete Nebula YAML configuration for a host.
@@ -113,8 +124,13 @@ func (g *Generator) GenerateHostConfig(in HostConfigInput) (string, error) {
 	// pki.blocklist is omitted entirely when empty rather than written as an
 	// empty list, so a network with nothing revoked produces the same config it
 	// always did and no existing deployment sees a spurious diff.
+	caBundle := in.CABundle
+	if caBundle == "" {
+		caBundle = host.CACertificate
+	}
+
 	pki := map[string]interface{}{
-		"ca":   host.CACertificate,
+		"ca":   caBundle,
 		"cert": host.Certificate,
 		"key":  host.PrivateKey,
 	}

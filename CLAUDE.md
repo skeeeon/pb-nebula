@@ -62,6 +62,7 @@ The update hook in `internal/sync/manager.go` (`setupHostHooks`) distinguishes w
   **A fan-out field almost always needs a config-only entry too.** `regenerateNetworkHostConfigs` deliberately excludes the record that changed, so a field that only appears in the fan-out list updates every host *except* the one that was edited. This shipped briefly for `is_relay`: clearing the flag left `am_relay: true` in the host's own config, so it kept relaying for peers that had already dropped it.
 - **`active` on ANY host** — lighthouse or not — triggers both the peer fan-out *and* that host's own config regeneration. Deactivating a host revokes its certificate, and Nebula revocation lives in every OTHER host's `pki.blocklist` (see **Revocation** below), so an active flip makes every config in the network stale. The host's own config is regenerated separately because the fan-out deliberately excludes the record that changed.
 - **`renew` (action field)** forces a cert regeneration regardless of remaining lifetime, then resets itself. See **Renewal** below.
+- **Reactivation** (`active` false→true) forces a cert regeneration — a host parked across a CA rotation is never re-signed by the commit sweep, so it comes back on a CA that may have been retired. See **CA rotation** below.
 - **No regeneration** for `email`, `password`, or anything else.
 
 If you add a new host field, decide which tier it belongs in and update the diff logic in `setupHostHooks`. Otherwise the field will silently never trigger regeneration, or will trigger an expensive cert regen it doesn't need.
@@ -87,6 +88,26 @@ Consequences worth keeping:
 
 ### Recursion prevention (saveInternal — do not bypass)
 Saves issued by pb-nebula itself re-fire the update hooks, and `e.Record.Original()` inside a re-fired hook still holds the **pre-request** snapshot — so any field-diff that triggered once would trigger again, looping forever (this exact loop shipped in the pre-`saveInternal` code: changing `public_host_port` regenerated ~37k times until killed). All internal writes go through `sm.saveInternal(record)`, which marks the record ID in `internalSaves`; the host update hook skips marked events via `isInternalSave`. If you add a hook that saves records, use `saveInternal`, never `sm.app.Save` directly. The older "certificate empty → populated" guard is kept as defense in depth for the creation flow (commits `f9823fb`, `1780bff`).
+
+### CA rotation takes three steps, and that is not negotiable
+
+`internal/sync/rotation.go`. Driven by the `rotate` **text** action field on `nebula_ca`: `prepare` → `commit` → `finish`. Text rather than bool because there are three verbs and a stuck `true` is dangerous.
+
+**Why three steps.** Nebula verification is **mutual** — each peer checks the other against its *own* local CA pool (`handshake_manager.go` builds the verifier as `pki.GetCAPool().VerifyCertificate`), with no chain and no fallback. Config distribution here is **pull-based**: a host reads `config_yaml` whenever it likes and nothing tells us when it did. So one write carrying both the new bundle *and* the new certificate splits the mesh — a host that fetched presents a new-CA cert to a host that hasn't, whose pool holds only the old CA, and the handshake fails in **both** directions until propagation finishes. Publishing trust first and switching issuance second removes the window. The wait between them is operator judgment and cannot be designed away, only made visible.
+
+- **`prepare`** mints the incoming CA into `next_certificate`/`next_private_key` and fans out **config-only**. `certificate`, `private_key` and `expires_at` are untouched: issuance stays put, no host cert changes, no fingerprint moves, the blocklist is unaffected. Fully reversible.
+- **`commit`** swaps the incoming CA in, then re-signs every **active** host. **Idempotent and resumable** — re-running it skips the swap and re-signs only hosts whose cert `Issuer()` still names the outgoing CA, so recovery from a partial sweep is the same verb, not a separate lever.
+- **`finish`** drops the outgoing CA, and **refuses while any active host is still on it** (`assertAllHostsMigrated`). That interlock is what makes `finish` safe to expose: dropping the old CA early takes a host off the mesh silently.
+
+**Rotation state is derived, never stored.** `next_certificate` set → prepared; `previous_certificate` set → rotated; neither → idle. A status column could only disagree with the certificates that already say this — same rule as blocklist fingerprints.
+
+**The bundle content is identical in both phases** — `[old, new]` either way (`caBundle`) — which is precisely what lets a host fetch at any instant from `prepare` onward and still talk to every peer. It is read from the **CA record** on every generation, not denormalized onto hosts, which makes rotation self-healing: any regeneration hands out the current bundle, so `finish` and partial recovery need no re-signing. `host.ca_certificate` stays a single certificate.
+
+**Inactive hosts are never re-signed.** Their fingerprint is in every peer's blocklist; re-signing would change it, so `getBlocklist` would publish the new one while the old cert stayed valid under the still-trusted outgoing CA — silently un-revoking it. Verified live across two rotations: the revoked host's fingerprint survived unchanged.
+
+**So reactivation must force a cert regeneration**, and that is why the `active` false→true branch sets `needsCertRegeneration`. A host parked across a rotation comes back holding a certificate from a CA that may since have been retired — off the blocklist, healthy-looking in the Admin UI, able to handshake with nobody.
+
+**Rotation guards return `router.NewBadRequestError`, not a plain error.** PocketBase flattens a plain error from a request hook into a generic "Something went wrong" 400, which discards the only thing that makes these messages worth writing — `finish` names the host that is blocking it. Validation lives in the **request** hook (can refuse) and execution in **AfterUpdateSuccess** (cannot), keyed on the `rotate` *transition* so a crash between commit and hook doesn't re-fire on the next unrelated edit. The After hook checks `isInternalSave` first: the CA *create* hook calls `saveInternal`, which fires an update event, and without that guard creating a CA would enter the rotation path.
 
 ### Renewal is a cron, and the clamp is what makes it tricky
 
