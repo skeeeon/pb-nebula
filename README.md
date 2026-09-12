@@ -46,6 +46,14 @@ pb-nebula transforms PocketBase into a complete Nebula overlay network managemen
 go get github.com/skeeeon/pb-nebula
 ```
 
+### Requirements
+
+**Every host on the mesh must run Nebula v1.10 or newer.** pb-nebula issues
+version 2 certificates, matching the current default of `nebula-cert ca`, and
+[Nebula's own upgrade guide](https://nebula.defined.net/docs/guides/upgrade-to-cert-v2-and-ipv6/)
+is explicit that "older versions cannot validate v2 certificates." A host on an
+older build will not fail loudly — it simply never completes a handshake.
+
 ## Quick Start
 
 ```go
@@ -381,9 +389,17 @@ pki:
     ...
   key: |
     ...
+  disconnect_invalid: true
   blocklist:
     - 7d0dc0bd1ae0bbd1a4a2ec8dd4a4b1d1e7d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6
 ```
+
+`disconnect_invalid` is the one Nebula default pb-nebula restates rather than
+omits. Nebula's docs say it defaults to `false`, its code defaults it to `true`,
+and its own example config shows it commented as `true` — when the documented
+default and the real one disagree, the config says what it means. Revocation
+does not depend on it (a blocklisted certificate is disconnected regardless),
+but an expired certificate and a finished CA rotation both do.
 
 An empty blocklist is **omitted** rather than written as an empty list, so a
 network with nothing revoked renders exactly the config it did before this

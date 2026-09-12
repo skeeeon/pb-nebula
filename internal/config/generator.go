@@ -133,6 +133,24 @@ func (g *Generator) GenerateHostConfig(in HostConfigInput) (string, error) {
 		"ca":   caBundle,
 		"cert": host.Certificate,
 		"key":  host.PrivateKey,
+		// Tear down live tunnels to a peer whose certificate has stopped being
+		// valid, rather than waiting for the tunnel to die on its own.
+		//
+		// THIS IS THE ONE DEFAULT WORTH RESTATING, unlike use_relays:
+		// Nebula's docs say this defaults to false while its code defaults it
+		// to true (interface.go: c.GetBool("pki.disconnect_invalid", true), in
+		// 1.10 and 1.11 alike) and its own example config shows it commented as
+		// true. When the documented default and the real default disagree,
+		// neither the operator reading the docs nor a future version bump can
+		// be relied on, so the config says what it means.
+		//
+		// It matters most at the end of a rotation. `finish` drops the outgoing
+		// CA, and without this a host still holding a certificate from it keeps
+		// its existing tunnels open indefinitely -- trusted by nobody, still
+		// connected to everybody. Revocation does not need it (a blocklisted
+		// certificate skips this check and disconnects regardless,
+		// connection_manager.go), but expiry and a finished rotation do.
+		"disconnect_invalid": true,
 	}
 	if len(blocklist) > 0 {
 		pki["blocklist"] = blocklist

@@ -495,3 +495,29 @@ func TestGenerateHostConfigInvalidUnsafeRoutes(t *testing.T) {
 		t.Errorf("expected ErrInvalidUnsafeRoute, got %v", err)
 	}
 }
+
+// TestGenerateHostConfigSetsDisconnectInvalid pins the one Nebula default this
+// generator restates rather than omits.
+//
+// The omit-the-default discipline everywhere else (use_relays, an empty
+// blocklist, the relay section) rests on the default being knowable. This one
+// is not: Nebula's docs say pki.disconnect_invalid defaults to false, its code
+// defaults it to true, and its own example config shows it commented as true.
+//
+// It is what closes the last gap at the end of a CA rotation. `finish` drops
+// the outgoing CA, and a host still holding a certificate signed by it would
+// otherwise keep its established tunnels open indefinitely -- trusted by
+// nobody, still connected to everybody.
+func TestGenerateHostConfigSetsDisconnectInvalid(t *testing.T) {
+	g := NewGenerator()
+
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses()})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+
+	pki := parseConfig(t, out)["pki"].(map[string]interface{})
+	if pki["disconnect_invalid"] != true {
+		t.Errorf("expected pki.disconnect_invalid true, got %v", pki["disconnect_invalid"])
+	}
+}
