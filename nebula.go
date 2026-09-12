@@ -156,6 +156,14 @@ func initializeComponents(app *pocketbase.PocketBase, options Options) error {
 	}
 	logger.Success("PocketBase hooks registered")
 
+	// Step 7: Schedule background jobs. Registration happens here, inside
+	// OnBootstrap, because PocketBase starts the cron on OnServe -- so a job
+	// added now is scheduled in time and only ever runs under `serve`.
+	logger.Info("Scheduling background jobs...")
+	if err := syncManager.SetupCron(); err != nil {
+		return WrapError(err, "failed to schedule background jobs")
+	}
+
 	logger.Success("🎉 pb-nebula initialized successfully!")
 	logger.Info("Collections: %s, %s, %s",
 		options.CACollectionName,
@@ -217,6 +225,13 @@ func validateOptions(options Options) error {
 	if options.DefaultHostValidityYears > options.DefaultCAValidityYears {
 		return fmt.Errorf("%w: DefaultHostValidityYears (%d) cannot exceed DefaultCAValidityYears (%d)",
 			ErrInvalidOptions, options.DefaultHostValidityYears, options.DefaultCAValidityYears)
+	}
+
+	// Validate renewal threshold. A threshold of 0 would never renew and one of
+	// 1 or more would renew on every sweep, so both ends are excluded.
+	if options.HostRenewalThreshold <= 0 || options.HostRenewalThreshold >= 1 {
+		return fmt.Errorf("%w: HostRenewalThreshold must be between 0 and 1 exclusive, got %v",
+			ErrInvalidOptions, options.HostRenewalThreshold)
 	}
 
 	// Validate encryption key length (AES-256 requires a 32-byte key)

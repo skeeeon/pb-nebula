@@ -33,6 +33,12 @@ func DefaultOptions() Options {
 
 		LogToConsole: true,
 
+		// Renewal is ON by default: the failure mode of forgetting it is a
+		// host that silently drops off the mesh when its certificate expires.
+		DisableHostCertRenewal: false,
+		HostRenewalThreshold:   types.DefaultHostRenewalThreshold,
+		HostRenewalCron:        types.DefaultHostRenewalCron,
+
 		EventFilter: nil, // No filter by default, process all events
 	}
 }
@@ -69,6 +75,16 @@ func applyDefaultOptions(options Options) Options {
 	}
 	if options.DefaultHostValidityYears <= 0 {
 		options.DefaultHostValidityYears = defaults.DefaultHostValidityYears
+	}
+
+	// Apply renewal defaults. DisableHostCertRenewal is deliberately absent:
+	// its zero value (false, meaning renewal is on) is already the default we
+	// want, which is the whole reason the option is named negatively.
+	if options.HostRenewalThreshold <= 0 {
+		options.HostRenewalThreshold = defaults.HostRenewalThreshold
+	}
+	if options.HostRenewalCron == "" {
+		options.HostRenewalCron = defaults.HostRenewalCron
 	}
 
 	return options

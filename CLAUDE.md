@@ -61,6 +61,7 @@ The update hook in `internal/sync/manager.go` (`setupHostHooks`) distinguishes w
 
   **A fan-out field almost always needs a config-only entry too.** `regenerateNetworkHostConfigs` deliberately excludes the record that changed, so a field that only appears in the fan-out list updates every host *except* the one that was edited. This shipped briefly for `is_relay`: clearing the flag left `am_relay: true` in the host's own config, so it kept relaying for peers that had already dropped it.
 - **`active` on ANY host** — lighthouse or not — triggers both the peer fan-out *and* that host's own config regeneration. Deactivating a host revokes its certificate, and Nebula revocation lives in every OTHER host's `pki.blocklist` (see **Revocation** below), so an active flip makes every config in the network stale. The host's own config is regenerated separately because the fan-out deliberately excludes the record that changed.
+- **`renew` (action field)** forces a cert regeneration regardless of remaining lifetime, then resets itself. See **Renewal** below.
 - **No regeneration** for `email`, `password`, or anything else.
 
 If you add a new host field, decide which tier it belongs in and update the diff logic in `setupHostHooks`. Otherwise the field will silently never trigger regeneration, or will trigger an expensive cert regen it doesn't need.
@@ -86,6 +87,20 @@ Consequences worth keeping:
 
 ### Recursion prevention (saveInternal — do not bypass)
 Saves issued by pb-nebula itself re-fire the update hooks, and `e.Record.Original()` inside a re-fired hook still holds the **pre-request** snapshot — so any field-diff that triggered once would trigger again, looping forever (this exact loop shipped in the pre-`saveInternal` code: changing `public_host_port` regenerated ~37k times until killed). All internal writes go through `sm.saveInternal(record)`, which marks the record ID in `internalSaves`; the host update hook skips marked events via `isInternalSave`. If you add a hook that saves records, use `saveInternal`, never `sm.app.Save` directly. The older "certificate empty → populated" guard is kept as defense in depth for the creation flow (commits `f9823fb`, `1780bff`).
+
+### Renewal is a cron, and the clamp is what makes it tricky
+
+`internal/sync/renewal.go` re-issues host certificates that have burned through `HostRenewalThreshold` (default 0.20, i.e. renew once 80% of the lifetime is gone). Registered in `SetupCron` during `OnBootstrap`; PocketBase starts the cron on `OnServe`, so the job is scheduled in time **and only ever runs under `serve`** — no CLI invocation quietly re-issues certificates.
+
+`shouldRenew` is pure and takes `now` as a parameter, so tests advance the clock instead of sleeping and the whole sweep evaluates every host against one instant.
+
+**The clamp trap.** `GenerateHostCert` clamps `NotAfter` to the CA's own `NotAfter`. Once the CA's expiry is the binding constraint, a re-issued certificate carries the *same* `NotAfter` as the one it replaced — so it is still past the threshold and the host gets re-signed on **every sweep until the CA expires**. That is a nightly fingerprint change plus a full config fan-out, arriving exactly when the CA needs calm attention. `hostCertNeedsRenewal` therefore refuses to renew when `notAfter` is not before the CA's, and warns naming the real fix: rotate the CA. Verified — a clamped host warns on every tick and is never re-signed.
+
+**Only active hosts are renewed.** An inactive host is revoked; re-issuing it changes its fingerprint, so `getBlocklist` would publish the new one while the old certificate stayed valid and unblocklisted. Renewing a revoked host would un-revoke it. The CA rotation sweep skips them for the same reason.
+
+`DisableHostCertRenewal` is named negatively on purpose: `applyDefaultOptions` only fills zero values, so a bool defaulting to *true* is indistinguishable from unset (same reason `LogToConsole` is not defaulted). The zero value means renewal is on, which is the safe direction — a mesh that silently expires is worse than one that re-issues.
+
+`renew` is an **action field**: set it true and the update hook re-issues immediately and resets it to false in the same save. Keyed on the false→true transition, and reset even when the event filter suppressed the work, so it can never stay pending. Same shape the CA rotation verbs use — a manual lever that needs no Go API and no HTTP route, so the platform drives it through the PocketBase client it already has.
 
 ### Gateway routing is two halves on two different hosts
 

@@ -191,6 +191,25 @@ type Options struct {
 	// (Nebula's PKI block requires it) and is stored plaintext. Encryption only
 	// protects the standalone private_key column.
 	EncryptionKey string
+
+	// DisableHostCertRenewal turns OFF the background job that re-issues host
+	// certificates before they expire. Renewal is on by default because the
+	// failure mode of forgetting it is a host that silently drops off the mesh.
+	//
+	// The name is negative on purpose. applyDefaultOptions only fills zero
+	// values, so a bool that defaults to true is indistinguishable from unset
+	// (the same reason LogToConsole is not defaulted). A negative name keeps
+	// the zero value meaningful without a *bool and nil checks at every read.
+	DisableHostCertRenewal bool
+
+	// HostRenewalThreshold is the fraction of remaining lifetime at or below
+	// which a host certificate is re-issued. Default 0.20, i.e. renew once 80%
+	// of the certificate's life has been used. Must be > 0 and < 1.
+	HostRenewalThreshold float64
+
+	// HostRenewalCron is the cron expression for the renewal sweep.
+	// Default "0 3 * * *" (daily at 03:00).
+	HostRenewalCron string
 }
 
 // Collection names with nebula_ prefix for clear identification
@@ -206,6 +225,23 @@ const (
 	DefaultHostValidityYears = 1  // 1 year for host certificates
 )
 
+// Host certificate renewal defaults
+const (
+	// DefaultHostRenewalThreshold re-issues once 80% of a certificate's
+	// lifetime has been consumed. On the default 1-year host certificate that
+	// leaves roughly 73 days of headroom.
+	DefaultHostRenewalThreshold = 0.20
+
+	// DefaultHostRenewalCron runs the sweep daily at 03:00. Renewal is not
+	// urgent work -- the threshold leaves weeks of margin -- so once a day is
+	// plenty and keeps the write burst off peak hours.
+	DefaultHostRenewalCron = "0 3 * * *"
+
+	// HostRenewalCronJobID namespaces the job so a host application registering
+	// its own cron entries cannot collide with ours.
+	HostRenewalCronJobID = "pbnebula_renew_host_certs"
+)
+
 // Event types for logging and filtering
 // These constants enable consistent event classification across components
 const (
@@ -217,6 +253,7 @@ const (
 	EventTypeHostCreate    = "host_create"    // Host creation events
 	EventTypeHostUpdate    = "host_update"    // Host modification events
 	EventTypeHostDelete    = "host_delete"    // Host deletion events
+	EventTypeHostRenew     = "host_renew"     // Host certificate renewal (cron sweep and the renew action field)
 )
 
 // GetGroups extracts the groups array from the JSON field.

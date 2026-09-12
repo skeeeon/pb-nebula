@@ -332,3 +332,65 @@ func TestGenerateHostCertOmitsUnsafeNetworksWhenUnset(t *testing.T) {
 		t.Errorf("expected no unsafe networks on an ordinary host, got %v", got)
 	}
 }
+
+// TestValidityFromPEMMatchesTheCertificate checks the renewal decision reads
+// the same window Nebula enforces.
+//
+// This has to come from the parsed certificate rather than a stored column: the
+// certificate carries whole-second precision while a stored timestamp can carry
+// sub-second precision, so the two can disagree by a fraction of a second --
+// exactly the mismatch that already forced GenerateHostCert to clamp against
+// the parsed CA rather than the expires_at value.
+func TestValidityFromPEMMatchesTheCertificate(t *testing.T) {
+	m := NewManager()
+
+	ca, err := m.GenerateCA("validity-ca", 10)
+	if err != nil {
+		t.Fatalf("GenerateCA failed: %v", err)
+	}
+
+	result, err := m.GenerateHostCert(HostCertParams{
+		Hostname:        "validity-01",
+		OverlayIP:       "10.128.0.11",
+		ValidityYears:   1,
+		CACertPEM:       ca.CertificatePEM,
+		CAPrivateKeyPEM: ca.PrivateKeyPEM,
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostCert failed: %v", err)
+	}
+
+	notBefore, notAfter, err := ValidityFromPEM(result.CertificatePEM)
+	if err != nil {
+		t.Fatalf("ValidityFromPEM failed: %v", err)
+	}
+
+	parsed, _, err := nebulacert.UnmarshalCertificateFromPEM([]byte(result.CertificatePEM))
+	if err != nil {
+		t.Fatalf("certificate does not parse: %v", err)
+	}
+	if !notBefore.Equal(parsed.NotBefore()) {
+		t.Errorf("notBefore: got %v, want %v", notBefore, parsed.NotBefore())
+	}
+	if !notAfter.Equal(parsed.NotAfter()) {
+		t.Errorf("notAfter: got %v, want %v", notAfter, parsed.NotAfter())
+	}
+
+	// Whole-second precision is the property that makes reading the column
+	// unsafe, so assert it rather than assuming it
+	if notAfter.Nanosecond() != 0 {
+		t.Errorf("expected whole-second precision in the certificate, got %v", notAfter)
+	}
+	if !notAfter.After(notBefore) {
+		t.Errorf("expected a positive validity window, got %v to %v", notBefore, notAfter)
+	}
+}
+
+func TestValidityFromPEMRejectsGarbage(t *testing.T) {
+	if _, _, err := ValidityFromPEM(""); err == nil {
+		t.Error("expected an error for an empty certificate")
+	}
+	if _, _, err := ValidityFromPEM("not a pem"); err == nil {
+		t.Error("expected an error for a malformed certificate")
+	}
+}

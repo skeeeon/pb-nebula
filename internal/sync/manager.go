@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	stdsync "sync"
+	"time"
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase"
@@ -36,6 +37,27 @@ import (
 // triggered once would trigger again on the re-entry, looping forever. All
 // internal writes therefore go through saveInternal, which marks the record
 // ID in internalSaves; the update hook skips events for marked records.
+//
+// SERIALIZATION (generation mutex) — SECOND LOAD-BEARING INVARIANT:
+// internalSaves is a set keyed by record ID and cleared by an unconditional
+// defer, which is only safe while pb-nebula's own writes never overlap. The
+// renewal cron broke that assumption: it writes host records on a schedule,
+// concurrently with whatever an operator is doing. Three races follow — a
+// dropped regeneration (the operator's hook sees the cron's mark and skips a
+// real edit), a lost mark (the first defer clears while a second save for the
+// same ID is still inside Save), and a lost update (the cron writes a record it
+// loaded before the operator's edit).
+//
+// The generation mutex closes all three by serializing every generate-and-save
+// sequence. This control plane does a handful of writes a minute, so the cost
+// is nothing.
+//
+// The invariant: acquire it ONLY at top-level entry points (cron tick, the
+// host/network/CA hooks), ALWAYS after the isInternalSave check, and NEVER
+// inside saveInternal or anything it re-enters. Go mutexes are not reentrant,
+// so a nested hook that reached Lock() would deadlock against its own caller.
+// The isInternalSave guard is what stops that: a re-fired hook returns before
+// it gets there.
 type Manager struct {
 	app           *pocketbase.PocketBase // PocketBase application instance
 	certManager   *cert.Manager          // Certificate generation service
@@ -44,6 +66,7 @@ type Manager struct {
 	options       types.Options          // Configuration options
 	logger        *utils.Logger          // Logger for consistent output
 	internalSaves stdsync.Map            // record IDs currently being saved by pb-nebula itself
+	generation    stdsync.Mutex          // serializes generate-and-save sequences; see above
 }
 
 // saveInternal saves a record while marking it as a pb-nebula-initiated write,
@@ -190,6 +213,9 @@ func (sm *Manager) setupNetworkHooks() {
 			return e.Next()
 		}
 
+		sm.generation.Lock()
+		defer sm.generation.Unlock()
+
 		sm.logger.Info("Network CIDR changed for %s, regenerating host configs...", e.Record.GetString("name"))
 		sm.regenerateNetworkHostConfigs(e.Record.Id, "")
 
@@ -275,6 +301,9 @@ func (sm *Manager) setupHostHooks() {
 			return e.Next()
 		}
 
+		sm.generation.Lock()
+		defer sm.generation.Unlock()
+
 		sm.logger.Cert("Generating certificate and config for host %s...", e.Record.GetString("hostname"))
 
 		// Generate host certificate and config
@@ -313,6 +342,12 @@ func (sm *Manager) setupHostHooks() {
 			return e.Next()
 		}
 
+		// Serialize against the renewal cron. MUST come after isInternalSave:
+		// a re-fired hook returns above and so never reaches this Lock, which
+		// is what keeps a non-reentrant mutex from deadlocking on itself.
+		sm.generation.Lock()
+		defer sm.generation.Unlock()
+
 		orig := e.Record.Original()
 
 		// CRITICAL: Skip if certificate was JUST generated (prevents recursion during creation)
@@ -332,6 +367,7 @@ func (sm *Manager) setupHostHooks() {
 		needsCertRegeneration := false
 		needsConfigRegeneration := false
 		needsPeerFanOut := false
+		needsRenewReset := false
 
 		if orig != nil {
 			// Check if CERTIFICATE regeneration is needed (expensive - new cert).
@@ -358,6 +394,23 @@ func (sm *Manager) setupHostHooks() {
 			if orig.GetInt("validity_years") != e.Record.GetInt("validity_years") && e.Record.GetInt("validity_years") > 0 {
 				sm.logger.Info("Validity years changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
 				needsCertRegeneration = true
+			}
+
+			// Action field: force an immediate re-issue regardless of how much
+			// lifetime is left. Keyed on the false -> true transition, and
+			// reset below so the flag never stays set. This is the manual lever
+			// the platform and the Admin UI both use, and it needs no new Go
+			// API or HTTP route to expose.
+			if !orig.GetBool("renew") && e.Record.GetBool("renew") &&
+				sm.shouldHandleEvent(sm.options.HostCollectionName, types.EventTypeHostRenew) {
+				sm.logger.Cert("Renewal requested for host %s, regenerating certificate", e.Record.GetString("hostname"))
+				needsCertRegeneration = true
+			}
+			// Reset unconditionally: a renew that was skipped by the event
+			// filter should not stay pending forever either.
+			if e.Record.GetBool("renew") {
+				e.Record.Set("renew", false)
+				needsRenewReset = true
 			}
 
 			// Check if only CONFIG regeneration is needed (cheap - just YAML)
@@ -447,6 +500,14 @@ func (sm *Manager) setupHostHooks() {
 		}
 
 		if !needsCertRegeneration && !needsConfigRegeneration && !needsPeerFanOut {
+			// A renew flag that produced no regeneration still has to be cleared,
+			// or it stays set and fires again on the next unrelated edit.
+			if needsRenewReset {
+				if err := sm.saveInternal(e.Record); err != nil {
+					sm.logger.Warning("Failed to reset renew flag for host %s: %v", e.Record.Id, err)
+				}
+				return e.Next()
+			}
 			sm.logger.Info("No meaningful changes detected for host %s, skipping regeneration", e.Record.GetString("hostname"))
 			return e.Next()
 		}
@@ -501,6 +562,9 @@ func (sm *Manager) setupHostHooks() {
 		if !sm.shouldHandleEvent(sm.options.HostCollectionName, types.EventTypeHostDelete) {
 			return e.Next()
 		}
+
+		sm.generation.Lock()
+		defer sm.generation.Unlock()
 
 		if (e.Record.GetBool("is_lighthouse") || e.Record.GetBool("is_relay")) && e.Record.GetBool("active") {
 			sm.logger.Config("Lighthouse/relay %s deleted, regenerating peer configs...", e.Record.GetString("hostname"))
@@ -810,11 +874,20 @@ func (sm *Manager) getBlocklist(networkID string) ([]string, error) {
 		return nil, err
 	}
 
+	now := time.Now()
 	fingerprints := make([]string, 0, len(records))
 	for _, record := range records {
 		certPEM := record.GetString("certificate")
 		if certPEM == "" {
 			continue // never issued one; nothing to revoke
+		}
+		// Drop expired certificates. Nebula refuses an expired certificate on
+		// its own, so blocklisting one buys nothing -- and without this the
+		// list only ever grows, in a config_yaml field capped at 50000 bytes.
+		// Read the validity from the certificate, not from expires_at, for the
+		// same reason the expiry clamp does.
+		if _, notAfter, err := cert.ValidityFromPEM(certPEM); err == nil && !now.Before(notAfter) {
+			continue
 		}
 		fp, err := cert.FingerprintFromPEM(certPEM)
 		if err != nil {

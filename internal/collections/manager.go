@@ -521,5 +521,11 @@ func hostFields() []core.Field {
 		&core.BoolField{
 			Name: "active",
 		},
+
+		// Action field: set true to force an immediate re-issue. The hook
+		// performs the renewal and resets it to false in the same save.
+		&core.BoolField{
+			Name: "renew",
+		},
 	}
 }

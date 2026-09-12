@@ -252,10 +252,10 @@ func (m *Manager) GenerateHostCert(params HostCertParams) (*HostCertResult, erro
 // which is a fan-out rather than a single central write.
 //
 // The fingerprint is derived from the stored certificate rather than cached in
-// a column, because InitializeCollections never alters an existing collection's
-// schema -- a new field would silently be absent on every deployment that
-// already exists. Parsing a PEM is cheap and the config generator already runs
-// only on change.
+// a column, because a cached fingerprint is a second copy of what the
+// certificate already states and the two diverge the moment a certificate is
+// re-issued -- which renewal and CA rotation now both do routinely. Parsing a
+// PEM is cheap and the config generator already runs only on change.
 //
 // SIDE EFFECTS: None (pure).
 func FingerprintFromPEM(certPEM string) (string, error) {
@@ -271,4 +271,39 @@ func FingerprintFromPEM(certPEM string) (string, error) {
 		return "", fmt.Errorf("failed to fingerprint certificate: %w", err)
 	}
 	return fp, nil
+}
+
+// ValidityFromPEM returns the NotBefore and NotAfter of a PEM-encoded certificate.
+//
+// WHY THIS EXISTS RATHER THAN READING THE expires_at COLUMN:
+// The same reason GenerateHostCert clamps against the parsed CA certificate and
+// not the stored timestamp. Certificate timestamps have whole-second precision,
+// while a stored date can carry sub-second precision, so the column and the
+// certificate can disagree by a fraction of a second -- enough for a renewal
+// decision to be made against a value the certificate does not actually hold.
+// The certificate is the thing Nebula enforces, so it is the thing to read.
+//
+// Renewal also needs NotBefore, which is not stored in any column at all: the
+// decision is about the FRACTION of the lifetime consumed, so it needs both
+// ends.
+//
+// PARAMETERS:
+//   - certPEM: PEM encoded certificate
+//
+// RETURNS:
+// - notBefore, notAfter as recorded in the certificate
+// - error if the certificate is empty or does not parse
+//
+// SIDE EFFECTS: None (pure).
+func ValidityFromPEM(certPEM string) (notBefore, notAfter time.Time, err error) {
+	if certPEM == "" {
+		return time.Time{}, time.Time{}, fmt.Errorf("certificate is empty")
+	}
+
+	parsed, _, err := nebulacert.UnmarshalCertificateFromPEM([]byte(certPEM))
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	return parsed.NotBefore(), parsed.NotAfter(), nil
 }
