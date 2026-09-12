@@ -47,6 +47,7 @@ func TestNebulasCAPoolRefusesABlocklistedCertificate(t *testing.T) {
 		h, err := m.GenerateHostCert(cert.HostCertParams{
 			Hostname:        name,
 			OverlayIP:       ip,
+			NetworkCIDR:     "10.128.0.0/24",
 			ValidityYears:   1,
 			CACertPEM:       ca.CertificatePEM,
 			CAPrivateKeyPEM: ca.PrivateKeyPEM,

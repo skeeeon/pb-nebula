@@ -53,6 +53,7 @@ func TestNebulasCAPoolAcceptsBothCertificatesInARotationBundle(t *testing.T) {
 		res, err := m.GenerateHostCert(cert.HostCertParams{
 			Hostname:        name,
 			OverlayIP:       ip,
+			NetworkCIDR:     "10.128.0.0/24",
 			ValidityYears:   1,
 			CACertPEM:       ca.CertificatePEM,
 			CAPrivateKeyPEM: ca.PrivateKeyPEM,
@@ -157,7 +158,7 @@ func TestRotationBundleStillHonoursTheBlocklist(t *testing.T) {
 	// the commit sweep skips inactive hosts precisely so this fingerprint stays
 	// the one every peer blocklists.
 	revoked, err := m.GenerateHostCert(cert.HostCertParams{
-		Hostname: "revoked-host", OverlayIP: "10.128.0.30", ValidityYears: 1,
+		Hostname: "revoked-host", OverlayIP: "10.128.0.30", NetworkCIDR: "10.128.0.0/24", ValidityYears: 1,
 		CACertPEM: outgoing.CertificatePEM, CAPrivateKeyPEM: outgoing.PrivateKeyPEM,
 	})
 	if err != nil {
@@ -170,7 +171,7 @@ func TestRotationBundleStillHonoursTheBlocklist(t *testing.T) {
 
 	// A healthy host re-signed under the incoming CA
 	healthy, err := m.GenerateHostCert(cert.HostCertParams{
-		Hostname: "healthy-host", OverlayIP: "10.128.0.31", ValidityYears: 1,
+		Hostname: "healthy-host", OverlayIP: "10.128.0.31", NetworkCIDR: "10.128.0.0/24", ValidityYears: 1,
 		CACertPEM: incoming.CertificatePEM, CAPrivateKeyPEM: incoming.PrivateKeyPEM,
 	})
 	if err != nil {

@@ -284,6 +284,11 @@ func (sm *Manager) setupNetworkHooks() {
 		sm.logger.Info("Network CIDR changed for %s, regenerating host configs...", e.Record.GetString("name"))
 		sm.regenerateNetworkHostConfigs(e.Record.Id, "")
 
+		// A new CIDR changes the mask every host certificate should carry, and
+		// regenerating configs re-signs nothing. Say so rather than leaving the
+		// fleet quietly unable to route.
+		sm.AuditHostCertNetworkMasks(e.Record.Id)
+
 		return e.Next()
 	})
 }
@@ -840,10 +845,14 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 
 	// Generate host certificate (expiry is clamped to the CA cert's NotAfter)
 	certResult, err := sm.certManager.GenerateHostCert(cert.HostCertParams{
-		Hostname:        record.GetString("hostname"),
-		OverlayIP:       record.GetString("overlay_ip"),
-		Groups:          groups,
-		ValidityYears:   validityYears,
+		Hostname:      record.GetString("hostname"),
+		OverlayIP:     record.GetString("overlay_ip"),
+		Groups:        groups,
+		ValidityYears: validityYears,
+		// The mask Nebula builds the host's overlay route from. Sourced from
+		// the network record on every signing rather than stored on the host,
+		// so a corrected CIDR reaches a host the next time it is re-signed.
+		NetworkCIDR:     network.GetString("cidr_range"),
 		UnsafeNetworks:  unsafeNetworks,
 		CACertPEM:       ca.GetString("certificate"),
 		CAPrivateKeyPEM: caPrivateKeyPEM,

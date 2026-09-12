@@ -58,6 +58,12 @@ type HostCertParams struct {
 	Groups        []string // Groups for firewall rules
 	ValidityYears int      // Certificate validity period
 
+	// NetworkCIDR is the overlay network this host belongs to, in CIDR form
+	// (e.g. "10.128.0.0/24"). REQUIRED: it supplies the mask the certificate's
+	// network is signed with, and Nebula builds the host's routing table from
+	// that mask. See overlayPrefix.
+	NetworkCIDR string
+
 	// UnsafeNetworks are the non-overlay prefixes this host is authorized to
 	// route for. Nebula enforces routing on the certificate rather than on
 	// config: a gateway whose cert omits the prefix silently refuses to route
@@ -140,7 +146,7 @@ func (m *Manager) GenerateCA(name string, validityYears int) (*CAResult, error) 
 //
 // HOST CERTIFICATE CHARACTERISTICS:
 // - IsCA flag set to false
-// - Contains overlay IP as a /32 network
+// - Contains the overlay IP carried at the NETWORK's mask (see overlayPrefix)
 // - Contains groups for firewall rules
 // - Signed by CA (contains issuer fingerprint)
 // - Validity cannot exceed CA validity
@@ -186,14 +192,12 @@ func (m *Manager) GenerateHostCert(params HostCertParams) (*HostCertResult, erro
 		return nil, fmt.Errorf("failed to generate host key pair: %w", err)
 	}
 
-	// Parse overlay IP and convert to /32 prefix
-	addr, err := netip.ParseAddr(params.OverlayIP)
+	// The host's address carried at the OVERLAY network's mask -- not /32.
+	// This is what Nebula turns into the tun address and the overlay route.
+	network, err := overlayPrefix(params.OverlayIP, params.NetworkCIDR)
 	if err != nil {
-		return nil, fmt.Errorf("invalid overlay IP %q: %w", params.OverlayIP, err)
+		return nil, err
 	}
-
-	// Create /32 prefix from IP (single host)
-	overlayPrefix := netip.PrefixFrom(addr, addr.BitLen())
 
 	// Calculate expiration - min of requested or the CA cert's own NotAfter
 	notBefore := time.Now()
@@ -208,7 +212,7 @@ func (m *Manager) GenerateHostCert(params HostCertParams) (*HostCertResult, erro
 	tbs := &nebulacert.TBSCertificate{
 		Version:        nebulacert.Version2,
 		Name:           params.Hostname,
-		Networks:       []netip.Prefix{overlayPrefix},
+		Networks:       []netip.Prefix{network},
 		UnsafeNetworks: params.UnsafeNetworks,
 		Groups:         params.Groups,
 		IsCA:           false,
@@ -239,6 +243,113 @@ func (m *Manager) GenerateHostCert(params HostCertParams) (*HostCertResult, erro
 		PrivateKeyPEM:  string(privKeyPEM),
 		ExpiresAt:      expiresAt,
 	}, nil
+}
+
+// overlayPrefix builds the prefix that goes into a host certificate's Networks:
+// the host's own address, carried at the OVERLAY NETWORK's mask.
+//
+// WHY THE MASK IS THE NETWORK'S AND NOT /32:
+// Nebula reads the certificate's networks straight onto the tun device. pki.go
+// populates myVpnNetworks from crt.Networks(); main.go hands that slice to the
+// device factory; overlay/tun_linux.go then adds the interface address with
+// net.CIDRMask(prefix.Bits(), ...) and installs a link-scope route for
+// prefix.Masked(). So the mask in the certificate IS the host's route to the
+// overlay.
+//
+// A /32 therefore gives a host an address and a route covering only itself.
+// The kernel has no route to any peer, so peer traffic never reaches the tun
+// and no packet can cross the mesh -- while every certificate, config and
+// handshake still looks correct. It also breaks the consumer half of gateway
+// routing: Nebula only accepts an unsafe_routes gateway that
+// isGatewayInVpnNetworks reports as inside the overlay (overlay/tun_linux.go),
+// which a /32 can never satisfy.
+//
+// Every nebula-cert example upstream signs the host address at the overlay
+// mask -- `-networks "192.168.100.10/24"` in the quick start, unsafe_routes and
+// cert-v2 guides -- and Nebula's own e2e suite signs "10.128.0.1/24". This
+// reproduces that.
+//
+// PARAMETERS:
+//   - overlayIP: the host's address (e.g. "10.128.0.100")
+//   - networkCIDR: the overlay network it belongs to (e.g. "10.128.0.0/24")
+//
+// RETURNS:
+// - the host address at the network's mask (e.g. 10.128.0.100/24)
+// - error if either value is unparseable, or the address is outside the network
+//
+// SIDE EFFECTS: None (pure).
+func overlayPrefix(overlayIP, networkCIDR string) (netip.Prefix, error) {
+	if networkCIDR == "" {
+		return netip.Prefix{}, fmt.Errorf("network CIDR is required to size the certificate's network")
+	}
+
+	network, err := netip.ParsePrefix(networkCIDR)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("invalid network CIDR %q: %w", networkCIDR, err)
+	}
+
+	addr, err := netip.ParseAddr(overlayIP)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("invalid overlay IP %q: %w", overlayIP, err)
+	}
+	// A 4-in-6 address would not match an IPv4 prefix, and would be signed as
+	// IPv6. Unmap so the two are compared, and stored, in the same family.
+	addr = addr.Unmap()
+
+	// Not a duplicate of ipam's ValidateHostIP: that runs on the request path,
+	// while this also covers the rotation and renewal sweeps, which re-sign
+	// records written long ago.
+	if !network.Contains(addr) {
+		return netip.Prefix{}, fmt.Errorf("overlay IP %s is not inside network %s", addr, network)
+	}
+
+	return netip.PrefixFrom(addr, network.Bits()), nil
+}
+
+// HostCertNetworkIsStale reports whether a stored host certificate carries a
+// different network from the one GenerateHostCert would sign for it today.
+//
+// WHY THIS IS ONLY A QUESTION AND NEVER AN ACTION:
+// Re-signing changes the certificate's fingerprint, and in Nebula a fingerprint
+// is what pki.blocklist revokes. Doing that on the library's own initiative
+// would move every fingerprint in a fleet at once, and would silently un-revoke
+// any host whose old certificate is what peers are blocklisting. So callers
+// warn; an operator re-issues, per host, through the `renew` action field.
+//
+// The comparison is exact rather than mask-only, so it also catches a host
+// whose overlay_ip was changed underneath a certificate that was never
+// re-signed. Any drift means the same thing: the stored certificate no longer
+// describes this host's place in the overlay.
+//
+// PARAMETERS:
+//   - certPEM: the host's stored certificate
+//   - overlayIP: the host's current overlay address
+//   - networkCIDR: the network's current CIDR range
+//
+// RETURNS:
+// - true if the certificate's network differs from what would be signed now
+// - error if the certificate, the address or the CIDR cannot be read
+//
+// SIDE EFFECTS: None (pure).
+func HostCertNetworkIsStale(certPEM, overlayIP, networkCIDR string) (bool, error) {
+	if certPEM == "" {
+		// Never issued one. There is nothing stale about an absent
+		// certificate, and the create hook owns filling it in.
+		return false, nil
+	}
+
+	want, err := overlayPrefix(overlayIP, networkCIDR)
+	if err != nil {
+		return false, err
+	}
+
+	parsed, _, err := nebulacert.UnmarshalCertificateFromPEM([]byte(certPEM))
+	if err != nil {
+		return false, fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	networks := parsed.Networks()
+	return len(networks) != 1 || networks[0] != want, nil
 }
 
 // FingerprintFromPEM returns the SHA-256 fingerprint of a PEM-encoded

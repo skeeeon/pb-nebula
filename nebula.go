@@ -164,6 +164,11 @@ func initializeComponents(app *pocketbase.PocketBase, options Options) error {
 		return WrapError(err, "failed to schedule background jobs")
 	}
 
+	// Step 8: Warn about host certificates that no longer match their network.
+	// Read-only on purpose -- re-signing moves fingerprints, so it is staged by
+	// the operator through the `renew` field, not by a library upgrade.
+	syncManager.AuditHostCertNetworkMasks("")
+
 	logger.Success("🎉 pb-nebula initialized successfully!")
 	logger.Info("Collections: %s, %s, %s",
 		options.CACollectionName,

@@ -147,6 +147,22 @@ Relays are **not** added to `static_host_map` — unlike a lighthouse, a relay's
 ### Firewall rules are host-based, not network-based
 This mirrors Nebula's own design. `nebula_networks` has no firewall fields. Every host carries `firewall_outbound` and `firewall_inbound` as JSON arrays in Nebula's native format. The config generator (`internal/config/generator.go`) applies Nebula-recommended defaults (allow-all outbound, ICMP-only inbound) when a host's rules are empty.
 
+### The host cert's network mask is the network's, never /32
+
+`GenerateHostCert` signs the host address at the **overlay network's** mask (`10.128.0.5/24`), taken from `nebula_networks.cidr_range` and passed in as `HostCertParams.NetworkCIDR`. It is required — there is no fallback, because the fallback is what was wrong.
+
+Nebula does not read a certificate's network as "this host's address". It reads the prefix straight onto the tun device: `pki.go` fills `myVpnNetworks` from `crt.Networks()`, `main.go` hands that to the device factory, and `overlay/tun_linux.go` adds the interface address with `net.CIDRMask(prefix.Bits(), …)` and installs a link-scope route for `prefix.Masked()`. **The mask in the certificate is the host's route to the overlay.**
+
+pb-nebula signed `/32` until this was fixed, which gives a host a route covering only itself. Nothing errors — the certificate verifies, the config renders, the handshake completes — but the kernel never hands peer traffic to the tun, so no packet crosses the mesh. It also breaks `unsafe_routes`, since Nebula only accepts a gateway that `isGatewayInVpnNetworks` finds inside the overlay.
+
+Every `nebula-cert sign` example upstream uses the overlay mask (`-networks "192.168.100.10/24"`), and Nebula's own e2e suite signs `10.128.0.1/24`. `TestGenerateHostCertCarriesTheOverlayNetworkMask` guards it, asserting both the mask and the `Contains` predicate the kernel route and Nebula both evaluate.
+
+`overlayPrefix` also rejects an address outside its network. That duplicates an ipam check on the request path on purpose: the rotation and renewal sweeps re-sign records written long before, and never pass through request validation.
+
+**Existing deployments carry `/32` certificates until each host is re-signed, and nothing re-signs them automatically.** `AuditHostCertNetworkMasks` (`internal/sync/audit.go`) warns — at bootstrap for every network, and from the network hook when `cidr_range` changes — naming each active host whose certificate no longer matches its network, and telling the operator to set `renew`. It never writes.
+
+That restraint is the point. Re-signing moves a certificate's fingerprint, and a fingerprint is what `pki.blocklist` revokes, so a sweep that re-signed on its own would churn every fingerprint and every peer config in a fleet on the strength of a library upgrade. **Inactive hosts are excluded** for the usual reason: they are revoked, and re-signing one would publish a new fingerprint while the old certificate stayed valid. `cert.HostCertNetworkIsStale` is the predicate, compared exactly rather than mask-only so an edited `overlay_ip` counts too.
+
 ### Host cert expiration is clamped
 `cert.Manager.GenerateHostCert` caps host cert `NotAfter` at the **parsed CA certificate's own `NotAfter`** — not the `expires_at` value stored in the DB. Cert timestamps have whole-second precision; a stored timestamp with sub-second precision can land fractionally after the real `NotAfter`, and `nebula/cert` then rejects the signing ("certificate expires after signing certificate"). Don't remove the clamp and don't reintroduce an external expiry source — `TestGenerateHostCertClampsToCAExpiry` guards this.
 

@@ -58,6 +58,7 @@ func TestGenerateHostCert(t *testing.T) {
 	result, err := m.GenerateHostCert(HostCertParams{
 		Hostname:        "web-01",
 		OverlayIP:       "10.128.0.100",
+		NetworkCIDR:     "10.128.0.0/24",
 		Groups:          []string{"web", "ssh"},
 		ValidityYears:   1,
 		CACertPEM:       ca.CertificatePEM,
@@ -78,8 +79,8 @@ func TestGenerateHostCert(t *testing.T) {
 		t.Errorf("expected name %q, got %q", "web-01", hostCert.Name())
 	}
 
-	// Overlay IP should be embedded as a /32
-	wantPrefix := netip.MustParsePrefix("10.128.0.100/32")
+	// Overlay IP should be embedded at the NETWORK's mask, not /32
+	wantPrefix := netip.MustParsePrefix("10.128.0.100/24")
 	networks := hostCert.Networks()
 	if len(networks) != 1 || networks[0] != wantPrefix {
 		t.Errorf("expected networks [%v], got %v", wantPrefix, networks)
@@ -119,6 +120,7 @@ func TestGenerateHostCertClampsToCAExpiry(t *testing.T) {
 	result, err := m.GenerateHostCert(HostCertParams{
 		Hostname:        "long-host",
 		OverlayIP:       "10.0.0.1",
+		NetworkCIDR:     "10.0.0.0/24",
 		ValidityYears:   10,
 		CACertPEM:       ca.CertificatePEM,
 		CAPrivateKeyPEM: ca.PrivateKeyPEM,
@@ -152,6 +154,7 @@ func TestGenerateHostCertInvalidIP(t *testing.T) {
 	_, err = m.GenerateHostCert(HostCertParams{
 		Hostname:        "bad-host",
 		OverlayIP:       "not-an-ip",
+		NetworkCIDR:     "10.128.0.0/24",
 		ValidityYears:   1,
 		CACertPEM:       ca.CertificatePEM,
 		CAPrivateKeyPEM: ca.PrivateKeyPEM,
@@ -175,6 +178,7 @@ func TestFingerprintFromPEMMatchesNebulasOwnValue(t *testing.T) {
 	host, err := m.GenerateHostCert(HostCertParams{
 		Hostname:        "door-01",
 		OverlayIP:       "10.128.0.7",
+		NetworkCIDR:     "10.128.0.0/24",
 		ValidityYears:   1,
 		CACertPEM:       ca.CertificatePEM,
 		CAPrivateKeyPEM: ca.PrivateKeyPEM,
@@ -219,6 +223,7 @@ func TestFingerprintFromPEMIsPerCertificate(t *testing.T) {
 		host, err := m.GenerateHostCert(HostCertParams{
 			Hostname:        name,
 			OverlayIP:       "10.128.0.7",
+			NetworkCIDR:     "10.128.0.0/24",
 			ValidityYears:   1,
 			CACertPEM:       ca.CertificatePEM,
 			CAPrivateKeyPEM: ca.PrivateKeyPEM,
@@ -270,6 +275,7 @@ func TestGenerateHostCertCarriesUnsafeNetworks(t *testing.T) {
 	result, err := m.GenerateHostCert(HostCertParams{
 		Hostname:        "gateway-01",
 		OverlayIP:       "10.128.0.5",
+		NetworkCIDR:     "10.128.0.0/24",
 		ValidityYears:   1,
 		UnsafeNetworks:  want,
 		CACertPEM:       ca.CertificatePEM,
@@ -315,6 +321,7 @@ func TestGenerateHostCertOmitsUnsafeNetworksWhenUnset(t *testing.T) {
 	result, err := m.GenerateHostCert(HostCertParams{
 		Hostname:        "plain-01",
 		OverlayIP:       "10.128.0.6",
+		NetworkCIDR:     "10.128.0.0/24",
 		ValidityYears:   1,
 		CACertPEM:       ca.CertificatePEM,
 		CAPrivateKeyPEM: ca.PrivateKeyPEM,
@@ -352,6 +359,7 @@ func TestValidityFromPEMMatchesTheCertificate(t *testing.T) {
 	result, err := m.GenerateHostCert(HostCertParams{
 		Hostname:        "validity-01",
 		OverlayIP:       "10.128.0.11",
+		NetworkCIDR:     "10.128.0.0/24",
 		ValidityYears:   1,
 		CACertPEM:       ca.CertificatePEM,
 		CAPrivateKeyPEM: ca.PrivateKeyPEM,
@@ -392,5 +400,239 @@ func TestValidityFromPEMRejectsGarbage(t *testing.T) {
 	}
 	if _, _, err := ValidityFromPEM("not a pem"); err == nil {
 		t.Error("expected an error for a malformed certificate")
+	}
+}
+
+// TestGenerateHostCertCarriesTheOverlayNetworkMask is the guard against
+// re-introducing /32 host certificates.
+//
+// Nebula does not treat a certificate's network as "this host's address". It
+// reads the prefix straight onto the tun device: pki.go fills myVpnNetworks
+// from crt.Networks(), main.go hands that to the device factory, and
+// overlay/tun_linux.go adds the interface address with
+// net.CIDRMask(prefix.Bits(), ...) and installs a link-scope route for
+// prefix.Masked(). The mask in the certificate IS the host's route to the
+// overlay.
+//
+// So a /32 certificate produces a host whose only route is to itself. Nothing
+// reports an error -- the certificate verifies, the config renders, the
+// handshake completes -- but the kernel never hands peer traffic to the tun and
+// no packet crosses the mesh. Every nebula-cert example upstream signs at the
+// overlay mask, and Nebula's own e2e suite signs "10.128.0.1/24".
+//
+// The second assertion is the one that would have caught the bug: Contains is
+// the predicate both the kernel route and Nebula's own isGatewayInVpnNetworks
+// evaluate, and a /32 fails it for every peer.
+func TestGenerateHostCertCarriesTheOverlayNetworkMask(t *testing.T) {
+	m := NewManager()
+
+	ca, err := m.GenerateCA("mask-ca", 10)
+	if err != nil {
+		t.Fatalf("GenerateCA failed: %v", err)
+	}
+
+	cases := []struct {
+		network string
+		ip      string
+		peer    string
+	}{
+		{"10.128.0.0/24", "10.128.0.5", "10.128.0.6"},
+		{"10.128.0.0/16", "10.128.4.5", "10.128.9.9"},
+		{"192.168.100.0/22", "192.168.100.10", "192.168.102.1"},
+	}
+
+	for _, tc := range cases {
+		result, err := m.GenerateHostCert(HostCertParams{
+			Hostname:        "host",
+			OverlayIP:       tc.ip,
+			NetworkCIDR:     tc.network,
+			ValidityYears:   1,
+			CACertPEM:       ca.CertificatePEM,
+			CAPrivateKeyPEM: ca.PrivateKeyPEM,
+		})
+		if err != nil {
+			t.Fatalf("GenerateHostCert(%s in %s) failed: %v", tc.ip, tc.network, err)
+		}
+
+		parsed, _, err := nebulacert.UnmarshalCertificateFromPEM([]byte(result.CertificatePEM))
+		if err != nil {
+			t.Fatalf("generated certificate does not parse: %v", err)
+		}
+
+		networks := parsed.Networks()
+		if len(networks) != 1 {
+			t.Fatalf("expected exactly one network in the certificate, got %v", networks)
+		}
+
+		want := netip.PrefixFrom(netip.MustParseAddr(tc.ip), netip.MustParsePrefix(tc.network).Bits())
+		if networks[0] != want {
+			t.Errorf("expected network %v, got %v", want, networks[0])
+		}
+
+		// The host must be able to route to its peers. This is the property a
+		// /32 silently destroys.
+		peer := netip.MustParseAddr(tc.peer)
+		if !networks[0].Contains(peer) {
+			t.Errorf("certificate network %v does not cover peer %v -- this host cannot route to the mesh",
+				networks[0], peer)
+		}
+
+		// Paired negative: the prefix this code used to emit covers nothing.
+		single := netip.PrefixFrom(networks[0].Addr(), networks[0].Addr().BitLen())
+		if single.Contains(peer) {
+			t.Errorf("a single-address prefix %v unexpectedly covers %v; the test proves nothing", single, peer)
+		}
+	}
+}
+
+// TestGenerateHostCertRejectsAnIPOutsideItsNetwork keeps the signing path from
+// minting a certificate whose address is not covered by its own mask. ipam
+// validates this on the request path, but the rotation and renewal sweeps
+// re-sign records written long before, so the check belongs here too.
+func TestGenerateHostCertRejectsAnIPOutsideItsNetwork(t *testing.T) {
+	m := NewManager()
+
+	ca, err := m.GenerateCA("outside-ca", 10)
+	if err != nil {
+		t.Fatalf("GenerateCA failed: %v", err)
+	}
+
+	_, err = m.GenerateHostCert(HostCertParams{
+		Hostname:        "stray",
+		OverlayIP:       "10.200.0.5",
+		NetworkCIDR:     "10.128.0.0/24",
+		ValidityYears:   1,
+		CACertPEM:       ca.CertificatePEM,
+		CAPrivateKeyPEM: ca.PrivateKeyPEM,
+	})
+	if err == nil {
+		t.Error("expected an error for an overlay IP outside the network, got nil")
+	}
+}
+
+// TestGenerateHostCertRequiresANetworkCIDR refuses to guess a mask. Falling
+// back to /32 is what shipped before, and it fails silently at runtime; an
+// error at signing time is the only failure mode an operator can act on.
+func TestGenerateHostCertRequiresANetworkCIDR(t *testing.T) {
+	m := NewManager()
+
+	ca, err := m.GenerateCA("nocidr-ca", 10)
+	if err != nil {
+		t.Fatalf("GenerateCA failed: %v", err)
+	}
+
+	_, err = m.GenerateHostCert(HostCertParams{
+		Hostname:        "unmasked",
+		OverlayIP:       "10.128.0.5",
+		ValidityYears:   1,
+		CACertPEM:       ca.CertificatePEM,
+		CAPrivateKeyPEM: ca.PrivateKeyPEM,
+	})
+	if err == nil {
+		t.Error("expected an error when NetworkCIDR is missing, got nil")
+	}
+}
+
+// TestHostCertNetworkIsStale covers the predicate the bootstrap audit warns
+// on. It has to be exact in both directions: a false positive tells an operator
+// to re-issue a fleet for nothing, and a false negative leaves hosts unable to
+// route while every screen says they are fine.
+func TestHostCertNetworkIsStale(t *testing.T) {
+	m := NewManager()
+
+	ca, err := m.GenerateCA("stale-ca", 10)
+	if err != nil {
+		t.Fatalf("GenerateCA failed: %v", err)
+	}
+
+	sign := func(ip, cidr string) string {
+		t.Helper()
+		res, err := m.GenerateHostCert(HostCertParams{
+			Hostname:        "host",
+			OverlayIP:       ip,
+			NetworkCIDR:     cidr,
+			ValidityYears:   1,
+			CACertPEM:       ca.CertificatePEM,
+			CAPrivateKeyPEM: ca.PrivateKeyPEM,
+		})
+		if err != nil {
+			t.Fatalf("GenerateHostCert(%s in %s) failed: %v", ip, cidr, err)
+		}
+		return res.CertificatePEM
+	}
+
+	current := sign("10.128.0.5", "10.128.0.0/24")
+
+	tests := []struct {
+		name       string
+		certPEM    string
+		overlayIP  string
+		cidr       string
+		wantStale  bool
+		wantErrors bool
+	}{
+		{
+			name:      "a freshly signed certificate is current",
+			certPEM:   current,
+			overlayIP: "10.128.0.5",
+			cidr:      "10.128.0.0/24",
+		},
+		{
+			// The upgrade case: the network widened, or the certificate
+			// predates the mask fix.
+			name:      "a different mask is stale",
+			certPEM:   current,
+			overlayIP: "10.128.0.5",
+			cidr:      "10.128.0.0/16",
+			wantStale: true,
+		},
+		{
+			// overlay_ip edited without a re-sign.
+			name:      "a different address is stale",
+			certPEM:   sign("10.128.0.9", "10.128.0.0/24"),
+			overlayIP: "10.128.0.5",
+			cidr:      "10.128.0.0/24",
+			wantStale: true,
+		},
+		{
+			// Mid-creation. Nothing to warn about, and warning would fire on
+			// every host the moment it is created.
+			name:      "no certificate yet is not stale",
+			certPEM:   "",
+			overlayIP: "10.128.0.5",
+			cidr:      "10.128.0.0/24",
+		},
+		{
+			name:       "an unreadable certificate is an error, not a verdict",
+			certPEM:    "-----BEGIN NEBULA CERTIFICATE-----\nnope\n-----END NEBULA CERTIFICATE-----\n",
+			overlayIP:  "10.128.0.5",
+			cidr:       "10.128.0.0/24",
+			wantErrors: true,
+		},
+		{
+			name:       "an unreadable network CIDR is an error, not a verdict",
+			certPEM:    current,
+			overlayIP:  "10.128.0.5",
+			cidr:       "not-a-cidr",
+			wantErrors: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stale, err := HostCertNetworkIsStale(tc.certPEM, tc.overlayIP, tc.cidr)
+			if tc.wantErrors {
+				if err == nil {
+					t.Fatal("expected an error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("HostCertNetworkIsStale failed: %v", err)
+			}
+			if stale != tc.wantStale {
+				t.Errorf("expected stale=%v, got %v", tc.wantStale, stale)
+			}
+		})
 	}
 }
