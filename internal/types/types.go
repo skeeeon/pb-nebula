@@ -91,6 +91,11 @@ type HostRecord struct {
 	IsLighthouse   bool   `json:"is_lighthouse"`    // True if this host is a lighthouse
 	PublicHostPort string `json:"public_host_port"` // Public IP:PORT (required if lighthouse)
 
+	// Per-host tun overrides. The zero value means "inherit the generator
+	// default" so an existing host renders exactly the config it always did.
+	MTU       int    `json:"mtu"`        // Overrides tun.mtu when > 0
+	TunDevice string `json:"tun_device"` // Overrides tun.dev when non-empty
+
 	// Generated Nebula credentials
 	Certificate   string `json:"certificate"`    // PEM encoded host certificate
 	PrivateKey    string `json:"private_key"`    // PEM encoded host private key

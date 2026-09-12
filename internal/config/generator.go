@@ -98,6 +98,24 @@ func (g *Generator) GenerateHostConfig(host *types.HostRecord, lighthouses []typ
 		pki["blocklist"] = blocklist
 	}
 
+	// Per-host tun overrides are applied on top of the defaults rather than
+	// baked into them, and only when set, so a host that overrides nothing
+	// renders exactly the tun section it always did
+	tun := map[string]interface{}{
+		"disabled":             false,
+		"dev":                  "nebula1",
+		"drop_local_broadcast": false,
+		"drop_multicast":       false,
+		"tx_queue":             500,
+		"mtu":                  1300,
+	}
+	if host.MTU > 0 {
+		tun["mtu"] = host.MTU
+	}
+	if host.TunDevice != "" {
+		tun["dev"] = host.TunDevice
+	}
+
 	// Build config structure
 	config := map[string]interface{}{
 		"pki":        pki,
@@ -110,14 +128,7 @@ func (g *Generator) GenerateHostConfig(host *types.HostRecord, lighthouses []typ
 			"punch":   true,
 			"respond": true,
 		},
-		"tun": map[string]interface{}{
-			"disabled":             false,
-			"dev":                  "nebula1",
-			"drop_local_broadcast": false,
-			"drop_multicast":       false,
-			"tx_queue":             500,
-			"mtu":                  1300,
-		},
+		"tun": tun,
 		"logging": map[string]interface{}{
 			"level":  "info",
 			"format": "text",

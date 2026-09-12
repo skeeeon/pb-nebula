@@ -367,6 +367,14 @@ func (sm *Manager) setupHostHooks() {
 					sm.logger.Info("Firewall inbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
 					needsConfigRegeneration = true
 				}
+				if orig.GetInt("mtu") != e.Record.GetInt("mtu") {
+					sm.logger.Info("MTU changed for host %s, regenerating config", e.Record.GetString("hostname"))
+					needsConfigRegeneration = true
+				}
+				if orig.GetString("tun_device") != e.Record.GetString("tun_device") {
+					sm.logger.Info("Tun device changed for host %s, regenerating config", e.Record.GetString("hostname"))
+					needsConfigRegeneration = true
+				}
 			}
 
 			// Deactivating a host revokes its certificate, and revocation in
@@ -769,6 +777,8 @@ func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
 		Groups:           record.GetString("groups"),
 		IsLighthouse:     record.GetBool("is_lighthouse"),
 		PublicHostPort:   record.GetString("public_host_port"),
+		MTU:              record.GetInt("mtu"),
+		TunDevice:        record.GetString("tun_device"),
 		Certificate:      record.GetString("certificate"),
 		PrivateKey:       privateKey,
 		CACertificate:    record.GetString("ca_certificate"),

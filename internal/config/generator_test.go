@@ -276,3 +276,56 @@ func TestGenerateHostConfigOmitsAnEmptyBlocklist(t *testing.T) {
 		})
 	}
 }
+
+// TestGenerateHostConfigAppliesTunOverrides checks that a host's mtu and
+// tun_device reach the rendered tun section. Nebula silently ignores config it
+// does not recognise, so a value written under the wrong key would look like a
+// working override and quietly do nothing.
+func TestGenerateHostConfigAppliesTunOverrides(t *testing.T) {
+	g := NewGenerator()
+
+	host := testHost()
+	host.MTU = 1200
+	host.TunDevice = "neb0"
+
+	out, err := g.GenerateHostConfig(host, testLighthouses(), nil)
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	tun := cfg["tun"].(map[string]interface{})
+	if tun["mtu"] != 1200 {
+		t.Errorf("expected tun.mtu 1200, got %v", tun["mtu"])
+	}
+	if tun["dev"] != "neb0" {
+		t.Errorf("expected tun.dev neb0, got %v", tun["dev"])
+	}
+
+	// Untouched keys keep their defaults
+	if tun["tx_queue"] != 500 {
+		t.Errorf("expected tun.tx_queue to stay 500, got %v", tun["tx_queue"])
+	}
+}
+
+// TestGenerateHostConfigKeepsTunDefaultsWhenUnset is the guarantee that earns
+// the zero-value-means-inherit convention: a host that overrides nothing must
+// render byte-identical config to what it rendered before the fields existed,
+// so enabling this feature does not hand every existing deployment a diff.
+func TestGenerateHostConfigKeepsTunDefaultsWhenUnset(t *testing.T) {
+	g := NewGenerator()
+
+	out, err := g.GenerateHostConfig(testHost(), testLighthouses(), nil)
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	tun := cfg["tun"].(map[string]interface{})
+	if tun["mtu"] != 1300 {
+		t.Errorf("expected default tun.mtu 1300, got %v", tun["mtu"])
+	}
+	if tun["dev"] != "nebula1" {
+		t.Errorf("expected default tun.dev nebula1, got %v", tun["dev"])
+	}
+}

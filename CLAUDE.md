@@ -40,13 +40,19 @@ Do not reorder or move initialization out of the `OnBootstrap` callback — coll
 - `nebula_networks` — base collection. Unique per CA: composite indexes on `(ca_id, name)` and `(ca_id, cidr_range)`. The `ca_id` relation is added in a **second save** after the collection exists, because PocketBase relation fields need a target collection ID. If you add a new relation field, follow this same two-phase pattern (see `createNetworksCollection` and `createHostsCollection`).
 - `nebula_hosts` — **auth collection** (PocketBase email/password). Access rules are self-service (`@request.auth.id = id`). Unique per network: composite indexes on `(network_id, overlay_ip)` and `(network_id, hostname)`.
 
-Index changes only apply to fresh databases — `InitializeCollections` is idempotent and never alters an existing collection's schema. Existing deployments need manual index migration.
+**Fields migrate; indexes do not.** `InitializeCollections` is idempotent: it creates a collection that does not exist, and for one that does it *adds any declared field it is missing* (`addMissingFields`). It never removes, retypes, or narrows an existing field, and it never touches indexes or access rules.
+
+The declaration is therefore shared — `caFields()`, `networkFields()` and `hostFields()` are read by both the create path and the migration, so a field added to one of them cannot reach a fresh database and miss an existing one. **Add new fields there, not inline in `create*Collection`.** Relation fields (`ca_id`, `network_id`) are the exception: they need their target collection's ID resolved at runtime, stay in the two-phase create path, and are excluded from the migration because they exist on every deployment that has the collection at all.
+
+Index changes still only apply to fresh databases and need manual migration on existing deployments. Adding a column is safe on a populated table; adding a UNIQUE index to one with violating rows fails the save and takes the rest of initialization with it.
+
+Fields whose zero value means "inherit the default" (`mtu`, `tun_device`) rely on PocketBase short-circuiting validation on `0` / `""` before checking `Min` / `Pattern`, so the bounds can be declared without a special case.
 
 ### Tiered regeneration (do not break this)
 The update hook in `internal/sync/manager.go` (`setupHostHooks`) distinguishes what *has* to be regenerated:
 
 - **Cert regeneration (expensive)** when `hostname`, `overlay_ip`, `groups`, or `validity_years` change — these are embedded in the certificate.
-- **Config-only regeneration (cheap)** when `is_lighthouse`, `public_host_port`, `firewall_outbound`, or `firewall_inbound` change — these are config-only.
+- **Config-only regeneration (cheap)** when `is_lighthouse`, `public_host_port`, `firewall_outbound`, `firewall_inbound`, `mtu`, or `tun_device` change — these are config-only.
 - **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. Fan-out also fires on active-lighthouse create and delete, and on network `cidr_range` change.
 - **`active` on ANY host** — lighthouse or not — triggers both the peer fan-out *and* that host's own config regeneration. Deactivating a host revokes its certificate, and Nebula revocation lives in every OTHER host's `pki.blocklist` (see **Revocation** below), so an active flip makes every config in the network stale. The host's own config is regenerated separately because the fan-out deliberately excludes the record that changed.
 - **No regeneration** for `email`, `password`, or anything else.
@@ -64,8 +70,8 @@ Consequences worth keeping:
 - An empty blocklist is **omitted** from the config rather than written as an empty list, so a network with nothing revoked renders exactly the config it did before this feature.
 - A failure to build the blocklist is **logged, never fatal**. A config without a blocklist is the config this library generated for years; failing would stop a host getting any config at all.
 
-**A host is born active.** PocketBase bools have no schema-level default, so a create that omits `active` lands as false -- and every host minted through the API omits it. That was nearly harmless while `active` only gated `getLighthouses`; it stopped being harmless once `active` drove `pki.blocklist`, because a freshly issued certificate would be blocklisted by every peer from the moment it was created. `setupHostHooks` therefore forces `active = true` on create. It is forced rather than defaulted-if-absent because by the time a hook sees the record, "field omitted" and "explicitly false" are indistinguishable; creating an already-revoked host is not a meaningful operation, and deactivation is an update.
-
+**A host is born active.** PocketBase bools have no schema-level default, so a create that omits `active` lands as false -- and every host minted through the API omits it. That was nearly harmless while `active` only gated `getLighthouses`; it stopped being harmless once `active` drove `pki.blocklist`, because a freshly issued certificate would be blocklisted by every peer from the moment it was created. `setupHostHooks` therefore forces `active = true` on create. It is forced rather than defaulted-if-absent because by the time a hook sees the record, "field omitted" and "explicitly false" are indistinguishable; creating an already-revoked host is not a meaningful operation, and deactivation is an update.
+
 **Deactivate to revoke; do not delete.** A deleted host record takes its certificate with it, and a fingerprint that is not in the database cannot be blocklisted — so deleting a host leaves its certificate valid until it expires. Deletion is for hosts you are content to leave trusted.
 
 **The config is not the delivery.** Regenerating `config_yaml` updates the database; it does not push anything to a device. Revocation takes effect when each peer's config is redeployed and the process reloads. That boundary is deliberate and matches the NATS side, where the platform mints a credential and does not care what connects with it — but it means "revoked" here means "revoked in the material we hand out", not "already off the mesh".
