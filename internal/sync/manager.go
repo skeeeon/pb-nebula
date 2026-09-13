@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"slices"
 	"sort"
+	"strings"
 	stdsync "sync"
 	"time"
 
@@ -293,6 +294,76 @@ func (sm *Manager) setupNetworkHooks() {
 	})
 }
 
+// certFields are the host fields signed INTO the certificate. Changing one is
+// completely inert until a new certificate is issued, so they cost a re-sign.
+//
+// unsafe_networks is the one that surprises people: Nebula authorizes routing
+// on the certificate, not on config, so a gateway whose cert omits a prefix
+// silently refuses to route it and drops the packet before any firewall rule
+// runs.
+var certFields = []string{
+	"hostname",
+	"overlay_ip",
+	"groups",
+	"unsafe_networks",
+}
+
+// configFields are the host fields that appear only in config_yaml, and can be
+// re-rendered without touching the certificate.
+//
+// EVERY FAN-OUT FIELD NEEDS AN ENTRY HERE TOO. regenerateNetworkHostConfigs
+// deliberately excludes the record that changed, so a field listed only in the
+// fan-out rules updates every host in the network EXCEPT the one that was
+// edited. That shipped once for is_relay: clearing the flag left am_relay: true
+// in the host's own config, so it kept relaying for peers that had already
+// dropped it.
+var configFields = []string{
+	"is_lighthouse",
+	"is_relay",
+	"public_host_port",
+	"firewall_outbound",
+	"firewall_inbound",
+	"mtu",
+	"tun_device",
+	// The consumer half of gateway routing. No peer embeds another host's
+	// routes, so this one has no fan-out entry.
+	"unsafe_routes",
+}
+
+// changedFields returns the names of the fields that differ between the stored
+// record and the incoming one.
+//
+// WHY A TABLE AND NOT FIFTEEN HAND-WRITTEN COMPARISONS:
+// The tiers are the thing a new field has to be slotted into, and the failure
+// mode of getting it wrong is silence -- a field that never triggers
+// regeneration, or triggers an expensive re-sign it does not need. Two lists
+// make "add a field, pick a tier" a single edit that cannot be half-done, and
+// make the tiers readable as data instead of reconstructed from a wall of ifs.
+//
+// Comparison goes through GetString for every field regardless of its declared
+// type. PocketBase renders a bool as "true"/"false" and an int as its decimal
+// form, which is uniform and exact enough for "did this change" -- and it is
+// what the string-typed fields were already compared with.
+//
+// PARAMETERS:
+//   - orig: the stored record (never nil; callers check)
+//   - record: the incoming record
+//   - fields: the tier to check
+//
+// RETURNS:
+// - the names that differ, in table order, or nil
+//
+// SIDE EFFECTS: None (pure).
+func changedFields(orig, record *core.Record, fields []string) []string {
+	var changed []string
+	for _, field := range fields {
+		if orig.GetString(field) != record.GetString(field) {
+			changed = append(changed, field)
+		}
+	}
+	return changed
+}
+
 // setupHostHooks registers hooks for host lifecycle, validation, and certificate/config generation.
 //
 // HOST EVENT HANDLING:
@@ -440,27 +511,18 @@ func (sm *Manager) setupHostHooks() {
 		needsRenewReset := false
 
 		if orig != nil {
-			// Check if CERTIFICATE regeneration is needed (expensive - new cert).
-			// These fields are embedded in the certificate itself.
-			if orig.GetString("hostname") != e.Record.GetString("hostname") {
-				sm.logger.Info("Hostname changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
+			// CERTIFICATE tier (expensive): these are signed into the cert, so
+			// nothing cheaper than a re-issue makes an edit take effect.
+			if changed := changedFields(orig, e.Record, certFields); len(changed) > 0 {
+				sm.logger.Info("Certificate field(s) %s changed for host %s, regenerating certificate",
+					strings.Join(changed, ", "), e.Record.GetString("hostname"))
 				needsCertRegeneration = true
 			}
-			if orig.GetString("overlay_ip") != e.Record.GetString("overlay_ip") {
-				sm.logger.Info("Overlay IP changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
-				needsCertRegeneration = true
-			}
-			if orig.GetString("groups") != e.Record.GetString("groups") {
-				sm.logger.Info("Groups changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
-				needsCertRegeneration = true
-			}
-			// unsafe_networks is signed INTO the certificate -- Nebula
-			// authorizes routing on the cert, so an edit here is completely
-			// inert until a new certificate is issued
-			if orig.GetString("unsafe_networks") != e.Record.GetString("unsafe_networks") {
-				sm.logger.Info("Unsafe networks changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
-				needsCertRegeneration = true
-			}
+
+			// validity_years is not in the table because it is not a plain
+			// diff: clearing it to 0 means "use the configured default", which
+			// is a request to keep the current lifetime, not to re-issue with
+			// a zero-year certificate.
 			if orig.GetInt("validity_years") != e.Record.GetInt("validity_years") && e.Record.GetInt("validity_years") > 0 {
 				sm.logger.Info("Validity years changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
 				needsCertRegeneration = true
@@ -483,44 +545,13 @@ func (sm *Manager) setupHostHooks() {
 				needsRenewReset = true
 			}
 
-			// Check if only CONFIG regeneration is needed (cheap - just YAML)
+			// CONFIG tier (cheap): rendered into config_yaml and nowhere else.
+			// Skipped when a certificate is already being re-issued, since that
+			// regenerates the config anyway.
 			if !needsCertRegeneration {
-				if orig.GetBool("is_lighthouse") != e.Record.GetBool("is_lighthouse") {
-					sm.logger.Info("Lighthouse status changed for host %s, regenerating config", e.Record.GetString("hostname"))
-					needsConfigRegeneration = true
-				}
-				// The peer fan-out below deliberately excludes this record, so
-				// the host's OWN config has to be regenerated here or it keeps
-				// am_relay after it stops being a relay -- still relaying for
-				// peers that no longer list it.
-				if orig.GetBool("is_relay") != e.Record.GetBool("is_relay") {
-					sm.logger.Info("Relay status changed for host %s, regenerating config", e.Record.GetString("hostname"))
-					needsConfigRegeneration = true
-				}
-				if orig.GetString("public_host_port") != e.Record.GetString("public_host_port") {
-					sm.logger.Info("Public host/port changed for host %s, regenerating config", e.Record.GetString("hostname"))
-					needsConfigRegeneration = true
-				}
-				if orig.GetString("firewall_outbound") != e.Record.GetString("firewall_outbound") {
-					sm.logger.Info("Firewall outbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
-					needsConfigRegeneration = true
-				}
-				if orig.GetString("firewall_inbound") != e.Record.GetString("firewall_inbound") {
-					sm.logger.Info("Firewall inbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
-					needsConfigRegeneration = true
-				}
-				if orig.GetInt("mtu") != e.Record.GetInt("mtu") {
-					sm.logger.Info("MTU changed for host %s, regenerating config", e.Record.GetString("hostname"))
-					needsConfigRegeneration = true
-				}
-				if orig.GetString("tun_device") != e.Record.GetString("tun_device") {
-					sm.logger.Info("Tun device changed for host %s, regenerating config", e.Record.GetString("hostname"))
-					needsConfigRegeneration = true
-				}
-				// The consumer half of gateway routing lives only in this
-				// host's own config -- no peer embeds it, so no fan-out
-				if orig.GetString("unsafe_routes") != e.Record.GetString("unsafe_routes") {
-					sm.logger.Info("Unsafe routes changed for host %s, regenerating config", e.Record.GetString("hostname"))
+				if changed := changedFields(orig, e.Record, configFields); len(changed) > 0 {
+					sm.logger.Info("Config field(s) %s changed for host %s, regenerating config",
+						strings.Join(changed, ", "), e.Record.GetString("hostname"))
 					needsConfigRegeneration = true
 				}
 			}

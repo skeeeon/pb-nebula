@@ -67,7 +67,9 @@ The update hook in `internal/sync/manager.go` (`setupHostHooks`) distinguishes w
 - **Reactivation** (`active` false→true) forces a cert regeneration — a host parked across a CA rotation is never re-signed by the commit sweep, so it comes back on a CA that may have been retired. See **CA rotation** below.
 - **No regeneration** for `email`, `password`, or anything else.
 
-If you add a new host field, decide which tier it belongs in and update the diff logic in `setupHostHooks`. Otherwise the field will silently never trigger regeneration, or will trigger an expensive cert regen it doesn't need.
+If you add a new host field, decide which tier it belongs in and **add it to `certFields` or `configFields`** at the top of `internal/sync/manager.go`. `changedFields` diffs a tier through `GetString`, which renders bools and numbers uniformly, so the tables are the whole edit — there is no matching `if` to write. `TestTiersAreDisjointAndComplete` keeps a second copy of the membership and fails when it drifts, so a field cannot be half-added. Otherwise the field will silently never trigger regeneration, or will trigger an expensive cert regen it doesn't need.
+
+`validity_years` stays out of the tables on purpose: clearing it to `0` means "use the configured default", which is a request to keep the current lifetime rather than to re-issue. `renew`, `active` and the fan-out rules stay explicit too — each is a transition or a condition, not a plain diff.
 
 ### Revocation is a fan-out, not a record
 
