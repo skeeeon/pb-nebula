@@ -87,9 +87,17 @@ type HostRecord struct {
 	OverlayIP string `json:"overlay_ip"` // Overlay network IP (e.g., "10.128.0.100")
 	Groups    string `json:"groups"`     // JSON array of group names for firewall rules
 
-	// Lighthouse configuration
+	// Lighthouse and relay configuration. Both roles need public_host_port:
+	// peers reach a lighthouse through static_host_map and a relay at the
+	// address they were handed, so neither can use an ephemeral port.
 	IsLighthouse   bool   `json:"is_lighthouse"`    // True if this host is a lighthouse
-	PublicHostPort string `json:"public_host_port"` // Public IP:PORT (required if lighthouse)
+	IsRelay        bool   `json:"is_relay"`         // True if this host relays for peers that cannot punch
+	PublicHostPort string `json:"public_host_port"` // Public IP:PORT (required if lighthouse or relay)
+
+	// Per-host tun overrides. The zero value means "inherit the generator
+	// default" so an existing host renders exactly the config it always did.
+	MTU       int    `json:"mtu"`        // Overrides tun.mtu when > 0
+	TunDevice string `json:"tun_device"` // Overrides tun.dev when non-empty
 
 	// Generated Nebula credentials
 	Certificate   string `json:"certificate"`    // PEM encoded host certificate
@@ -101,6 +109,32 @@ type HostRecord struct {
 	FirewallOutbound string `json:"firewall_outbound"` // JSON array of outbound firewall rules
 	FirewallInbound  string `json:"firewall_inbound"`  // JSON array of inbound firewall rules
 
+	// Gateway routing to non-Nebula subnets. These two are the PROVIDER and
+	// CONSUMER halves of the same feature and live on DIFFERENT hosts:
+	//
+	//   - UnsafeNetworks is signed INTO this host's certificate. Nebula
+	//     authorizes routing on the certificate, not on config, so a gateway
+	//     whose cert omits a prefix silently refuses to route it -- the packet
+	//     is dropped before any firewall rule is consulted. Cert-bound.
+	//   - UnsafeRoutes tells THIS host to send traffic for a prefix through
+	//     some other host. Config-only.
+	//
+	// Both are required, on their respective hosts, for traffic to flow, and
+	// neither derives the other. See the Phase 3 notes in CLAUDE.md.
+	UnsafeNetworks string `json:"unsafe_networks"` // JSON array of CIDRs this host may route for
+	UnsafeRoutes   string `json:"unsafe_routes"`   // JSON array of {route, via} this host sends into the tunnel
+
+	// PreferredRanges are UNDERLAY prefixes this host should favour when a peer
+	// advertises several addresses -- typically the LAN it sits on, so two
+	// hosts in the same rack use their private addresses instead of the public
+	// ones a lighthouse learned for them.
+	//
+	// This is a host column rather than a network one because it describes
+	// where the host physically is, not which overlay it belongs to. Two hosts
+	// in one pb-nebula network can sit in different datacenters, and two hosts
+	// in different networks can share a rack.
+	PreferredRanges string `json:"preferred_ranges"` // JSON array of underlay CIDRs to prefer
+
 	// Certificate validity
 	ValidityYears int       `json:"validity_years"` // Certificate validity period
 	ExpiresAt     time.Time `json:"expires_at"`     // Certificate expiration timestamp
@@ -109,6 +143,23 @@ type HostRecord struct {
 	Active  bool      `json:"active"`  // Host enable/disable flag
 	Created time.Time `json:"created"` // Creation timestamp
 	Updated time.Time `json:"updated"` // Last update timestamp
+}
+
+// UnsafeRoute is one entry of Nebula's tun.unsafe_routes: traffic for Route is
+// sent through the mesh host whose overlay IP is Via.
+//
+// This is the CONSUMER half of gateway routing. The PROVIDER half is
+// HostRecord.UnsafeNetworks on the host named by Via, because Nebula authorizes
+// routing on the certificate: a via node whose cert does not carry the prefix
+// silently refuses to route it. Both halves are configured independently and
+// both are required.
+//
+// Only route and via are supported. Nebula also accepts optional mtu and metric
+// per route; they are omitted until someone needs them, rather than carried as
+// fields nothing sets.
+type UnsafeRoute struct {
+	Route string `json:"route"` // CIDR to route through the mesh (e.g., "192.168.50.0/24")
+	Via   string `json:"via"`   // Overlay IP of the gateway host (e.g., "10.128.0.5")
 }
 
 // LighthouseInfo contains the information needed to configure lighthouse discovery.
@@ -151,6 +202,38 @@ type Options struct {
 	// (Nebula's PKI block requires it) and is stored plaintext. Encryption only
 	// protects the standalone private_key column.
 	EncryptionKey string
+
+	// DisableHostCertRenewal turns OFF the background job that re-issues host
+	// certificates before they expire. Renewal is on by default because the
+	// failure mode of forgetting it is a host that silently drops off the mesh.
+	//
+	// The name is negative on purpose. applyDefaultOptions only fills zero
+	// values, so a bool that defaults to true is indistinguishable from unset
+	// (the same reason LogToConsole is not defaulted). A negative name keeps
+	// the zero value meaningful without a *bool and nil checks at every read.
+	DisableHostCertRenewal bool
+
+	// HostRenewalThreshold is the fraction of remaining lifetime at or below
+	// which a host certificate is re-issued. Default 0.20, i.e. renew once 80%
+	// of the certificate's life has been used. Must be > 0 and < 1.
+	HostRenewalThreshold float64
+
+	// HostRenewalCron is the cron expression for the renewal sweep.
+	// Default "0 3 * * *" (daily at 03:00).
+	HostRenewalCron string
+
+	// CAExpiryWarningDays is how far ahead of a CA's expiry to start warning.
+	// Default 90.
+	//
+	// A CA cannot be renewed, only rotated, and rotation is a three-step
+	// operator procedure with a deliberate wait in the middle -- Nebula's own
+	// guide says to begin two to three months out. Nothing else surfaces an
+	// aging CA in time: host renewal only notices once certificates are
+	// already clamped to the CA's NotAfter, which is both late and indirect.
+	//
+	// Not gated by DisableHostCertRenewal. Turning off automatic re-issue is a
+	// reason to want MORE warning about an expiring CA, not less.
+	CAExpiryWarningDays int
 }
 
 // Collection names with nebula_ prefix for clear identification
@@ -166,6 +249,40 @@ const (
 	DefaultHostValidityYears = 1  // 1 year for host certificates
 )
 
+// Host certificate renewal defaults
+const (
+	// DefaultHostRenewalThreshold re-issues once 80% of a certificate's
+	// lifetime has been consumed. On the default 1-year host certificate that
+	// leaves roughly 73 days of headroom.
+	DefaultHostRenewalThreshold = 0.20
+
+	// DefaultHostRenewalCron runs the sweep daily at 03:00. Renewal is not
+	// urgent work -- the threshold leaves weeks of margin -- so once a day is
+	// plenty and keeps the write burst off peak hours.
+	DefaultHostRenewalCron = "0 3 * * *"
+
+	// HostRenewalCronJobID namespaces the job so a host application registering
+	// its own cron entries cannot collide with ours.
+	HostRenewalCronJobID = "pbnebula_renew_host_certs"
+)
+
+// CA expiry warning defaults
+const (
+	// DefaultCAExpiryWarningDays starts warning 90 days out, matching the "two
+	// to three months in advance" Nebula's CA rotation guide asks for. The wait
+	// between prepare and commit is operator judgment and cannot be compressed,
+	// so the warning has to arrive with room for it.
+	DefaultCAExpiryWarningDays = 90
+
+	// DefaultCAExpiryCron runs the check daily at 03:30, after the renewal
+	// sweep rather than alongside it, so the two do not interleave their log
+	// output on the one morning both have something to say.
+	DefaultCAExpiryCron = "30 3 * * *"
+
+	// CAExpiryCronJobID namespaces the job, like HostRenewalCronJobID.
+	CAExpiryCronJobID = "pbnebula_warn_ca_expiry"
+)
+
 // Event types for logging and filtering
 // These constants enable consistent event classification across components
 const (
@@ -177,6 +294,8 @@ const (
 	EventTypeHostCreate    = "host_create"    // Host creation events
 	EventTypeHostUpdate    = "host_update"    // Host modification events
 	EventTypeHostDelete    = "host_delete"    // Host deletion events
+	EventTypeHostRenew     = "host_renew"     // Host certificate renewal (cron sweep and the renew action field)
+	EventTypeCARotate      = "ca_rotate"      // CA rotation step (prepare, commit, finish)
 )
 
 // GetGroups extracts the groups array from the JSON field.
@@ -288,4 +407,63 @@ func (h *HostRecord) SetFirewallRules(outbound, inbound []map[string]interface{}
 	}
 
 	return nil
+}
+
+// GetPreferredRanges parses the JSON preferred_ranges array into a string slice.
+//
+// Empty or "null" yields nil, so a host that expresses no preference renders no
+// preferred_ranges key at all.
+//
+// RETURNS:
+// - []string of underlay CIDRs, nil when unset
+// - error if the stored value is not a JSON array of strings
+func (h *HostRecord) GetPreferredRanges() ([]string, error) {
+	if h.PreferredRanges == "" || h.PreferredRanges == "null" {
+		return nil, nil
+	}
+
+	var ranges []string
+	if err := json.Unmarshal([]byte(h.PreferredRanges), &ranges); err != nil {
+		return nil, err
+	}
+	return ranges, nil
+}
+
+// GetUnsafeNetworks parses the JSON unsafe_networks array into a string slice.
+// These are the non-overlay prefixes this host is authorized to route for, and
+// they are signed into its certificate.
+//
+// RETURNS:
+// - []string: CIDR strings, empty slice if none are configured
+// - error if the JSON is malformed
+func (h *HostRecord) GetUnsafeNetworks() ([]string, error) {
+	if h.UnsafeNetworks == "" || h.UnsafeNetworks == "null" {
+		return []string{}, nil
+	}
+
+	var networks []string
+	if err := json.Unmarshal([]byte(h.UnsafeNetworks), &networks); err != nil {
+		return nil, err
+	}
+
+	return networks, nil
+}
+
+// GetUnsafeRoutes parses the JSON unsafe_routes array into UnsafeRoute values.
+// These tell this host to send traffic for a prefix through another mesh host.
+//
+// RETURNS:
+// - []UnsafeRoute: Routes, empty slice if none are configured
+// - error if the JSON is malformed
+func (h *HostRecord) GetUnsafeRoutes() ([]UnsafeRoute, error) {
+	if h.UnsafeRoutes == "" || h.UnsafeRoutes == "null" {
+		return []UnsafeRoute{}, nil
+	}
+
+	var routes []UnsafeRoute
+	if err := json.Unmarshal([]byte(h.UnsafeRoutes), &routes); err != nil {
+		return nil, err
+	}
+
+	return routes, nil
 }

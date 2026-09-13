@@ -40,7 +40,7 @@ func parseConfig(t *testing.T, yamlStr string) map[string]interface{} {
 func TestGenerateHostConfigRegularHost(t *testing.T) {
 	g := NewGenerator()
 
-	out, err := g.GenerateHostConfig(testHost(), testLighthouses(), nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses(), Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestGenerateHostConfigLighthouse(t *testing.T) {
 	host.IsLighthouse = true
 	host.PublicHostPort = "1.2.3.4:4242"
 
-	out, err := g.GenerateHostConfig(host, testLighthouses(), nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses(), Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestGenerateHostConfigLighthouse(t *testing.T) {
 func TestGenerateHostConfigDefaultFirewall(t *testing.T) {
 	g := NewGenerator()
 
-	out, err := g.GenerateHostConfig(testHost(), nil, nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: nil, Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestGenerateHostConfigCustomFirewall(t *testing.T) {
 	host := testHost()
 	host.FirewallInbound = `[{"port": "22", "proto": "tcp", "groups": ["admin"]}]`
 
-	out, err := g.GenerateHostConfig(host, testLighthouses(), nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses(), Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestGenerateHostConfigInvalidFirewall(t *testing.T) {
 	host := testHost()
 	host.FirewallInbound = `{not json`
 
-	_, err := g.GenerateHostConfig(host, nil, nil)
+	_, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: nil, Blocklist: nil})
 	if !errors.Is(err, types.ErrInvalidFirewall) {
 		t.Errorf("expected ErrInvalidFirewall, got %v", err)
 	}
@@ -172,18 +172,23 @@ func TestExtractPort(t *testing.T) {
 	tests := []struct {
 		hostPort     string
 		isLighthouse bool
+		isRelay      bool
 		want         int
 	}{
-		{"1.2.3.4:4242", true, 4242},
-		{"1.2.3.4:4242", false, 0}, // regular hosts use ephemeral port
-		{"", true, 0},
-		{"no-port", true, 0},
-		{"[fd00::1]:4242", true, 4242}, // IPv6 public endpoint
+		{"1.2.3.4:4242", true, false, 4242},
+		{"1.2.3.4:4242", false, false, 0}, // regular hosts use ephemeral port
+		{"1.2.3.4:4242", false, true, 4242},
+		{"1.2.3.4:4242", true, true, 4242}, // lighthouse that also relays
+		{"", true, false, 0},
+		{"", false, true, 0},
+		{"no-port", true, false, 0},
+		{"[fd00::1]:4242", true, false, 4242}, // IPv6 public endpoint
 	}
 
 	for _, tt := range tests {
-		if got := g.extractPort(tt.hostPort, tt.isLighthouse); got != tt.want {
-			t.Errorf("extractPort(%q, %v) = %d, want %d", tt.hostPort, tt.isLighthouse, got, tt.want)
+		if got := g.extractPort(tt.hostPort, tt.isLighthouse, tt.isRelay); got != tt.want {
+			t.Errorf("extractPort(%q, lighthouse=%v, relay=%v) = %d, want %d",
+				tt.hostPort, tt.isLighthouse, tt.isRelay, got, tt.want)
 		}
 	}
 }
@@ -193,7 +198,7 @@ func TestGenerateHostConfigEmbedsPrivateKeyInline(t *testing.T) {
 	// inline (Nebula's PKI block requires it), so it is plaintext at rest.
 	g := NewGenerator()
 
-	out, err := g.GenerateHostConfig(testHost(), nil, nil)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: nil, Blocklist: nil})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -215,7 +220,7 @@ func TestGenerateHostConfigWritesTheBlocklistUnderPKI(t *testing.T) {
 		"2222222222222222222222222222222222222222222222222222222222222222",
 	}
 
-	out, err := g.GenerateHostConfig(testHost(), testLighthouses(), fingerprints)
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses(), Blocklist: fingerprints})
 	if err != nil {
 		t.Fatalf("GenerateHostConfig failed: %v", err)
 	}
@@ -259,7 +264,7 @@ func TestGenerateHostConfigOmitsAnEmptyBlocklist(t *testing.T) {
 
 	for name, blocklist := range map[string][]string{"nil": nil, "empty": {}} {
 		t.Run(name, func(t *testing.T) {
-			out, err := g.GenerateHostConfig(testHost(), testLighthouses(), blocklist)
+			out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses(), Blocklist: blocklist})
 			if err != nil {
 				t.Fatalf("GenerateHostConfig failed: %v", err)
 			}
@@ -275,4 +280,308 @@ func TestGenerateHostConfigOmitsAnEmptyBlocklist(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGenerateHostConfigAppliesTunOverrides checks that a host's mtu and
+// tun_device reach the rendered tun section. Nebula silently ignores config it
+// does not recognise, so a value written under the wrong key would look like a
+// working override and quietly do nothing.
+func TestGenerateHostConfigAppliesTunOverrides(t *testing.T) {
+	g := NewGenerator()
+
+	host := testHost()
+	host.MTU = 1200
+	host.TunDevice = "neb0"
+
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses(), Blocklist: nil})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	tun := cfg["tun"].(map[string]interface{})
+	if tun["mtu"] != 1200 {
+		t.Errorf("expected tun.mtu 1200, got %v", tun["mtu"])
+	}
+	if tun["dev"] != "neb0" {
+		t.Errorf("expected tun.dev neb0, got %v", tun["dev"])
+	}
+
+	// Untouched keys keep their defaults
+	if tun["tx_queue"] != 500 {
+		t.Errorf("expected tun.tx_queue to stay 500, got %v", tun["tx_queue"])
+	}
+}
+
+// TestGenerateHostConfigKeepsTunDefaultsWhenUnset is the guarantee that earns
+// the zero-value-means-inherit convention: a host that overrides nothing must
+// render byte-identical config to what it rendered before the fields existed,
+// so enabling this feature does not hand every existing deployment a diff.
+func TestGenerateHostConfigKeepsTunDefaultsWhenUnset(t *testing.T) {
+	g := NewGenerator()
+
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses(), Blocklist: nil})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	tun := cfg["tun"].(map[string]interface{})
+	if tun["mtu"] != 1300 {
+		t.Errorf("expected default tun.mtu 1300, got %v", tun["mtu"])
+	}
+	if tun["dev"] != "nebula1" {
+		t.Errorf("expected default tun.dev nebula1, got %v", tun["dev"])
+	}
+}
+
+// TestGenerateHostConfigRelayHost checks that a relay advertises itself and
+// nothing else. Nebula ignores relay.relays when am_relay is true and forces
+// useRelays off for a relay, so emitting a list here would be config that reads
+// as meaningful and is silently discarded.
+func TestGenerateHostConfigRelayHost(t *testing.T) {
+	g := NewGenerator()
+
+	host := testHost()
+	host.IsRelay = true
+	host.PublicHostPort = "203.0.113.7:4242"
+
+	out, err := g.GenerateHostConfig(HostConfigInput{
+		Host:        host,
+		Lighthouses: testLighthouses(),
+		Relays:      []string{"10.128.0.9"},
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	relay := cfg["relay"].(map[string]interface{})
+	if relay["am_relay"] != true {
+		t.Errorf("expected am_relay true, got %v", relay["am_relay"])
+	}
+	if _, ok := relay["relays"]; ok {
+		t.Error("a relay must not be given relays of its own")
+	}
+	if _, ok := relay["use_relays"]; ok {
+		t.Error("use_relays should never be emitted; Nebula's default already handles it")
+	}
+
+	// A relay needs a stable listening port, like a lighthouse
+	listen := cfg["listen"].(map[string]interface{})
+	if listen["port"] != 4242 {
+		t.Errorf("expected relay to listen on 4242, got %v", listen["port"])
+	}
+}
+
+// TestGenerateHostConfigPeerGetsRelayList checks the other half: an ordinary
+// host is handed the network's relays as paths it may use.
+func TestGenerateHostConfigPeerGetsRelayList(t *testing.T) {
+	g := NewGenerator()
+
+	out, err := g.GenerateHostConfig(HostConfigInput{
+		Host:        testHost(),
+		Lighthouses: testLighthouses(),
+		Relays:      []string{"10.128.0.7", "10.128.0.9"},
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	relay := cfg["relay"].(map[string]interface{})
+	relays := relay["relays"].([]interface{})
+	if len(relays) != 2 || relays[0] != "10.128.0.7" || relays[1] != "10.128.0.9" {
+		t.Errorf("unexpected relays list: %v", relays)
+	}
+	if _, ok := relay["am_relay"]; ok {
+		t.Error("a non-relay host should not carry am_relay")
+	}
+
+	// Relays are reached via the lighthouse, not a static_host_map entry
+	shm := cfg["static_host_map"].(map[string]interface{})
+	if _, ok := shm["10.128.0.7"]; ok {
+		t.Error("relays must not be added to static_host_map")
+	}
+}
+
+// TestGenerateHostConfigOmitsRelaySectionWhenNoRelays is the no-spurious-diff
+// guarantee: a network that uses no relays must render exactly the config it
+// rendered before relay support existed, key for key.
+func TestGenerateHostConfigOmitsRelaySectionWhenNoRelays(t *testing.T) {
+	g := NewGenerator()
+
+	out, err := g.GenerateHostConfig(HostConfigInput{
+		Host:        testHost(),
+		Lighthouses: testLighthouses(),
+		Relays:      nil,
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	if relay, ok := cfg["relay"]; ok {
+		t.Errorf("expected relay section omitted entirely, got %v", relay)
+	}
+	if strings.Contains(out, "relay") {
+		t.Errorf("config mentions relay despite the network having none:\n%s", out)
+	}
+}
+
+// TestGenerateHostConfigWritesUnsafeRoutes checks the consumer half lands under
+// tun.unsafe_routes with the exact keys Nebula's overlay/route.go reads. A
+// misspelled key here is inert YAML that looks like a working route.
+func TestGenerateHostConfigWritesUnsafeRoutes(t *testing.T) {
+	g := NewGenerator()
+
+	host := testHost()
+	host.UnsafeRoutes = `[{"route":"192.168.50.0/24","via":"10.128.0.5"},{"route":"172.16.0.0/16","via":"10.128.0.6"}]`
+
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	tun := cfg["tun"].(map[string]interface{})
+	raw, ok := tun["unsafe_routes"]
+	if !ok {
+		t.Fatalf("tun.unsafe_routes missing; tun section was %v", tun)
+	}
+	routes := raw.([]interface{})
+	if len(routes) != 2 {
+		t.Fatalf("expected 2 routes, got %d", len(routes))
+	}
+
+	first := routes[0].(map[string]interface{})
+	if first["route"] != "192.168.50.0/24" || first["via"] != "10.128.0.5" {
+		t.Errorf("unexpected first route: %v", first)
+	}
+	// Only route and via are emitted; Nebula treats mtu/metric as optional and
+	// we do not carry fields nothing sets
+	if len(first) != 2 {
+		t.Errorf("expected exactly route and via, got %v", first)
+	}
+}
+
+// TestGenerateHostConfigOmitsUnsafeRoutesWhenUnset is the no-spurious-diff
+// guarantee for the consumer half.
+func TestGenerateHostConfigOmitsUnsafeRoutesWhenUnset(t *testing.T) {
+	g := NewGenerator()
+
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses()})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+	cfg := parseConfig(t, out)
+
+	tun := cfg["tun"].(map[string]interface{})
+	if v, ok := tun["unsafe_routes"]; ok {
+		t.Errorf("expected tun.unsafe_routes omitted for a host with no routes, got %v", v)
+	}
+}
+
+// TestGenerateHostConfigInvalidUnsafeRoutes checks malformed stored JSON
+// surfaces as the matching sentinel rather than a bare marshal error.
+func TestGenerateHostConfigInvalidUnsafeRoutes(t *testing.T) {
+	g := NewGenerator()
+
+	host := testHost()
+	host.UnsafeRoutes = `{not json`
+
+	_, err := g.GenerateHostConfig(HostConfigInput{Host: host})
+	if !errors.Is(err, types.ErrInvalidUnsafeRoute) {
+		t.Errorf("expected ErrInvalidUnsafeRoute, got %v", err)
+	}
+}
+
+// TestGenerateHostConfigSetsDisconnectInvalid pins the one Nebula default this
+// generator restates rather than omits.
+//
+// The omit-the-default discipline everywhere else (use_relays, an empty
+// blocklist, the relay section) rests on the default being knowable. This one
+// is not: Nebula's docs say pki.disconnect_invalid defaults to false, its code
+// defaults it to true, and its own example config shows it commented as true.
+//
+// It is what closes the last gap at the end of a CA rotation. `finish` drops
+// the outgoing CA, and a host still holding a certificate signed by it would
+// otherwise keep its established tunnels open indefinitely -- trusted by
+// nobody, still connected to everybody.
+func TestGenerateHostConfigSetsDisconnectInvalid(t *testing.T) {
+	g := NewGenerator()
+
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses()})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+
+	pki := parseConfig(t, out)["pki"].(map[string]interface{})
+	if pki["disconnect_invalid"] != true {
+		t.Errorf("expected pki.disconnect_invalid true, got %v", pki["disconnect_invalid"])
+	}
+}
+
+// TestGenerateHostConfigPreferredRanges covers both directions of a setting
+// that is emitted only when the operator asks for it.
+//
+// The omission matters as much as the emission: every existing deployment has
+// no preference set, and a host that expresses none must render exactly the
+// config it always did rather than acquiring an empty key that shows up as a
+// diff in whatever ships these files.
+func TestGenerateHostConfigPreferredRanges(t *testing.T) {
+	g := NewGenerator()
+
+	t.Run("omitted when unset", func(t *testing.T) {
+		out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses()})
+		if err != nil {
+			t.Fatalf("GenerateHostConfig failed: %v", err)
+		}
+		if _, present := parseConfig(t, out)["preferred_ranges"]; present {
+			t.Error("expected preferred_ranges to be omitted when the host sets none")
+		}
+	})
+
+	t.Run("rendered in order when set", func(t *testing.T) {
+		host := testHost()
+		host.PreferredRanges = `["10.0.0.0/8","192.168.0.0/16"]`
+
+		out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()})
+		if err != nil {
+			t.Fatalf("GenerateHostConfig failed: %v", err)
+		}
+
+		raw, present := parseConfig(t, out)["preferred_ranges"]
+		if !present {
+			t.Fatal("expected preferred_ranges in the config")
+		}
+
+		got := raw.([]interface{})
+		want := []string{"10.0.0.0/8", "192.168.0.0/16"}
+		if len(got) != len(want) {
+			t.Fatalf("expected %d preferred ranges, got %v", len(want), got)
+		}
+		// Preserved as the operator wrote it. Nebula treats the list as a SET
+		// -- remote_list.go sorts on isPreferred(), a boolean membership test,
+		// not on position -- so order changes nothing at runtime. It is kept
+		// anyway because the value arrives as stored JSON rather than from an
+		// unordered query, so there is nothing to sort for and re-ordering it
+		// would only manufacture diffs. That is the opposite of getBlocklist
+		// and getRelays, which must sort precisely because their order is not
+		// guaranteed.
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("preferred_ranges[%d] = %v, want %s", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("malformed JSON is an error", func(t *testing.T) {
+		host := testHost()
+		host.PreferredRanges = `{"not":"an array"}`
+
+		if _, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()}); err == nil {
+			t.Error("expected an error for malformed preferred_ranges, got nil")
+		}
+	})
 }

@@ -4,12 +4,17 @@ package sync
 import (
 	"encoding/json"
 	"fmt"
+	"net/netip"
+	"slices"
 	"sort"
+	"strings"
 	stdsync "sync"
+	"time"
 
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/router"
 	"github.com/skeeeon/pb-nebula/internal/cert"
 	"github.com/skeeeon/pb-nebula/internal/config"
 	"github.com/skeeeon/pb-nebula/internal/ipam"
@@ -34,6 +39,27 @@ import (
 // triggered once would trigger again on the re-entry, looping forever. All
 // internal writes therefore go through saveInternal, which marks the record
 // ID in internalSaves; the update hook skips events for marked records.
+//
+// SERIALIZATION (generation mutex) — SECOND LOAD-BEARING INVARIANT:
+// internalSaves is a set keyed by record ID and cleared by an unconditional
+// defer, which is only safe while pb-nebula's own writes never overlap. The
+// renewal cron broke that assumption: it writes host records on a schedule,
+// concurrently with whatever an operator is doing. Three races follow — a
+// dropped regeneration (the operator's hook sees the cron's mark and skips a
+// real edit), a lost mark (the first defer clears while a second save for the
+// same ID is still inside Save), and a lost update (the cron writes a record it
+// loaded before the operator's edit).
+//
+// The generation mutex closes all three by serializing every generate-and-save
+// sequence. This control plane does a handful of writes a minute, so the cost
+// is nothing.
+//
+// The invariant: acquire it ONLY at top-level entry points (cron tick, the
+// host/network/CA hooks), ALWAYS after the isInternalSave check, and NEVER
+// inside saveInternal or anything it re-enters. Go mutexes are not reentrant,
+// so a nested hook that reached Lock() would deadlock against its own caller.
+// The isInternalSave guard is what stops that: a re-fired hook returns before
+// it gets there.
 type Manager struct {
 	app           *pocketbase.PocketBase // PocketBase application instance
 	certManager   *cert.Manager          // Certificate generation service
@@ -42,6 +68,7 @@ type Manager struct {
 	options       types.Options          // Configuration options
 	logger        *utils.Logger          // Logger for consistent output
 	internalSaves stdsync.Map            // record IDs currently being saved by pb-nebula itself
+	generation    stdsync.Mutex          // serializes generate-and-save sequences; see above
 }
 
 // saveInternal saves a record while marking it as a pb-nebula-initiated write,
@@ -110,8 +137,73 @@ func (sm *Manager) SetupHooks() error {
 // setupCAHooks registers hooks for CA lifecycle.
 //
 // CA EVENT HANDLING:
+// - Validation: reject illegal rotation verbs and hand-edits of managed fields
 // - Creation: Generate CA certificate and keys automatically after record is saved
+// - Rotation: perform the requested rotation step and reset the action field
 func (sm *Manager) setupCAHooks() {
+	// Rotation validation. This belongs in the REQUEST hooks because
+	// OnRecordAfterUpdateSuccess runs after the write has committed and so
+	// cannot refuse anything -- the same split validateHostRecord uses.
+	sm.app.OnRecordCreateRequest().BindFunc(func(e *core.RecordRequestEvent) error {
+		if e.Collection.Name != sm.options.CACollectionName {
+			return e.Next()
+		}
+		if err := sm.validateCARotation(e.Record, nil); err != nil {
+			return err
+		}
+		return e.Next()
+	})
+
+	sm.app.OnRecordUpdateRequest().BindFunc(func(e *core.RecordRequestEvent) error {
+		if e.Collection.Name != sm.options.CACollectionName {
+			return e.Next()
+		}
+		if err := sm.validateCARotation(e.Record, e.Record.Original()); err != nil {
+			return err
+		}
+		return e.Next()
+	})
+
+	// Rotation execution
+	sm.app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error {
+		if e.Record.Collection().Name != sm.options.CACollectionName {
+			return e.Next()
+		}
+
+		// CRITICAL, and not optional: the CA CREATE hook below calls
+		// saveInternal on an already-persisted record, which fires an update
+		// event. Without this guard, creating a CA would enter the rotation
+		// path. It is also what keeps the generation mutex from deadlocking
+		// against itself, since a re-fired hook returns before reaching Lock.
+		if sm.isInternalSave(e.Record) {
+			return e.Next()
+		}
+
+		if !sm.shouldHandleEvent(sm.options.CACollectionName, types.EventTypeCARotate) {
+			return e.Next()
+		}
+
+		// Key on the TRANSITION, not the value. This hook runs after the
+		// commit, so a crash between the two leaves `rotate` durably set --
+		// and without this check the next unrelated CA edit would fire a
+		// rotation nobody asked for. Same reason the network CIDR check
+		// compares against Original().
+		orig := e.Record.Original()
+		verb := e.Record.GetString("rotate")
+		if verb == "" || (orig != nil && orig.GetString("rotate") == verb) {
+			return e.Next()
+		}
+
+		sm.generation.Lock()
+		defer sm.generation.Unlock()
+
+		if err := sm.rotateCA(e.Record, verb); err != nil {
+			sm.logger.Error("CA rotation (%s) failed for %s: %v", verb, e.Record.GetString("name"), err)
+		}
+
+		return e.Next()
+	})
+
 	// CA creation - generate certificate automatically
 	sm.app.OnRecordAfterCreateSuccess().BindFunc(func(e *core.RecordEvent) error {
 		if e.Record.Collection().Name != sm.options.CACollectionName {
@@ -154,7 +246,7 @@ func (sm *Manager) setupNetworkHooks() {
 		}
 
 		if err := sm.validateNetworkRecord(e.Record); err != nil {
-			return err
+			return badRequest(err)
 		}
 
 		return e.Next()
@@ -166,7 +258,7 @@ func (sm *Manager) setupNetworkHooks() {
 		}
 
 		if err := sm.validateNetworkRecord(e.Record); err != nil {
-			return err
+			return badRequest(err)
 		}
 
 		return e.Next()
@@ -188,11 +280,91 @@ func (sm *Manager) setupNetworkHooks() {
 			return e.Next()
 		}
 
+		sm.generation.Lock()
+		defer sm.generation.Unlock()
+
 		sm.logger.Info("Network CIDR changed for %s, regenerating host configs...", e.Record.GetString("name"))
 		sm.regenerateNetworkHostConfigs(e.Record.Id, "")
 
+		// A new CIDR changes the mask every host certificate should carry, and
+		// regenerating configs re-signs nothing. Say so rather than leaving the
+		// fleet quietly unable to route.
+		sm.AuditHostCertNetworkMasks(e.Record.Id)
+
 		return e.Next()
 	})
+}
+
+// certFields are the host fields signed INTO the certificate. Changing one is
+// completely inert until a new certificate is issued, so they cost a re-sign.
+//
+// unsafe_networks is the one that surprises people: Nebula authorizes routing
+// on the certificate, not on config, so a gateway whose cert omits a prefix
+// silently refuses to route it and drops the packet before any firewall rule
+// runs.
+var certFields = []string{
+	"hostname",
+	"overlay_ip",
+	"groups",
+	"unsafe_networks",
+}
+
+// configFields are the host fields that appear only in config_yaml, and can be
+// re-rendered without touching the certificate.
+//
+// EVERY FAN-OUT FIELD NEEDS AN ENTRY HERE TOO. regenerateNetworkHostConfigs
+// deliberately excludes the record that changed, so a field listed only in the
+// fan-out rules updates every host in the network EXCEPT the one that was
+// edited. That shipped once for is_relay: clearing the flag left am_relay: true
+// in the host's own config, so it kept relaying for peers that had already
+// dropped it.
+var configFields = []string{
+	"is_lighthouse",
+	"is_relay",
+	"public_host_port",
+	"firewall_outbound",
+	"firewall_inbound",
+	"mtu",
+	"tun_device",
+	// The consumer half of gateway routing. No peer embeds another host's
+	// routes, so this one has no fan-out entry.
+	"unsafe_routes",
+	// Underlay preference: local to this host, so no fan-out either.
+	"preferred_ranges",
+}
+
+// changedFields returns the names of the fields that differ between the stored
+// record and the incoming one.
+//
+// WHY A TABLE AND NOT FIFTEEN HAND-WRITTEN COMPARISONS:
+// The tiers are the thing a new field has to be slotted into, and the failure
+// mode of getting it wrong is silence -- a field that never triggers
+// regeneration, or triggers an expensive re-sign it does not need. Two lists
+// make "add a field, pick a tier" a single edit that cannot be half-done, and
+// make the tiers readable as data instead of reconstructed from a wall of ifs.
+//
+// Comparison goes through GetString for every field regardless of its declared
+// type. PocketBase renders a bool as "true"/"false" and an int as its decimal
+// form, which is uniform and exact enough for "did this change" -- and it is
+// what the string-typed fields were already compared with.
+//
+// PARAMETERS:
+//   - orig: the stored record (never nil; callers check)
+//   - record: the incoming record
+//   - fields: the tier to check
+//
+// RETURNS:
+// - the names that differ, in table order, or nil
+//
+// SIDE EFFECTS: None (pure).
+func changedFields(orig, record *core.Record, fields []string) []string {
+	var changed []string
+	for _, field := range fields {
+		if orig.GetString(field) != record.GetString(field) {
+			changed = append(changed, field)
+		}
+	}
+	return changed
 }
 
 // setupHostHooks registers hooks for host lifecycle, validation, and certificate/config generation.
@@ -244,7 +416,7 @@ func (sm *Manager) setupHostHooks() {
 		}
 
 		if err := sm.validateHostRecord(e.Record); err != nil {
-			return err
+			return badRequest(err)
 		}
 
 		return e.Next()
@@ -256,7 +428,7 @@ func (sm *Manager) setupHostHooks() {
 		}
 
 		if err := sm.validateHostRecord(e.Record); err != nil {
-			return err
+			return badRequest(err)
 		}
 
 		return e.Next()
@@ -273,6 +445,9 @@ func (sm *Manager) setupHostHooks() {
 			return e.Next()
 		}
 
+		sm.generation.Lock()
+		defer sm.generation.Unlock()
+
 		sm.logger.Cert("Generating certificate and config for host %s...", e.Record.GetString("hostname"))
 
 		// Generate host certificate and config
@@ -287,9 +462,11 @@ func (sm *Manager) setupHostHooks() {
 
 		sm.logger.Success("Generated certificate and config for host %s", e.Record.GetString("hostname"))
 
-		// New active lighthouse - peers need it in their static_host_map
-		if e.Record.GetBool("is_lighthouse") && e.Record.GetBool("active") {
-			sm.logger.Config("New lighthouse %s, regenerating peer configs...", e.Record.GetString("hostname"))
+		// A new active lighthouse or relay changes what every peer renders:
+		// lighthouses land in static_host_map and the lighthouse section,
+		// relays in the relay section
+		if (e.Record.GetBool("is_lighthouse") || e.Record.GetBool("is_relay")) && e.Record.GetBool("active") {
+			sm.logger.Config("New lighthouse/relay %s, regenerating peer configs...", e.Record.GetString("hostname"))
 			sm.regenerateNetworkHostConfigs(e.Record.GetString("network_id"), e.Record.Id)
 		}
 
@@ -308,6 +485,12 @@ func (sm *Manager) setupHostHooks() {
 		if sm.isInternalSave(e.Record) {
 			return e.Next()
 		}
+
+		// Serialize against the renewal cron. MUST come after isInternalSave:
+		// a re-fired hook returns above and so never reaches this Lock, which
+		// is what keeps a non-reentrant mutex from deadlocking on itself.
+		sm.generation.Lock()
+		defer sm.generation.Unlock()
 
 		orig := e.Record.Original()
 
@@ -328,43 +511,51 @@ func (sm *Manager) setupHostHooks() {
 		needsCertRegeneration := false
 		needsConfigRegeneration := false
 		needsPeerFanOut := false
+		needsCAFanOut := false
+		needsRenewReset := false
 
 		if orig != nil {
-			// Check if CERTIFICATE regeneration is needed (expensive - new cert).
-			// These fields are embedded in the certificate itself.
-			if orig.GetString("hostname") != e.Record.GetString("hostname") {
-				sm.logger.Info("Hostname changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
+			// CERTIFICATE tier (expensive): these are signed into the cert, so
+			// nothing cheaper than a re-issue makes an edit take effect.
+			if changed := changedFields(orig, e.Record, certFields); len(changed) > 0 {
+				sm.logger.Info("Certificate field(s) %s changed for host %s, regenerating certificate",
+					strings.Join(changed, ", "), e.Record.GetString("hostname"))
 				needsCertRegeneration = true
 			}
-			if orig.GetString("overlay_ip") != e.Record.GetString("overlay_ip") {
-				sm.logger.Info("Overlay IP changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
-				needsCertRegeneration = true
-			}
-			if orig.GetString("groups") != e.Record.GetString("groups") {
-				sm.logger.Info("Groups changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
-				needsCertRegeneration = true
-			}
+
+			// validity_years is not in the table because it is not a plain
+			// diff: clearing it to 0 means "use the configured default", which
+			// is a request to keep the current lifetime, not to re-issue with
+			// a zero-year certificate.
 			if orig.GetInt("validity_years") != e.Record.GetInt("validity_years") && e.Record.GetInt("validity_years") > 0 {
 				sm.logger.Info("Validity years changed for host %s, regenerating certificate", e.Record.GetString("hostname"))
 				needsCertRegeneration = true
 			}
 
-			// Check if only CONFIG regeneration is needed (cheap - just YAML)
+			// Action field: force an immediate re-issue regardless of how much
+			// lifetime is left. Keyed on the false -> true transition, and
+			// reset below so the flag never stays set. This is the manual lever
+			// the platform and the Admin UI both use, and it needs no new Go
+			// API or HTTP route to expose.
+			if !orig.GetBool("renew") && e.Record.GetBool("renew") &&
+				sm.shouldHandleEvent(sm.options.HostCollectionName, types.EventTypeHostRenew) {
+				sm.logger.Cert("Renewal requested for host %s, regenerating certificate", e.Record.GetString("hostname"))
+				needsCertRegeneration = true
+			}
+			// Reset unconditionally: a renew that was skipped by the event
+			// filter should not stay pending forever either.
+			if e.Record.GetBool("renew") {
+				e.Record.Set("renew", false)
+				needsRenewReset = true
+			}
+
+			// CONFIG tier (cheap): rendered into config_yaml and nowhere else.
+			// Skipped when a certificate is already being re-issued, since that
+			// regenerates the config anyway.
 			if !needsCertRegeneration {
-				if orig.GetBool("is_lighthouse") != e.Record.GetBool("is_lighthouse") {
-					sm.logger.Info("Lighthouse status changed for host %s, regenerating config", e.Record.GetString("hostname"))
-					needsConfigRegeneration = true
-				}
-				if orig.GetString("public_host_port") != e.Record.GetString("public_host_port") {
-					sm.logger.Info("Public host/port changed for host %s, regenerating config", e.Record.GetString("hostname"))
-					needsConfigRegeneration = true
-				}
-				if orig.GetString("firewall_outbound") != e.Record.GetString("firewall_outbound") {
-					sm.logger.Info("Firewall outbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
-					needsConfigRegeneration = true
-				}
-				if orig.GetString("firewall_inbound") != e.Record.GetString("firewall_inbound") {
-					sm.logger.Info("Firewall inbound rules changed for host %s, regenerating config", e.Record.GetString("hostname"))
+				if changed := changedFields(orig, e.Record, configFields); len(changed) > 0 {
+					sm.logger.Info("Config field(s) %s changed for host %s, regenerating config",
+						strings.Join(changed, ", "), e.Record.GetString("hostname"))
 					needsConfigRegeneration = true
 				}
 			}
@@ -377,10 +568,29 @@ func (sm *Manager) setupHostHooks() {
 			// otherwise did nothing: the certificate stayed trusted until expiry.
 			// The host's own config is regenerated too, because the fan-out
 			// deliberately excludes the record that changed.
+			// The blocklist is scoped to the CA, because that is where Nebula's
+			// trust boundary is -- so an active flip makes every config under
+			// the CA stale, not just this network's. needsPeerFanOut stays set
+			// so the guards below read the same; needsCAFanOut only widens
+			// which hosts the fan-out reaches.
 			if orig.GetBool("active") != e.Record.GetBool("active") {
-				sm.logger.Info("Active flag changed for host %s, refreshing revocation blocklist across the network", e.Record.GetString("hostname"))
+				sm.logger.Info("Active flag changed for host %s, refreshing revocation blocklist across the CA", e.Record.GetString("hostname"))
 				needsConfigRegeneration = true
 				needsPeerFanOut = true
+				needsCAFanOut = true
+			}
+
+			// Reactivation needs a NEW certificate, not just a config refresh.
+			// A deactivated host is skipped by the CA rotation re-sign sweep on
+			// purpose (re-signing it would change the fingerprint its peers
+			// blocklist), so a host parked across a rotation comes back holding
+			// a certificate signed by a CA that may since have been retired --
+			// off the blocklist, looking healthy in the Admin UI, and able to
+			// handshake with nobody. Its certificate may also simply have
+			// expired while it was parked. Either way, re-issue.
+			if !orig.GetBool("active") && e.Record.GetBool("active") {
+				sm.logger.Info("Host %s reactivated, regenerating certificate", e.Record.GetString("hostname"))
+				needsCertRegeneration = true
 			}
 
 			// Check if peer configs are now stale. Peers embed this host's
@@ -394,6 +604,19 @@ func (sm *Manager) setupHostHooks() {
 					needsPeerFanOut = true
 				}
 			}
+
+			// Same shape for relays: peers list this host's overlay_ip in their
+			// relay section, so becoming or ceasing to be a relay -- or moving
+			// -- makes every peer config in the network stale. public_host_port
+			// is absent here on purpose: unlike a lighthouse, a relay's address
+			// is not embedded in peer configs, only its overlay IP is.
+			if orig.GetBool("is_relay") || e.Record.GetBool("is_relay") {
+				if orig.GetBool("is_relay") != e.Record.GetBool("is_relay") ||
+					orig.GetBool("active") != e.Record.GetBool("active") ||
+					orig.GetString("overlay_ip") != e.Record.GetString("overlay_ip") {
+					needsPeerFanOut = true
+				}
+			}
 		} else {
 			// If we don't have original data, regenerate cert to be safe
 			sm.logger.Info("No original data available for host %s, regenerating certificate", e.Record.GetString("hostname"))
@@ -401,6 +624,14 @@ func (sm *Manager) setupHostHooks() {
 		}
 
 		if !needsCertRegeneration && !needsConfigRegeneration && !needsPeerFanOut {
+			// A renew flag that produced no regeneration still has to be cleared,
+			// or it stays set and fires again on the next unrelated edit.
+			if needsRenewReset {
+				if err := sm.saveInternal(e.Record); err != nil {
+					sm.logger.Warning("Failed to reset renew flag for host %s: %v", e.Record.Id, err)
+				}
+				return e.Next()
+			}
 			sm.logger.Info("No meaningful changes detected for host %s, skipping regeneration", e.Record.GetString("hostname"))
 			return e.Next()
 		}
@@ -437,8 +668,11 @@ func (sm *Manager) setupHostHooks() {
 
 		// Fan out to peers AFTER this host's own regeneration so peers see
 		// the host's final state (e.g. updated overlay_ip)
-		if needsPeerFanOut {
-			sm.logger.Config("Lighthouse settings changed for host %s, regenerating peer configs...", e.Record.GetString("hostname"))
+		if needsCAFanOut {
+			sm.logger.Config("Revocation changed for host %s, regenerating every config under its CA...", e.Record.GetString("hostname"))
+			sm.regenerateCAHostConfigs(e.Record.GetString("network_id"), e.Record.Id)
+		} else if needsPeerFanOut {
+			sm.logger.Config("Peer-visible settings changed for host %s, regenerating peer configs...", e.Record.GetString("hostname"))
 			sm.regenerateNetworkHostConfigs(e.Record.GetString("network_id"), e.Record.Id)
 		}
 
@@ -456,13 +690,46 @@ func (sm *Manager) setupHostHooks() {
 			return e.Next()
 		}
 
-		if e.Record.GetBool("is_lighthouse") && e.Record.GetBool("active") {
-			sm.logger.Config("Lighthouse %s deleted, regenerating peer configs...", e.Record.GetString("hostname"))
+		sm.generation.Lock()
+		defer sm.generation.Unlock()
+
+		if (e.Record.GetBool("is_lighthouse") || e.Record.GetBool("is_relay")) && e.Record.GetBool("active") {
+			sm.logger.Config("Lighthouse/relay %s deleted, regenerating peer configs...", e.Record.GetString("hostname"))
 			sm.regenerateNetworkHostConfigs(e.Record.GetString("network_id"), e.Record.Id)
 		}
 
 		return e.Next()
 	})
+}
+
+// badRequest turns a validation error into a 400 whose message survives the
+// trip to the client.
+//
+// PocketBase flattens a plain error returned from a request hook into a generic
+// "Something went wrong while processing your request." -- which throws away
+// the entire point of writing a message. It is worth the wrapper here for the
+// same reason the CA rotation guards already do it: these errors are the only
+// explanation an operator gets for a refused save, and they are written to be
+// actionable ("172.16.0.5/24 has host bits set, did you mean 172.16.0.0/24?").
+//
+// The sentinel is deliberately not preserved through the wrapper. ApiError does
+// not wrap, so errors.Is cannot match past this point -- but nothing on the
+// far side of a request hook is Go code doing errors.Is. The sentinels stay
+// intact inside validateHostRecord and validateNetworkRecord, which is where
+// anything in-process reads them.
+//
+// PARAMETERS:
+//   - err: the validation failure
+//
+// RETURNS:
+// - an *router.ApiError carrying err's message, or nil if err is nil
+//
+// SIDE EFFECTS: None.
+func badRequest(err error) error {
+	if err == nil {
+		return nil
+	}
+	return router.NewBadRequestError(err.Error(), nil)
 }
 
 // validateNetworkRecord validates a network record before create/update.
@@ -488,6 +755,14 @@ func (sm *Manager) validateHostRecord(record *core.Record) error {
 		return types.ErrLighthouseNoPublicIP
 	}
 
+	// A relay needs a stable listening port for the same practical reason a
+	// lighthouse does. Rejecting here rather than accepting and rendering
+	// listen.port 0 keeps this from failing silently: the relay would be
+	// advertised to every peer and then be unreachable at the port they try.
+	if record.GetBool("is_relay") && record.GetString("public_host_port") == "" {
+		return types.ErrRelayNoPublicIP
+	}
+
 	// Validate groups is valid JSON array
 	groupsJSON := record.GetString("groups")
 	if groupsJSON != "" && groupsJSON != "null" {
@@ -497,7 +772,99 @@ func (sm *Manager) validateHostRecord(record *core.Record) error {
 		}
 	}
 
+	// Gateway routing. The two halves are validated independently because they
+	// live on different hosts: unsafe_networks is what THIS host may route for
+	// (and is signed into its certificate), unsafe_routes is what it sends to
+	// other hosts.
+	hostModel := &types.HostRecord{
+		UnsafeNetworks: record.GetString("unsafe_networks"),
+		UnsafeRoutes:   record.GetString("unsafe_routes"),
+	}
+
+	unsafeNetworks, err := hostModel.GetUnsafeNetworks()
+	if err != nil {
+		return fmt.Errorf("%w: unsafe_networks must be a JSON array of CIDR strings: %v",
+			types.ErrInvalidUnsafeNetwork, err)
+	}
+	if err := sm.ipamManager.ValidateUnsafeNetworks(unsafeNetworks, record.GetString("network_id")); err != nil {
+		return err
+	}
+
+	unsafeRoutes, err := hostModel.GetUnsafeRoutes()
+	if err != nil {
+		return fmt.Errorf("%w: unsafe_routes must be a JSON array of {route, via} objects: %v",
+			types.ErrInvalidUnsafeRoute, err)
+	}
+	if err := sm.ipamManager.ValidateUnsafeRoutes(unsafeRoutes, record.GetString("network_id")); err != nil {
+		return err
+	}
+
+	// Underlay preference. Purely local to this host -- no peer, network or
+	// certificate is involved -- so it is validated on its own.
+	hostModel.PreferredRanges = record.GetString("preferred_ranges")
+	preferredRanges, err := hostModel.GetPreferredRanges()
+	if err != nil {
+		return fmt.Errorf("%w: preferred_ranges must be a JSON array of CIDR strings: %v",
+			types.ErrInvalidPreferredRange, err)
+	}
+	if err := ipam.ValidatePreferredRanges(preferredRanges); err != nil {
+		return err
+	}
+
+	// Advisory only: the gateway's certificate may legitimately be updated after
+	// the route is added, so this never blocks the write
+	sm.warnOnUnroutableUnsafeRoutes(record, unsafeRoutes)
+
 	return nil
+}
+
+// regenerateCAHostConfigs regenerates every host config under the CA that owns
+// the given network, excluding one record.
+//
+// This is the reach a revocation needs. pki.blocklist is built per CA, because
+// a CA is Nebula's trust boundary and a certificate it signed verifies for
+// every host carrying it in pki.ca -- across every pb-nebula network under that
+// CA. A fan-out that stopped at the network would leave sibling networks still
+// able to verify the host that was just revoked.
+//
+// Lighthouse and relay changes deliberately do NOT use this: those really are
+// per-network, since no host renders another network's lighthouses.
+//
+// If the CA cannot be resolved the fan-out falls back to the single network.
+// That is strictly less than intended, but it is what the code did before the
+// blocklist was widened, and a partial regeneration beats none.
+//
+// PARAMETERS:
+//   - networkID: any network under the CA to reach
+//   - excludeHostID: the record that triggered this and handles its own config
+//
+// SIDE EFFECTS: Writes config_yaml on host records.
+func (sm *Manager) regenerateCAHostConfigs(networkID, excludeHostID string) {
+	network, err := sm.app.FindRecordById(sm.options.NetworkCollectionName, networkID)
+	if err != nil {
+		sm.logger.Warning("Cannot widen regeneration to the CA for network %s, falling back to that network alone: %v",
+			networkID, err)
+		sm.regenerateNetworkHostConfigs(networkID, excludeHostID)
+		return
+	}
+
+	caID := network.GetString("ca_id")
+	if caID == "" {
+		sm.regenerateNetworkHostConfigs(networkID, excludeHostID)
+		return
+	}
+
+	networks, err := sm.app.FindAllRecords(sm.options.NetworkCollectionName, dbx.HashExp{"ca_id": caID})
+	if err != nil {
+		sm.logger.Warning("Cannot list networks for CA %s, falling back to network %s alone: %v",
+			caID, networkID, err)
+		sm.regenerateNetworkHostConfigs(networkID, excludeHostID)
+		return
+	}
+
+	for _, n := range networks {
+		sm.regenerateNetworkHostConfigs(n.Id, excludeHostID)
+	}
 }
 
 // regenerateNetworkHostConfigs regenerates and saves config_yaml for every host
@@ -514,6 +881,16 @@ func (sm *Manager) regenerateNetworkHostConfigs(networkID, excludeHostID string)
 		return
 	}
 
+	// Loaded once for the whole fan-out: nothing in the loop below changes the
+	// lighthouses, relays, blocklist or trust bundle, and rebuilding them per
+	// host made a single deactivation in a large network re-parse every
+	// inactive certificate once per peer.
+	ctx, err := sm.loadNetworkConfigContext(networkID)
+	if err != nil {
+		sm.logger.Warning("Failed to load network %s for regeneration: %v", networkID, err)
+		return
+	}
+
 	regenerated := 0
 	total := 0
 	for _, host := range hosts {
@@ -521,7 +898,7 @@ func (sm *Manager) regenerateNetworkHostConfigs(networkID, excludeHostID string)
 			continue
 		}
 		total++
-		if err := sm.generateHostConfig(host); err != nil {
+		if err := sm.generateHostConfigWith(host, ctx); err != nil {
 			sm.logger.Warning("Failed to regenerate config for host %s: %v", host.Id, err)
 			continue
 		}
@@ -603,12 +980,25 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 		validityYears = sm.options.DefaultHostValidityYears
 	}
 
+	// Prefixes this host may route for. These are signed INTO the certificate:
+	// Nebula authorizes routing on the cert, so a gateway whose cert omits a
+	// prefix silently refuses to route it.
+	unsafeNetworks, err := sm.parseUnsafeNetworks(record)
+	if err != nil {
+		return err
+	}
+
 	// Generate host certificate (expiry is clamped to the CA cert's NotAfter)
 	certResult, err := sm.certManager.GenerateHostCert(cert.HostCertParams{
-		Hostname:        record.GetString("hostname"),
-		OverlayIP:       record.GetString("overlay_ip"),
-		Groups:          groups,
-		ValidityYears:   validityYears,
+		Hostname:      record.GetString("hostname"),
+		OverlayIP:     record.GetString("overlay_ip"),
+		Groups:        groups,
+		ValidityYears: validityYears,
+		// The mask Nebula builds the host's overlay route from. Sourced from
+		// the network record on every signing rather than stored on the host,
+		// so a corrected CIDR reaches a host the next time it is re-signed.
+		NetworkCIDR:     network.GetString("cidr_range"),
+		UnsafeNetworks:  unsafeNetworks,
 		CACertPEM:       ca.GetString("certificate"),
 		CAPrivateKeyPEM: caPrivateKeyPEM,
 	})
@@ -642,22 +1032,83 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 
 // generateHostConfig generates Nebula config for a host and updates the record.
 func (sm *Manager) generateHostConfig(record *core.Record) error {
-	// Get network
-	network, err := sm.app.FindRecordById(sm.options.NetworkCollectionName, record.GetString("network_id"))
+	ctx, err := sm.loadNetworkConfigContext(record.GetString("network_id"))
 	if err != nil {
-		return fmt.Errorf("%w: %v", types.ErrNetworkNotFound, err)
+		return err
+	}
+	return sm.generateHostConfigWith(record, ctx)
+}
+
+// networkConfigContext is the part of a host's config that is not about the
+// host at all: the trust bundle, the lighthouses, the relays and the revocation
+// list, every one of which is identical for every member of the network.
+//
+// WHY IT IS A TYPE AND NOT FIVE LOOKUPS PER HOST:
+// A fan-out regenerates every host in a network, and each one used to re-run
+// the same two record lookups and three queries -- and getBlocklist parses the
+// certificate of every inactive host, every time. Deactivating one host in a
+// 200-host network meant 200 identical blocklist builds. Nothing inside the
+// loop can change any of it: the loop writes config_yaml and nothing else.
+//
+// Loading it once also turns a missing network from N identical failures into
+// one, which is both cheaper and easier to read in a log.
+type networkConfigContext struct {
+	network     *core.Record
+	caBundle    string
+	lighthouses []types.LighthouseInfo
+	relays      []string
+	blocklist   []string
+}
+
+// loadNetworkConfigContext gathers everything a network's hosts render in
+// common.
+//
+// PARAMETERS:
+//   - networkID: the network to load
+//
+// RETURNS:
+//   - the context, or an error wrapping ErrNetworkNotFound if the network or its
+//     peers cannot be read
+//
+// SIDE EFFECTS: Logging only (reads).
+func (sm *Manager) loadNetworkConfigContext(networkID string) (*networkConfigContext, error) {
+	network, err := sm.app.FindRecordById(sm.options.NetworkCollectionName, networkID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", types.ErrNetworkNotFound, err)
 	}
 
-	// Query lighthouses in this network
-	lighthouses, err := sm.getLighthouses(network.Id)
-	if err != nil {
-		return fmt.Errorf("failed to get lighthouses: %w", err)
+	ctx := &networkConfigContext{network: network}
+
+	// Trust bundle for pki.ca, read from the CA record on every generation.
+	// That is what makes rotation self-healing: any regeneration, for any
+	// reason, hands out the CURRENT bundle, so finishing a rotation or
+	// recovering a partial one needs no re-signing. A lookup failure is not
+	// fatal -- fall back to the denormalized single certificate, matching the
+	// never-fatal discipline getBlocklist already follows.
+	if ca, err := sm.app.FindRecordById(sm.options.CACollectionName, network.GetString("ca_id")); err == nil {
+		ctx.caBundle = caBundle(ca)
+	} else {
+		sm.logger.Warning("Cannot load CA for network %s, falling back to the host's stored CA certificate: %v",
+			network.Id, err)
 	}
 
-	// Certificate fingerprints this network refuses. Nebula has no CRL, so a
+	// Lighthouses peers discover each other through
+	ctx.lighthouses, err = sm.getLighthouses(network.Id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get lighthouses: %w", err)
+	}
+
+	// Relays a host can route through when it cannot hole-punch to a peer
+	ctx.relays, err = sm.getRelays(network.Id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get relays: %w", err)
+	}
+
+	// Certificate fingerprints this CA's hosts refuse. Nebula has no CRL, so a
 	// deactivated host is only actually off the mesh once every peer config
-	// carries its fingerprint -- see getBlocklist.
-	blocklist, err := sm.getBlocklist(network.Id)
+	// carries its fingerprint -- and "every peer" means every host under the
+	// CA, not just this network. See getBlocklist.
+	ctx.blocklist, err = sm.getBlocklist(network.GetString("ca_id"))
 	if err != nil {
 		// Never fatal: a config without a blocklist is the config this library
 		// generated for years, and failing here would stop a host getting ANY
@@ -665,11 +1116,19 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 		sm.logger.Warning("Failed to build revocation blocklist for network %s: %v", network.Id, err)
 	}
 
-	// Convert records to models
-	hostModel := sm.recordToHostModel(record)
+	return ctx, nil
+}
 
-	// Generate config (now uses host-level firewall rules)
-	configYAML, err := sm.configGen.GenerateHostConfig(hostModel, lighthouses, blocklist)
+// generateHostConfigWith renders one host's config against an already-loaded
+// network context, and updates the record.
+func (sm *Manager) generateHostConfigWith(record *core.Record, ctx *networkConfigContext) error {
+	configYAML, err := sm.configGen.GenerateHostConfig(config.HostConfigInput{
+		Host:        sm.recordToHostModel(record),
+		Lighthouses: ctx.lighthouses,
+		Relays:      ctx.relays,
+		Blocklist:   ctx.blocklist,
+		CABundle:    ctx.caBundle,
+	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", types.ErrConfigGeneration, err)
 	}
@@ -678,8 +1137,8 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 	return nil
 }
 
-// getBlocklist returns the certificate fingerprints of every DEACTIVATED
-// host in a network, sorted.
+// getBlocklist returns the certificate fingerprints of every DEACTIVATED host
+// under a CA, sorted.
 //
 // This is the revocation list. Nebula has no CRL and no OCSP: the only way to
 // refuse a certificate it has already signed is pki.blocklist, a list of
@@ -688,8 +1147,19 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 // its peers lighthouse lists and nothing else -- its certificate stayed valid
 // until it expired, so a decommissioned device kept its place on the mesh.
 //
-// Sorted so an unchanged network renders a byte-identical config. Without
-// that, map iteration order would make every regeneration look like a change.
+// SCOPED TO THE CA, NOT THE NETWORK, BECAUSE TRUST IS:
+// nebula_networks is a pb-nebula construct -- an IPAM scope, a uniqueness
+// scope, and the peer group whose lighthouses and relays each host renders.
+// Nebula has no such object. Its trust boundary is the CA: every host under one
+// CA carries that CA in pki.ca and will verify anything it signed.
+//
+// So a blocklist scoped to the network revoked a host from its own peers and
+// left it verifiable by every sibling network under the same CA -- which this
+// library explicitly supports, one CA serving many networks. Deactivation has
+// to reach as far as the signature does, or it is not revocation.
+//
+// Sorted so an unchanged CA renders a byte-identical config. Without that, map
+// iteration order would make every regeneration look like a change.
 //
 // A host with no certificate yet (mid-creation) is skipped rather than treated
 // as an error: there is nothing to revoke.
@@ -698,23 +1168,60 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 // certificate with it, and a fingerprint absent from the database cannot be
 // blocklisted. To take a device off the mesh, DEACTIVATE it; deleting is for
 // hosts whose certificate you are content to leave valid until it expires.
-func (sm *Manager) getBlocklist(networkID string) ([]string, error) {
+//
+// PARAMETERS:
+//   - caID: the CA whose revoked hosts to collect
+//
+// RETURNS:
+// - sorted fingerprints, empty when nothing is revoked
+// - error if the networks or hosts cannot be listed
+func (sm *Manager) getBlocklist(caID string) ([]string, error) {
+	if caID == "" {
+		// A network with no CA cannot have signed anything, so there is
+		// nothing to revoke. Not an error: generateHostConfig already tolerates
+		// a missing CA by falling back to the stored certificate.
+		return nil, nil
+	}
+
+	networks, err := sm.app.FindAllRecords(sm.options.NetworkCollectionName,
+		dbx.HashExp{"ca_id": caID})
+	if err != nil {
+		return nil, err
+	}
+	if len(networks) == 0 {
+		return nil, nil
+	}
+
+	networkIDs := make([]any, len(networks))
+	for i, network := range networks {
+		networkIDs[i] = network.Id
+	}
+
 	records, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
-		dbx.HashExp{"network_id": networkID, "active": false})
+		dbx.In("network_id", networkIDs...), dbx.HashExp{"active": false})
 	if err != nil {
 		return nil, err
 	}
 
+	now := time.Now()
 	fingerprints := make([]string, 0, len(records))
 	for _, record := range records {
 		certPEM := record.GetString("certificate")
 		if certPEM == "" {
 			continue // never issued one; nothing to revoke
 		}
+		// Drop expired certificates. Nebula refuses an expired certificate on
+		// its own, so blocklisting one buys nothing -- and without this the
+		// list only ever grows, in a config_yaml field capped at 50000 bytes.
+		// Read the validity from the certificate, not from expires_at, for the
+		// same reason the expiry clamp does.
+		if _, notAfter, err := cert.ValidityFromPEM(certPEM); err == nil && !now.Before(notAfter) {
+			continue
+		}
 		fp, err := cert.FingerprintFromPEM(certPEM)
 		if err != nil {
-			// One unparseable certificate must not cost the network its whole
-			// blocklist, so log it and keep the rest.
+			// One unparseable certificate must not cost the CA's hosts their
+			// whole blocklist, so log it and keep the rest.
 			sm.logger.Warning("Cannot fingerprint certificate for host %s, omitting from blocklist: %v", record.Id, err)
 			continue
 		}
@@ -744,6 +1251,115 @@ func (sm *Manager) getLighthouses(networkID string) ([]types.LighthouseInfo, err
 	return lighthouses, nil
 }
 
+// parseUnsafeNetworks reads a host record's unsafe_networks into the prefix type
+// the cert package signs. Validation has already run in the request hook, so a
+// failure here means the stored JSON is malformed rather than the input was.
+//
+// PARAMETERS:
+//   - record: Host record
+//
+// RETURNS:
+// - []netip.Prefix: Prefixes to embed in the certificate, nil if none
+// - error wrapping ErrInvalidUnsafeNetwork if the stored value cannot be parsed
+func (sm *Manager) parseUnsafeNetworks(record *core.Record) ([]netip.Prefix, error) {
+	raw := record.GetString("unsafe_networks")
+	if raw == "" || raw == "null" {
+		return nil, nil
+	}
+
+	var cidrs []string
+	if err := json.Unmarshal([]byte(raw), &cidrs); err != nil {
+		return nil, fmt.Errorf("%w: %v", types.ErrInvalidUnsafeNetwork, err)
+	}
+
+	prefixes := make([]netip.Prefix, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s: %v", types.ErrInvalidUnsafeNetwork, cidr, err)
+		}
+		prefixes = append(prefixes, prefix)
+	}
+
+	return prefixes, nil
+}
+
+// warnOnUnroutableUnsafeRoutes logs a warning for each route whose gateway does
+// not declare the prefix in its own unsafe_networks.
+//
+// WHY THIS WARNS RATHER THAN REJECTS:
+// The two halves of gateway routing live on different hosts and are configured
+// independently, so a route can legitimately be added before the gateway's
+// certificate is updated. Rejecting would force a specific ordering; staying
+// silent would leave the operator with the failure this whole function exists to
+// surface -- Nebula drops the packet with no log line, which reads like a peer
+// or LAN outage rather than a configuration error.
+//
+// Failures to look up a peer are themselves only logged: this is advisory.
+//
+// SIDE EFFECTS: Logging only.
+func (sm *Manager) warnOnUnroutableUnsafeRoutes(record *core.Record, routes []types.UnsafeRoute) {
+	if len(routes) == 0 {
+		return
+	}
+
+	for _, route := range routes {
+		peers, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
+			dbx.HashExp{"network_id": record.GetString("network_id"), "overlay_ip": route.Via})
+		if err != nil || len(peers) == 0 {
+			sm.logger.Warning("Host %s routes %s via %s, but no host in this network has that overlay IP",
+				record.GetString("hostname"), route.Route, route.Via)
+			continue
+		}
+
+		gateway := peers[0]
+		declared, err := (&types.HostRecord{UnsafeNetworks: gateway.GetString("unsafe_networks")}).GetUnsafeNetworks()
+		if err != nil {
+			continue
+		}
+
+		if !slices.Contains(declared, route.Route) {
+			sm.logger.Warning("Host %s routes %s via %s, but %s does not declare %s in unsafe_networks -- "+
+				"Nebula will drop this traffic until it does",
+				record.GetString("hostname"), route.Route, route.Via,
+				gateway.GetString("hostname"), route.Route)
+		}
+	}
+}
+
+// getRelays returns the overlay IPs of every active relay in a network, sorted.
+//
+// Only active relays are advertised: an inactive host's certificate is
+// blocklisted, so naming it as a relay path would hand every peer a route
+// through a host none of them will complete a handshake with.
+//
+// SORTED, FOR THE SAME REASON getBlocklist IS:
+// Query order is not guaranteed, and an unsorted list would reorder itself
+// between regenerations -- making every config look changed and every peer
+// reload for nothing.
+//
+// PARAMETERS:
+//   - networkID: Network to search
+//
+// RETURNS:
+// - []string: Overlay IPs of active relays, sorted
+// - error if the query fails
+func (sm *Manager) getRelays(networkID string) ([]string, error) {
+	records, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
+		dbx.HashExp{"network_id": networkID, "is_relay": true, "active": true})
+	if err != nil {
+		return nil, err
+	}
+
+	relays := make([]string, 0, len(records))
+	for _, record := range records {
+		relays = append(relays, record.GetString("overlay_ip"))
+	}
+	sort.Strings(relays)
+
+	return relays, nil
+}
+
 // shouldHandleEvent determines if an event should be processed based on configured filters.
 func (sm *Manager) shouldHandleEvent(collectionName, eventType string) bool {
 	if sm.options.EventFilter != nil {
@@ -768,12 +1384,18 @@ func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
 		OverlayIP:        record.GetString("overlay_ip"),
 		Groups:           record.GetString("groups"),
 		IsLighthouse:     record.GetBool("is_lighthouse"),
+		IsRelay:          record.GetBool("is_relay"),
 		PublicHostPort:   record.GetString("public_host_port"),
+		MTU:              record.GetInt("mtu"),
+		TunDevice:        record.GetString("tun_device"),
 		Certificate:      record.GetString("certificate"),
 		PrivateKey:       privateKey,
 		CACertificate:    record.GetString("ca_certificate"),
 		ConfigYAML:       record.GetString("config_yaml"),
 		FirewallOutbound: record.GetString("firewall_outbound"),
 		FirewallInbound:  record.GetString("firewall_inbound"),
+		UnsafeNetworks:   record.GetString("unsafe_networks"),
+		UnsafeRoutes:     record.GetString("unsafe_routes"),
+		PreferredRanges:  record.GetString("preferred_ranges"),
 	}
 }

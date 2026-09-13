@@ -46,6 +46,14 @@ pb-nebula transforms PocketBase into a complete Nebula overlay network managemen
 go get github.com/skeeeon/pb-nebula
 ```
 
+### Requirements
+
+**Every host on the mesh must run Nebula v1.10 or newer.** pb-nebula issues
+version 2 certificates, matching the current default of `nebula-cert ca`, and
+[Nebula's own upgrade guide](https://nebula.defined.net/docs/guides/upgrade-to-cert-v2-and-ipv6/)
+is explicit that "older versions cannot validate v2 certificates." A host on an
+older build will not fail loudly — it simply never completes a handshake.
+
 ## Quick Start
 
 ```go
@@ -381,9 +389,25 @@ pki:
     ...
   key: |
     ...
+  disconnect_invalid: true
   blocklist:
     - 7d0dc0bd1ae0bbd1a4a2ec8dd4a4b1d1e7d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6
 ```
+
+`disconnect_invalid` is the one Nebula default pb-nebula restates rather than
+omits. Nebula's docs say it defaults to `false`, its code defaults it to `true`,
+and its own example config shows it commented as `true` — when the documented
+default and the real one disagree, the config says what it means. Revocation
+does not depend on it (a blocklisted certificate is disconnected regardless),
+but an expired certificate and a finished CA rotation both do.
+
+The blocklist is scoped to the **CA**, not the network — because that is where
+Nebula's trust boundary is. Every host carrying a CA in `pki.ca` will verify
+anything that CA signed, including hosts in a *different* pb-nebula network
+under the same CA. A network-scoped blocklist would revoke a host from its own
+peers and leave it verifiable by its siblings. So deactivating a host
+regenerates every config under its CA; lighthouse and relay changes stay
+network-scoped, since no host renders another network's lighthouses.
 
 An empty blocklist is **omitted** rather than written as an empty list, so a
 network with nothing revoked renders exactly the config it did before this
@@ -422,6 +446,38 @@ rather than defaulted-if-absent because by the time a hook sees the record,
 "field omitted" and "explicitly false" are indistinguishable; creating an
 already-revoked host is not a meaningful operation, and deactivation is an
 update.
+
+## Preferred Ranges
+
+`preferred_ranges` tells a host which **underlay** prefixes to favour when a peer
+advertises several addresses — typically the LAN it sits on, so two hosts in one
+rack use their private addresses rather than the public ones a lighthouse
+learned for them.
+
+```json
+{
+  "preferred_ranges": ["10.0.0.0/8", "192.168.0.0/16"]
+}
+```
+
+It is a **host** field, not a network one, because it describes where the host
+physically sits rather than which overlay it belongs to — two hosts in one
+network can be in different datacenters, and two hosts in different networks can
+share a rack. Config-only: changing it re-renders that host's `config_yaml` and
+nothing else.
+
+Validation rejects unparseable CIDRs, host bits (`172.16.0.5/24` — you meant
+`172.16.0.0/24`), duplicates, and more than 16 entries. That matters because
+Nebula's own failure mode is silence: it parses each entry and, on error, logs a
+warning and skips it, so a typo costs the host its preference while the tunnel
+still forms over the public path.
+
+**IPv6 is accepted here even though pb-nebula's overlay is IPv4-only** — these
+are underlay prefixes, and Nebula ranks IPv6 addresses in `preferred_ranges`
+highest of all. Overlapping entries are allowed: Nebula matches an address
+against the set, so a broad range plus a narrower one inside it is coherent.
+
+Omitted from the config entirely when unset.
 
 ## Firewall Rules
 
@@ -529,6 +585,14 @@ type Options struct {
     // Logging
     LogToConsole bool // Default: true
 
+    // Host certificate renewal (background job, serve only)
+    DisableHostCertRenewal bool    // Default: false (renewal is ON)
+    HostRenewalThreshold   float64 // Default: 0.20 — renew once 80% of the lifetime is gone
+    HostRenewalCron        string  // Default: "0 3 * * *"
+
+    // CA expiry warning (log only; never gated by DisableHostCertRenewal)
+    CAExpiryWarningDays int // Default: 90
+
     // Optional event filter
     EventFilter func(collectionName, eventType string) bool
 
@@ -536,6 +600,14 @@ type Options struct {
     EncryptionKey string
 }
 ```
+
+`CAExpiryWarningDays` is separate from renewal on purpose. A host certificate
+can be renewed; a CA cannot — the only remedy is rotation, which is a
+three-step operator procedure with a deliberate wait in the middle. Nebula's
+rotation guide asks you to start two to three months out, so the warning has to
+arrive with room for the wait, not just room for the work. Turning automatic
+host renewal off is a reason to want *more* warning about an expiring CA, which
+is why `DisableHostCertRenewal` does not silence it.
 
 ### Custom Configuration Example
 

@@ -16,8 +16,9 @@ import "errors"
 // - Operational errors: Runtime generation failures that may be transient
 var (
 	// Certificate errors - Cryptographic operations
-	ErrCertGeneration = errors.New("failed to generate certificate")
-	ErrCANotFound     = errors.New("CA not found")
+	ErrCertGeneration  = errors.New("failed to generate certificate")
+	ErrCANotFound      = errors.New("CA not found")
+	ErrInvalidRotation = errors.New("invalid CA rotation")
 
 	// Network errors - Network management
 	ErrNetworkNotFound  = errors.New("network not found")
@@ -25,9 +26,13 @@ var (
 	ErrIPv6NotSupported = errors.New("IPv6 networks not supported yet")
 
 	// Host errors - Host management
-	ErrInvalidIP            = errors.New("invalid IP address")
-	ErrIPNotInNetwork       = errors.New("IP address not within network CIDR")
-	ErrLighthouseNoPublicIP = errors.New("lighthouse hosts require public_host_port")
+	ErrInvalidIP             = errors.New("invalid IP address")
+	ErrIPNotInNetwork        = errors.New("IP address not within network CIDR")
+	ErrLighthouseNoPublicIP  = errors.New("lighthouse hosts require public_host_port")
+	ErrRelayNoPublicIP       = errors.New("relay hosts require public_host_port")
+	ErrInvalidUnsafeNetwork  = errors.New("invalid unsafe network")
+	ErrInvalidUnsafeRoute    = errors.New("invalid unsafe route")
+	ErrInvalidPreferredRange = errors.New("invalid preferred range")
 
 	// Config errors - Configuration generation
 	ErrConfigGeneration = errors.New("failed to generate config")

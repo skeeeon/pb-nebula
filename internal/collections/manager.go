@@ -44,7 +44,6 @@ func NewManager(app *pocketbase.PocketBase, options pbtypes.Options) *Manager {
 }
 
 // InitializeCollections creates or updates all required collections in dependency order.
-// This is idempotent - existing collections are left unchanged.
 //
 // DEPENDENCY ORDER:
 // 1. CA (no dependencies)
@@ -52,13 +51,21 @@ func NewManager(app *pocketbase.PocketBase, options pbtypes.Options) *Manager {
 // 3. Hosts (depends on networks)
 //
 // IDEMPOTENT BEHAVIOR:
-// - Checks if collection exists before creating
-// - Skips creation if collection already exists
-// - Does not modify existing collection schemas
+// - Creates a collection that does not exist yet
+// - For a collection that does exist, ADDS any declared field it is missing
+// - Never removes, retypes, or narrows an existing field
+// - Never alters indexes or access rules on an existing collection
+//
+// WHY FIELDS MIGRATE BUT INDEXES DO NOT:
+// Adding a column is safe on a populated table; every existing row simply gets
+// the zero value, which is what a record created before the field existed would
+// have meant anyway. Adding a UNIQUE index is not safe — if any existing rows
+// violate it the whole save fails, taking the rest of initialization with it.
+// Index changes therefore remain a manual operation, as they always were.
 //
 // RETURNS:
 // - nil on successful initialization
-// - error if any collection creation fails
+// - error if any collection creation or migration fails
 func (cm *Manager) InitializeCollections() error {
 	// Initialize in dependency order
 	if err := cm.createCACollection(); err != nil {
@@ -71,6 +78,58 @@ func (cm *Manager) InitializeCollections() error {
 
 	if err := cm.createHostsCollection(); err != nil {
 		return fmt.Errorf("failed to create hosts collection: %w", err)
+	}
+
+	return nil
+}
+
+// addMissingFields adds any declared field the collection does not already have,
+// and saves the collection only if something actually changed.
+//
+// DESIGN:
+// This is the whole schema-migration story for pb-nebula, and it is deliberately
+// the smallest thing that works. A field is identified by name: if the collection
+// already has one with that name it is left completely alone, whatever its type
+// or options. So a deployment that widened a Max keeps its value, and a field
+// whose type genuinely changed is a migration we refuse to guess at rather than
+// silently destroy data over.
+//
+// The counterpart to this restraint is that the *declaration* must be shared:
+// caFields, networkFields and hostFields are read both here and by the create
+// path, so a field added to one of them cannot reach a fresh database and miss
+// an existing one.
+//
+// RELATION FIELDS ARE NOT HANDLED HERE:
+// ca_id and network_id need their target collection's ID resolved at runtime and
+// are added in the second phase of the create path. They exist on every
+// deployment that has the collection at all, so there is nothing to migrate.
+//
+// PARAMETERS:
+//   - collection: an existing collection, already loaded
+//   - want: the full declared non-relation field set for that collection
+//
+// RETURNS:
+// - nil if the collection was already current or was updated successfully
+// - error if the save fails
+//
+// SIDE EFFECTS: May ALTER the underlying table to add columns.
+func (cm *Manager) addMissingFields(collection *core.Collection, want []core.Field) error {
+	added := []string{}
+
+	for _, field := range want {
+		if collection.Fields.GetByName(field.GetName()) != nil {
+			continue
+		}
+		collection.Fields.Add(field)
+		added = append(added, field.GetName())
+	}
+
+	if len(added) == 0 {
+		return nil
+	}
+
+	if err := cm.app.Save(collection); err != nil {
+		return fmt.Errorf("failed to add fields %v to %s: %w", added, collection.Name, err)
 	}
 
 	return nil
@@ -96,11 +155,10 @@ func (cm *Manager) InitializeCollections() error {
 // - nil if collection created successfully or already exists
 // - error if collection creation fails
 func (cm *Manager) createCACollection() error {
-	// Check if collection already exists
-	_, err := cm.app.FindCollectionByNameOrId(cm.options.CACollectionName)
+	// An existing collection is migrated, not recreated
+	existing, err := cm.app.FindCollectionByNameOrId(cm.options.CACollectionName)
 	if err == nil {
-		// Collection already exists
-		return nil
+		return cm.addMissingFields(existing, caFields())
 	}
 
 	collection := core.NewBaseCollection(cm.options.CACollectionName)
@@ -112,45 +170,7 @@ func (cm *Manager) createCACollection() error {
 	collection.UpdateRule = nil
 	collection.DeleteRule = nil
 
-	// Add fields
-	collection.Fields.Add(&core.TextField{
-		Name:     "name",
-		Required: true,
-		Max:      100,
-	})
-	collection.Fields.Add(&core.TextField{
-		Name: "certificate",
-		Max:  10000,
-	})
-	collection.Fields.Add(&core.TextField{
-		Name:   "private_key",
-		Hidden: true, // HIDDEN field - not exposed via API
-		Max:    10000,
-	})
-	collection.Fields.Add(&core.NumberField{
-		Name:    "validity_years",
-		OnlyInt: true,
-		Min:     types.Pointer(1.0),
-		Max:     types.Pointer(50.0),
-	})
-	collection.Fields.Add(&core.DateField{
-		Name: "expires_at",
-	})
-	collection.Fields.Add(&core.TextField{
-		Name: "curve",
-		Max:  50,
-	})
-
-	// Add timestamps
-	collection.Fields.Add(&core.AutodateField{
-		Name:     "created",
-		OnCreate: true,
-	})
-	collection.Fields.Add(&core.AutodateField{
-		Name:     "updated",
-		OnCreate: true,
-		OnUpdate: true,
-	})
+	collection.Fields.Add(caFields()...)
 
 	// Create unique index on name (CA names distinguish meshes)
 	collection.Indexes = types.JSONArray[string]{
@@ -158,6 +178,83 @@ func (cm *Manager) createCACollection() error {
 	}
 
 	return cm.app.Save(collection)
+}
+
+// caFields returns the full non-relation field set for the CA collection.
+//
+// Both the create path and addMissingFields read this one declaration, so a
+// field added here reaches fresh and existing databases alike. Fields are
+// constructed fresh on every call because FieldsList.Add mutates them (it
+// assigns an id), so a shared package-level slice would not be reusable.
+func caFields() []core.Field {
+	return []core.Field{
+		&core.TextField{
+			Name:     "name",
+			Required: true,
+			Max:      100,
+		},
+		&core.TextField{
+			Name: "certificate",
+			Max:  10000,
+		},
+		&core.TextField{
+			Name:   "private_key",
+			Hidden: true, // HIDDEN field - not exposed via API
+			Max:    10000,
+		},
+		&core.NumberField{
+			Name:    "validity_years",
+			OnlyInt: true,
+			Min:     types.Pointer(1.0),
+			Max:     types.Pointer(50.0),
+		},
+		&core.DateField{
+			Name: "expires_at",
+		},
+		&core.TextField{
+			Name: "curve",
+			Max:  50,
+		},
+
+		// Rotation state. Only one of next_certificate / previous_certificate
+		// is ever set, and which one identifies the phase -- there is no
+		// separate status column, because a stored copy of something the
+		// certificate fields already say can only disagree with them.
+		&core.TextField{
+			Name: "next_certificate",
+			Max:  10000,
+		},
+		&core.TextField{
+			Name:   "next_private_key",
+			Hidden: true, // HIDDEN, like private_key: it is a live CA key
+			Max:    10000,
+		},
+		&core.TextField{
+			Name: "previous_certificate",
+			Max:  10000,
+		},
+		&core.DateField{
+			Name: "rotated_at",
+		},
+
+		// Action field. Text rather than bool because rotation has three verbs
+		// and a stuck `true` is dangerous. The hook resets it to "".
+		&core.TextField{
+			Name:    "rotate",
+			Max:     10,
+			Pattern: `^(prepare|commit|finish)$`,
+		},
+
+		&core.AutodateField{
+			Name:     "created",
+			OnCreate: true,
+		},
+		&core.AutodateField{
+			Name:     "updated",
+			OnCreate: true,
+			OnUpdate: true,
+		},
+	}
 }
 
 // createNetworksCollection creates the networks collection for tenant isolation.
@@ -185,11 +282,10 @@ func (cm *Manager) createCACollection() error {
 // - nil if collection created successfully or already exists
 // - error if collection creation fails
 func (cm *Manager) createNetworksCollection() error {
-	// Check if collection already exists
-	_, err := cm.app.FindCollectionByNameOrId(cm.options.NetworkCollectionName)
+	// An existing collection is migrated, not recreated
+	existing, err := cm.app.FindCollectionByNameOrId(cm.options.NetworkCollectionName)
 	if err == nil {
-		// Collection already exists
-		return nil
+		return cm.addMissingFields(existing, networkFields())
 	}
 
 	collection := core.NewBaseCollection(cm.options.NetworkCollectionName)
@@ -201,39 +297,7 @@ func (cm *Manager) createNetworksCollection() error {
 	collection.UpdateRule = types.Pointer("@request.auth.id != ''")
 	collection.DeleteRule = types.Pointer("@request.auth.id != ''")
 
-	// Add identity fields
-	collection.Fields.Add(&core.TextField{
-		Name:     "name",
-		Required: true,
-		Max:      100,
-	})
-	collection.Fields.Add(&core.TextField{
-		Name: "description",
-		Max:  500,
-	})
-
-	// Add network configuration
-	collection.Fields.Add(&core.TextField{
-		Name:     "cidr_range",
-		Required: true,
-		Max:      50,
-	})
-
-	// Add management field
-	collection.Fields.Add(&core.BoolField{
-		Name: "active",
-	})
-
-	// Add timestamps
-	collection.Fields.Add(&core.AutodateField{
-		Name:     "created",
-		OnCreate: true,
-	})
-	collection.Fields.Add(&core.AutodateField{
-		Name:     "updated",
-		OnCreate: true,
-		OnUpdate: true,
-	})
+	collection.Fields.Add(networkFields()...)
 
 	// Save collection first, then add relation
 	if err := cm.app.Save(collection); err != nil {
@@ -262,6 +326,40 @@ func (cm *Manager) createNetworksCollection() error {
 	}
 
 	return cm.app.Save(collection)
+}
+
+// networkFields returns the full non-relation field set for the networks
+// collection. The ca_id relation is excluded deliberately — see caFields for why
+// the declaration is shared, and addMissingFields for why relations are not.
+func networkFields() []core.Field {
+	return []core.Field{
+		&core.TextField{
+			Name:     "name",
+			Required: true,
+			Max:      100,
+		},
+		&core.TextField{
+			Name: "description",
+			Max:  500,
+		},
+		&core.TextField{
+			Name:     "cidr_range",
+			Required: true,
+			Max:      50,
+		},
+		&core.BoolField{
+			Name: "active",
+		},
+		&core.AutodateField{
+			Name:     "created",
+			OnCreate: true,
+		},
+		&core.AutodateField{
+			Name:     "updated",
+			OnCreate: true,
+			OnUpdate: true,
+		},
+	}
 }
 
 // createHostsCollection creates the hosts collection (auth collection with Nebula integration).
@@ -304,11 +402,10 @@ func (cm *Manager) createNetworksCollection() error {
 // - nil if collection created successfully or already exists
 // - error if collection creation fails
 func (cm *Manager) createHostsCollection() error {
-	// Check if collection already exists
-	_, err := cm.app.FindCollectionByNameOrId(cm.options.HostCollectionName)
+	// An existing collection is migrated, not recreated
+	existing, err := cm.app.FindCollectionByNameOrId(cm.options.HostCollectionName)
 	if err == nil {
-		// Collection already exists
-		return nil
+		return cm.addMissingFields(existing, hostFields())
 	}
 
 	collection := core.NewAuthCollection(cm.options.HostCollectionName)
@@ -320,72 +417,7 @@ func (cm *Manager) createHostsCollection() error {
 	collection.UpdateRule = types.Pointer("@request.auth.id = id")
 	collection.DeleteRule = types.Pointer("@request.auth.id = id")
 
-	// Add Nebula-specific fields
-	collection.Fields.Add(&core.TextField{
-		Name:     "hostname",
-		Required: true,
-		Max:      100,
-	})
-	collection.Fields.Add(&core.TextField{
-		Name:     "overlay_ip",
-		Required: true,
-		Max:      50,
-	})
-	collection.Fields.Add(&core.JSONField{
-		Name:    "groups",
-		MaxSize: 1000,
-	})
-	collection.Fields.Add(&core.BoolField{
-		Name: "is_lighthouse",
-	})
-	collection.Fields.Add(&core.TextField{
-		Name: "public_host_port",
-		Max:  100,
-	})
-
-	// Add certificate fields
-	collection.Fields.Add(&core.TextField{
-		Name: "certificate",
-		Max:  10000,
-	})
-	collection.Fields.Add(&core.TextField{
-		Name: "private_key",
-		Max:  10000,
-	})
-	collection.Fields.Add(&core.TextField{
-		Name: "ca_certificate",
-		Max:  10000,
-	})
-	collection.Fields.Add(&core.TextField{
-		Name: "config_yaml",
-		Max:  50000,
-	})
-
-	// Add host-specific firewall rules (Nebula native JSON format)
-	collection.Fields.Add(&core.JSONField{
-		Name:    "firewall_outbound",
-		MaxSize: 10000,
-	})
-	collection.Fields.Add(&core.JSONField{
-		Name:    "firewall_inbound",
-		MaxSize: 10000,
-	})
-
-	// Add validity fields
-	collection.Fields.Add(&core.NumberField{
-		Name:    "validity_years",
-		OnlyInt: true,
-		Min:     types.Pointer(1.0),
-		Max:     types.Pointer(10.0),
-	})
-	collection.Fields.Add(&core.DateField{
-		Name: "expires_at",
-	})
-
-	// Add management field
-	collection.Fields.Add(&core.BoolField{
-		Name: "active",
-	})
+	collection.Fields.Add(hostFields()...)
 
 	// Save collection first to get ID for relations
 	if err := cm.app.Save(collection); err != nil {
@@ -414,4 +446,124 @@ func (cm *Manager) createHostsCollection() error {
 	}
 
 	return cm.app.Save(collection)
+}
+
+// hostFields returns the full non-relation field set for the hosts collection.
+//
+// The network_id relation is excluded deliberately (see addMissingFields), as are
+// the auth system fields (email, password, tokenKey, verified, created, updated)
+// that core.NewAuthCollection provides — those are PocketBase's, not ours.
+func hostFields() []core.Field {
+	return []core.Field{
+		// Nebula identity
+		&core.TextField{
+			Name:     "hostname",
+			Required: true,
+			Max:      100,
+		},
+		&core.TextField{
+			Name:     "overlay_ip",
+			Required: true,
+			Max:      50,
+		},
+		&core.JSONField{
+			Name:    "groups",
+			MaxSize: 1000,
+		},
+		&core.BoolField{
+			Name: "is_lighthouse",
+		},
+		&core.BoolField{
+			Name: "is_relay",
+		},
+		&core.TextField{
+			Name: "public_host_port",
+			Max:  100,
+		},
+
+		// Per-host tun overrides. Both use the zero value to mean "inherit the
+		// generator default" (mtu 1300, dev nebula1), which PocketBase supports
+		// directly: NumberField short-circuits on 0 before checking Min, and
+		// TextField short-circuits on "" before checking Pattern.
+		&core.NumberField{
+			Name:    "mtu",
+			OnlyInt: true,
+			Min:     types.Pointer(576.0),  // IPv4 minimum reassembly buffer
+			Max:     types.Pointer(9216.0), // common jumbo-frame ceiling
+		},
+		&core.TextField{
+			Name:    "tun_device",
+			Max:     15, // kernel interface-name limit
+			Pattern: `^[A-Za-z0-9_-]{1,15}$`,
+		},
+
+		// Generated credentials
+		&core.TextField{
+			Name: "certificate",
+			Max:  10000,
+		},
+		&core.TextField{
+			Name: "private_key",
+			Max:  10000,
+		},
+		&core.TextField{
+			Name: "ca_certificate",
+			Max:  10000,
+		},
+		&core.TextField{
+			Name: "config_yaml",
+			Max:  50000,
+		},
+
+		// Host-specific firewall rules (Nebula native JSON format)
+		&core.JSONField{
+			Name:    "firewall_outbound",
+			MaxSize: 10000,
+		},
+		&core.JSONField{
+			Name:    "firewall_inbound",
+			MaxSize: 10000,
+		},
+
+		// Gateway routing. unsafe_networks is cert-bound (the provider half);
+		// unsafe_routes is config-only (the consumer half, on other hosts).
+		&core.JSONField{
+			Name:    "unsafe_networks",
+			MaxSize: 1000,
+		},
+		&core.JSONField{
+			Name:    "unsafe_routes",
+			MaxSize: 2000,
+		},
+
+		// Underlay prefixes to prefer when a peer advertises several
+		// addresses. A host column, not a network one: it describes where the
+		// host physically sits, not which overlay it belongs to.
+		&core.JSONField{
+			Name:    "preferred_ranges",
+			MaxSize: 1000,
+		},
+
+		// Certificate validity
+		&core.NumberField{
+			Name:    "validity_years",
+			OnlyInt: true,
+			Min:     types.Pointer(1.0),
+			Max:     types.Pointer(10.0),
+		},
+		&core.DateField{
+			Name: "expires_at",
+		},
+
+		// Management
+		&core.BoolField{
+			Name: "active",
+		},
+
+		// Action field: set true to force an immediate re-issue. The hook
+		// performs the renewal and resets it to false in the same save.
+		&core.BoolField{
+			Name: "renew",
+		},
+	}
 }

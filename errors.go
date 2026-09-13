@@ -20,8 +20,9 @@ import (
 // - Operational errors: Runtime issues that may be transient
 var (
 	// Certificate errors - Cryptographic operations
-	ErrCertGeneration = types.ErrCertGeneration
-	ErrCANotFound     = types.ErrCANotFound
+	ErrCertGeneration  = types.ErrCertGeneration
+	ErrCANotFound      = types.ErrCANotFound
+	ErrInvalidRotation = types.ErrInvalidRotation
 
 	// Network errors - Network management
 	ErrNetworkNotFound  = types.ErrNetworkNotFound
@@ -29,9 +30,13 @@ var (
 	ErrIPv6NotSupported = types.ErrIPv6NotSupported
 
 	// Host errors - Host management
-	ErrInvalidIP            = types.ErrInvalidIP
-	ErrIPNotInNetwork       = types.ErrIPNotInNetwork
-	ErrLighthouseNoPublicIP = types.ErrLighthouseNoPublicIP
+	ErrInvalidIP             = types.ErrInvalidIP
+	ErrIPNotInNetwork        = types.ErrIPNotInNetwork
+	ErrLighthouseNoPublicIP  = types.ErrLighthouseNoPublicIP
+	ErrRelayNoPublicIP       = types.ErrRelayNoPublicIP
+	ErrInvalidUnsafeNetwork  = types.ErrInvalidUnsafeNetwork
+	ErrInvalidUnsafeRoute    = types.ErrInvalidUnsafeRoute
+	ErrInvalidPreferredRange = types.ErrInvalidPreferredRange
 
 	// Config errors - Configuration generation
 	ErrConfigGeneration = types.ErrConfigGeneration

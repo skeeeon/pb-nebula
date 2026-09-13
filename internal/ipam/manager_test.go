@@ -2,6 +2,8 @@ package ipam
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"testing"
 
 	"github.com/skeeeon/pb-nebula/internal/types"
@@ -67,5 +69,163 @@ func TestValidateIPFormat(t *testing.T) {
 	}
 	if err := m.ValidateIPFormat(""); !errors.Is(err, types.ErrInvalidIP) {
 		t.Errorf("expected ErrInvalidIP for empty string, got %v", err)
+	}
+}
+
+// mustCIDR parses a network CIDR for the unsafe-network tests below.
+func mustCIDR(t *testing.T, cidr string) *net.IPNet {
+	t.Helper()
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		t.Fatalf("bad test CIDR %q: %v", cidr, err)
+	}
+	return network
+}
+
+func TestValidateUnsafeNetworks(t *testing.T) {
+	overlay := mustCIDR(t, "10.128.0.0/16")
+
+	tests := []struct {
+		name    string
+		cidrs   []string
+		wantErr error
+	}{
+		{"none", nil, nil},
+		{"single prefix", []string{"192.168.50.0/24"}, nil},
+		{"several disjoint", []string{"192.168.50.0/24", "172.16.0.0/16"}, nil},
+		{"host bits set", []string{"192.168.50.5/24"}, types.ErrInvalidUnsafeNetwork},
+		{"not a CIDR", []string{"192.168.50.0"}, types.ErrInvalidUnsafeNetwork},
+		{"IPv6", []string{"fd00::/64"}, types.ErrInvalidUnsafeNetwork},
+		{"duplicate", []string{"192.168.50.0/24", "192.168.50.0/24"}, types.ErrInvalidUnsafeNetwork},
+		{"overlapping pair", []string{"192.168.0.0/16", "192.168.50.0/24"}, types.ErrInvalidUnsafeNetwork},
+		// Would shadow real mesh peers: Nebula builds one routing table from
+		// the certificate's networks and unsafe networks together
+		{"equals the overlay", []string{"10.128.0.0/16"}, types.ErrInvalidUnsafeNetwork},
+		{"inside the overlay", []string{"10.128.5.0/24"}, types.ErrInvalidUnsafeNetwork},
+		{"contains the overlay", []string{"10.0.0.0/8"}, types.ErrInvalidUnsafeNetwork},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateUnsafeNetworks(tt.cidrs, overlay)
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("validateUnsafeNetworks(%v) = %v, want %v", tt.cidrs, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateUnsafeNetworksRespectsTheCap(t *testing.T) {
+	// The cap exists because these ride inside the signed certificate, which is
+	// handed to every peer on every handshake.
+	overlay := mustCIDR(t, "10.128.0.0/16")
+
+	tooMany := make([]string, MaxUnsafeNetworksPerHost+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("192.168.%d.0/24", i)
+	}
+
+	if err := validateUnsafeNetworks(tooMany[:MaxUnsafeNetworksPerHost], overlay); err != nil {
+		t.Errorf("exactly the cap should be allowed, got %v", err)
+	}
+	if err := validateUnsafeNetworks(tooMany, overlay); !errors.Is(err, types.ErrInvalidUnsafeNetwork) {
+		t.Errorf("one over the cap should be rejected, got %v", err)
+	}
+}
+
+func TestValidateUnsafeRoutes(t *testing.T) {
+	overlay := mustCIDR(t, "10.128.0.0/16")
+
+	route := func(r, v string) []types.UnsafeRoute {
+		return []types.UnsafeRoute{{Route: r, Via: v}}
+	}
+
+	tests := []struct {
+		name    string
+		routes  []types.UnsafeRoute
+		wantErr error
+	}{
+		{"none", nil, nil},
+		{"valid", route("192.168.50.0/24", "10.128.0.5"), nil},
+		{"missing route", route("", "10.128.0.5"), types.ErrInvalidUnsafeRoute},
+		{"missing via", route("192.168.50.0/24", ""), types.ErrInvalidUnsafeRoute},
+		{"route host bits", route("192.168.50.5/24", "10.128.0.5"), types.ErrInvalidUnsafeRoute},
+		{"route not a CIDR", route("192.168.50.0", "10.128.0.5"), types.ErrInvalidUnsafeRoute},
+		{"route overlaps overlay", route("10.128.5.0/24", "10.128.0.5"), types.ErrInvalidUnsafeRoute},
+		{"via not an IP", route("192.168.50.0/24", "not-an-ip"), types.ErrInvalidUnsafeRoute},
+		// via names a mesh peer by overlay IP, so an address outside the
+		// network is a typo that would otherwise be silently inert
+		{"via outside the network", route("192.168.50.0/24", "192.168.50.1"), types.ErrInvalidUnsafeRoute},
+		{"via IPv6", route("192.168.50.0/24", "fd00::1"), types.ErrInvalidUnsafeRoute},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateUnsafeRoutes(tt.routes, overlay)
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("validateUnsafeRoutes(%v) = %v, want %v", tt.routes, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidatePreferredRanges guards a setting whose failure mode is silence.
+//
+// Nebula parses preferred_ranges with netip.ParsePrefix and, on failure, logs a
+// warning and skips the entry (hostmap.go, reload). A typo therefore costs the
+// host its address preference without breaking anything: the tunnel still
+// forms, over the public path, and the only symptom is traffic taking the slow
+// route. Rejecting on write is the one point at which that is visible.
+func TestValidatePreferredRanges(t *testing.T) {
+	tests := []struct {
+		name    string
+		cidrs   []string
+		wantErr bool
+	}{
+		{name: "empty is fine", cidrs: nil},
+		{name: "a private LAN", cidrs: []string{"10.0.0.0/8"}},
+		{name: "several", cidrs: []string{"10.0.0.0/8", "192.168.0.0/16", "172.16.0.0/12"}},
+		// A broad range plus a narrower one inside it is coherent: Nebula
+		// matches an address against the set, so overlaps are not an error.
+		{name: "overlapping entries are allowed", cidrs: []string{"10.0.0.0/8", "10.1.2.0/24"}},
+		// The underlay may be IPv6 even though this library's overlay is not,
+		// and Nebula ranks IPv6 in preferred_ranges highest of all.
+		{name: "IPv6 underlay", cidrs: []string{"fd00::/8"}},
+		{name: "a single host", cidrs: []string{"1.1.1.1/32"}},
+
+		{name: "not a CIDR", cidrs: []string{"10.0.0.0"}, wantErr: true},
+		{name: "nonsense", cidrs: []string{"not-a-range"}, wantErr: true},
+		// Nebula would mask this silently; the operator meant an address.
+		{name: "host bits set", cidrs: []string{"172.16.0.5/24"}, wantErr: true},
+		{name: "duplicate", cidrs: []string{"10.0.0.0/8", "10.0.0.0/8"}, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidatePreferredRanges(tt.cidrs)
+			if tt.wantErr && err == nil {
+				t.Error("expected an error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidatePreferredRangesRespectsTheCap keeps one host from bloating its
+// own rendered config without limit, like the unsafe_routes cap.
+func TestValidatePreferredRangesRespectsTheCap(t *testing.T) {
+	tooMany := make([]string, MaxPreferredRangesPerHost+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf("10.%d.0.0/16", i)
+	}
+
+	if err := ValidatePreferredRanges(tooMany); err == nil {
+		t.Errorf("expected an error for %d preferred ranges, got nil", len(tooMany))
+	}
+
+	if err := ValidatePreferredRanges(tooMany[:MaxPreferredRangesPerHost]); err != nil {
+		t.Errorf("expected %d preferred ranges to be accepted: %v", MaxPreferredRangesPerHost, err)
 	}
 }
