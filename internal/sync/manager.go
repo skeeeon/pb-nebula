@@ -164,6 +164,41 @@ func (sm *Manager) setupCAHooks() {
 		return e.Next()
 	})
 
+	// The same check again, at the MODEL layer, because the request hooks above
+	// only fire for writes that arrive through the record API.
+	//
+	// A consumer that drives rotation from its own route -- which is the shape
+	// this library asks for, since a rotation lever cannot be expressed as a
+	// PocketBase update rule -- calls app.Save() directly. No request hook runs,
+	// so validation was skipped and execution went ahead anyway: `finish` on an
+	// idle CA, `commit` with nothing prepared. A validation that only fires on
+	// one entry point is not a validation, it is a UI nicety, and the interlock
+	// that makes `finish` safe to expose is the whole reason `finish` IS exposed.
+	//
+	// Running twice on an API update is deliberate and cheap -- the check is
+	// read-only, and the request hook still owns the client-facing message. What
+	// this hook returns is the RAW error, so a Go caller can errors.Is it against
+	// ErrInvalidRotation; router.NewBadRequestError would flatten that away, and
+	// a route calling Save has no rule layer to translate for it.
+	sm.app.OnRecordUpdate().BindFunc(func(e *core.RecordEvent) error {
+		if e.Record.Collection().Name != sm.options.CACollectionName {
+			return e.Next()
+		}
+
+		// pb-nebula's own writes are exempt for the usual reason, and here it is
+		// load-bearing rather than defensive: rotatePrepare saves a record whose
+		// next_certificate it has just changed, which is exactly what the
+		// "managed by pb-nebula" guard below refuses from anyone else.
+		if sm.isInternalSave(e.Record) {
+			return e.Next()
+		}
+
+		if err := sm.checkCARotation(e.Record, e.Record.Original()); err != nil {
+			return err
+		}
+		return e.Next()
+	})
+
 	// Rotation execution
 	sm.app.OnRecordAfterUpdateSuccess().BindFunc(func(e *core.RecordEvent) error {
 		if e.Record.Collection().Name != sm.options.CACollectionName {

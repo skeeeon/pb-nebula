@@ -122,6 +122,20 @@ Saves issued by pb-nebula itself re-fire the update hooks, and `e.Record.Origina
 
 **So reactivation must force a cert regeneration**, and that is why the `active` false→true branch sets `needsCertRegeneration`. A host parked across a rotation comes back holding a certificate from a CA that may since have been retired — off the blocklist, healthy-looking in the Admin UI, able to handshake with nobody.
 
+**Rotation is validated at two layers, and the second is not redundant.** The
+request hooks (`OnRecordCreateRequest`/`OnRecordUpdateRequest`) only fire for
+writes arriving through the record API. A consumer driving rotation from its own
+route calls `app.Save()` — which is the shape this library asks for, since a
+rotation lever cannot be expressed as a PocketBase update rule — and for that
+write no request hook runs, so validation was skipped while execution went ahead
+regardless: `finish` on an idle CA, `commit` with nothing prepared. So
+`checkCARotation` is bound to `OnRecordUpdate` as well, guarded by
+`isInternalSave` (load-bearing there, not defensive: `rotatePrepare` saves a
+record whose `next_certificate` it has just changed, exactly what the
+"managed by pb-nebula" guard refuses from anyone else). The model hook returns
+the **raw** error so a Go caller can `errors.Is` it against `ErrInvalidRotation`;
+the request hook still owns the client-facing message.
+
 **Validation errors are wrapped in `router.NewBadRequestError`, never returned plain** — `badRequest()` does it for the host and network request hooks, and `validateCARotation` for the CA ones.  PocketBase flattens a plain error from a request hook into a generic "Something went wrong while processing your request." 400, which discards the only thing that makes these messages worth writing — `finish` names the host blocking it, and `ValidatePreferredRanges` names the mask the operator probably meant. ApiError does not wrap, so the sentinel does not survive past the hook; nothing on the far side is Go code doing `errors.Is`, and the sentinels stay intact inside the validators themselves. Validation lives in the **request** hook (can refuse) and execution in **AfterUpdateSuccess** (cannot), keyed on the `rotate` *transition* so a crash between commit and hook doesn't re-fire on the next unrelated edit. The After hook checks `isInternalSave` first: the CA *create* hook calls `saveInternal`, which fires an update event, and without that guard creating a CA would enter the rotation path.
 
 ### Renewal is a cron, and the clamp is what makes it tricky
