@@ -14,6 +14,7 @@ import (
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketbase/pocketbase/tools/router"
 	"github.com/skeeeon/pb-nebula/internal/cert"
 	"github.com/skeeeon/pb-nebula/internal/config"
 	"github.com/skeeeon/pb-nebula/internal/ipam"
@@ -245,7 +246,7 @@ func (sm *Manager) setupNetworkHooks() {
 		}
 
 		if err := sm.validateNetworkRecord(e.Record); err != nil {
-			return err
+			return badRequest(err)
 		}
 
 		return e.Next()
@@ -257,7 +258,7 @@ func (sm *Manager) setupNetworkHooks() {
 		}
 
 		if err := sm.validateNetworkRecord(e.Record); err != nil {
-			return err
+			return badRequest(err)
 		}
 
 		return e.Next()
@@ -415,7 +416,7 @@ func (sm *Manager) setupHostHooks() {
 		}
 
 		if err := sm.validateHostRecord(e.Record); err != nil {
-			return err
+			return badRequest(err)
 		}
 
 		return e.Next()
@@ -427,7 +428,7 @@ func (sm *Manager) setupHostHooks() {
 		}
 
 		if err := sm.validateHostRecord(e.Record); err != nil {
-			return err
+			return badRequest(err)
 		}
 
 		return e.Next()
@@ -510,6 +511,7 @@ func (sm *Manager) setupHostHooks() {
 		needsCertRegeneration := false
 		needsConfigRegeneration := false
 		needsPeerFanOut := false
+		needsCAFanOut := false
 		needsRenewReset := false
 
 		if orig != nil {
@@ -566,10 +568,16 @@ func (sm *Manager) setupHostHooks() {
 			// otherwise did nothing: the certificate stayed trusted until expiry.
 			// The host's own config is regenerated too, because the fan-out
 			// deliberately excludes the record that changed.
+			// The blocklist is scoped to the CA, because that is where Nebula's
+			// trust boundary is -- so an active flip makes every config under
+			// the CA stale, not just this network's. needsPeerFanOut stays set
+			// so the guards below read the same; needsCAFanOut only widens
+			// which hosts the fan-out reaches.
 			if orig.GetBool("active") != e.Record.GetBool("active") {
-				sm.logger.Info("Active flag changed for host %s, refreshing revocation blocklist across the network", e.Record.GetString("hostname"))
+				sm.logger.Info("Active flag changed for host %s, refreshing revocation blocklist across the CA", e.Record.GetString("hostname"))
 				needsConfigRegeneration = true
 				needsPeerFanOut = true
+				needsCAFanOut = true
 			}
 
 			// Reactivation needs a NEW certificate, not just a config refresh.
@@ -660,8 +668,11 @@ func (sm *Manager) setupHostHooks() {
 
 		// Fan out to peers AFTER this host's own regeneration so peers see
 		// the host's final state (e.g. updated overlay_ip)
-		if needsPeerFanOut {
-			sm.logger.Config("Lighthouse settings changed for host %s, regenerating peer configs...", e.Record.GetString("hostname"))
+		if needsCAFanOut {
+			sm.logger.Config("Revocation changed for host %s, regenerating every config under its CA...", e.Record.GetString("hostname"))
+			sm.regenerateCAHostConfigs(e.Record.GetString("network_id"), e.Record.Id)
+		} else if needsPeerFanOut {
+			sm.logger.Config("Peer-visible settings changed for host %s, regenerating peer configs...", e.Record.GetString("hostname"))
 			sm.regenerateNetworkHostConfigs(e.Record.GetString("network_id"), e.Record.Id)
 		}
 
@@ -689,6 +700,36 @@ func (sm *Manager) setupHostHooks() {
 
 		return e.Next()
 	})
+}
+
+// badRequest turns a validation error into a 400 whose message survives the
+// trip to the client.
+//
+// PocketBase flattens a plain error returned from a request hook into a generic
+// "Something went wrong while processing your request." -- which throws away
+// the entire point of writing a message. It is worth the wrapper here for the
+// same reason the CA rotation guards already do it: these errors are the only
+// explanation an operator gets for a refused save, and they are written to be
+// actionable ("172.16.0.5/24 has host bits set, did you mean 172.16.0.0/24?").
+//
+// The sentinel is deliberately not preserved through the wrapper. ApiError does
+// not wrap, so errors.Is cannot match past this point -- but nothing on the
+// far side of a request hook is Go code doing errors.Is. The sentinels stay
+// intact inside validateHostRecord and validateNetworkRecord, which is where
+// anything in-process reads them.
+//
+// PARAMETERS:
+//   - err: the validation failure
+//
+// RETURNS:
+// - an *router.ApiError carrying err's message, or nil if err is nil
+//
+// SIDE EFFECTS: None.
+func badRequest(err error) error {
+	if err == nil {
+		return nil
+	}
+	return router.NewBadRequestError(err.Error(), nil)
 }
 
 // validateNetworkRecord validates a network record before create/update.
@@ -775,6 +816,55 @@ func (sm *Manager) validateHostRecord(record *core.Record) error {
 	sm.warnOnUnroutableUnsafeRoutes(record, unsafeRoutes)
 
 	return nil
+}
+
+// regenerateCAHostConfigs regenerates every host config under the CA that owns
+// the given network, excluding one record.
+//
+// This is the reach a revocation needs. pki.blocklist is built per CA, because
+// a CA is Nebula's trust boundary and a certificate it signed verifies for
+// every host carrying it in pki.ca -- across every pb-nebula network under that
+// CA. A fan-out that stopped at the network would leave sibling networks still
+// able to verify the host that was just revoked.
+//
+// Lighthouse and relay changes deliberately do NOT use this: those really are
+// per-network, since no host renders another network's lighthouses.
+//
+// If the CA cannot be resolved the fan-out falls back to the single network.
+// That is strictly less than intended, but it is what the code did before the
+// blocklist was widened, and a partial regeneration beats none.
+//
+// PARAMETERS:
+//   - networkID: any network under the CA to reach
+//   - excludeHostID: the record that triggered this and handles its own config
+//
+// SIDE EFFECTS: Writes config_yaml on host records.
+func (sm *Manager) regenerateCAHostConfigs(networkID, excludeHostID string) {
+	network, err := sm.app.FindRecordById(sm.options.NetworkCollectionName, networkID)
+	if err != nil {
+		sm.logger.Warning("Cannot widen regeneration to the CA for network %s, falling back to that network alone: %v",
+			networkID, err)
+		sm.regenerateNetworkHostConfigs(networkID, excludeHostID)
+		return
+	}
+
+	caID := network.GetString("ca_id")
+	if caID == "" {
+		sm.regenerateNetworkHostConfigs(networkID, excludeHostID)
+		return
+	}
+
+	networks, err := sm.app.FindAllRecords(sm.options.NetworkCollectionName, dbx.HashExp{"ca_id": caID})
+	if err != nil {
+		sm.logger.Warning("Cannot list networks for CA %s, falling back to network %s alone: %v",
+			caID, networkID, err)
+		sm.regenerateNetworkHostConfigs(networkID, excludeHostID)
+		return
+	}
+
+	for _, n := range networks {
+		sm.regenerateNetworkHostConfigs(n.Id, excludeHostID)
+	}
 }
 
 // regenerateNetworkHostConfigs regenerates and saves config_yaml for every host
@@ -1014,10 +1104,11 @@ func (sm *Manager) loadNetworkConfigContext(networkID string) (*networkConfigCon
 		return nil, fmt.Errorf("failed to get relays: %w", err)
 	}
 
-	// Certificate fingerprints this network refuses. Nebula has no CRL, so a
+	// Certificate fingerprints this CA's hosts refuse. Nebula has no CRL, so a
 	// deactivated host is only actually off the mesh once every peer config
-	// carries its fingerprint -- see getBlocklist.
-	ctx.blocklist, err = sm.getBlocklist(network.Id)
+	// carries its fingerprint -- and "every peer" means every host under the
+	// CA, not just this network. See getBlocklist.
+	ctx.blocklist, err = sm.getBlocklist(network.GetString("ca_id"))
 	if err != nil {
 		// Never fatal: a config without a blocklist is the config this library
 		// generated for years, and failing here would stop a host getting ANY
@@ -1046,8 +1137,8 @@ func (sm *Manager) generateHostConfigWith(record *core.Record, ctx *networkConfi
 	return nil
 }
 
-// getBlocklist returns the certificate fingerprints of every DEACTIVATED
-// host in a network, sorted.
+// getBlocklist returns the certificate fingerprints of every DEACTIVATED host
+// under a CA, sorted.
 //
 // This is the revocation list. Nebula has no CRL and no OCSP: the only way to
 // refuse a certificate it has already signed is pki.blocklist, a list of
@@ -1056,8 +1147,19 @@ func (sm *Manager) generateHostConfigWith(record *core.Record, ctx *networkConfi
 // its peers lighthouse lists and nothing else -- its certificate stayed valid
 // until it expired, so a decommissioned device kept its place on the mesh.
 //
-// Sorted so an unchanged network renders a byte-identical config. Without
-// that, map iteration order would make every regeneration look like a change.
+// SCOPED TO THE CA, NOT THE NETWORK, BECAUSE TRUST IS:
+// nebula_networks is a pb-nebula construct -- an IPAM scope, a uniqueness
+// scope, and the peer group whose lighthouses and relays each host renders.
+// Nebula has no such object. Its trust boundary is the CA: every host under one
+// CA carries that CA in pki.ca and will verify anything it signed.
+//
+// So a blocklist scoped to the network revoked a host from its own peers and
+// left it verifiable by every sibling network under the same CA -- which this
+// library explicitly supports, one CA serving many networks. Deactivation has
+// to reach as far as the signature does, or it is not revocation.
+//
+// Sorted so an unchanged CA renders a byte-identical config. Without that, map
+// iteration order would make every regeneration look like a change.
 //
 // A host with no certificate yet (mid-creation) is skipped rather than treated
 // as an error: there is nothing to revoke.
@@ -1066,9 +1168,37 @@ func (sm *Manager) generateHostConfigWith(record *core.Record, ctx *networkConfi
 // certificate with it, and a fingerprint absent from the database cannot be
 // blocklisted. To take a device off the mesh, DEACTIVATE it; deleting is for
 // hosts whose certificate you are content to leave valid until it expires.
-func (sm *Manager) getBlocklist(networkID string) ([]string, error) {
+//
+// PARAMETERS:
+//   - caID: the CA whose revoked hosts to collect
+//
+// RETURNS:
+// - sorted fingerprints, empty when nothing is revoked
+// - error if the networks or hosts cannot be listed
+func (sm *Manager) getBlocklist(caID string) ([]string, error) {
+	if caID == "" {
+		// A network with no CA cannot have signed anything, so there is
+		// nothing to revoke. Not an error: generateHostConfig already tolerates
+		// a missing CA by falling back to the stored certificate.
+		return nil, nil
+	}
+
+	networks, err := sm.app.FindAllRecords(sm.options.NetworkCollectionName,
+		dbx.HashExp{"ca_id": caID})
+	if err != nil {
+		return nil, err
+	}
+	if len(networks) == 0 {
+		return nil, nil
+	}
+
+	networkIDs := make([]any, len(networks))
+	for i, network := range networks {
+		networkIDs[i] = network.Id
+	}
+
 	records, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
-		dbx.HashExp{"network_id": networkID, "active": false})
+		dbx.In("network_id", networkIDs...), dbx.HashExp{"active": false})
 	if err != nil {
 		return nil, err
 	}
@@ -1090,8 +1220,8 @@ func (sm *Manager) getBlocklist(networkID string) ([]string, error) {
 		}
 		fp, err := cert.FingerprintFromPEM(certPEM)
 		if err != nil {
-			// One unparseable certificate must not cost the network its whole
-			// blocklist, so log it and keep the rest.
+			// One unparseable certificate must not cost the CA's hosts their
+			// whole blocklist, so log it and keep the rest.
 			sm.logger.Warning("Cannot fingerprint certificate for host %s, omitting from blocklist: %v", record.Id, err)
 			continue
 		}
