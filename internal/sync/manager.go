@@ -777,6 +777,16 @@ func (sm *Manager) regenerateNetworkHostConfigs(networkID, excludeHostID string)
 		return
 	}
 
+	// Loaded once for the whole fan-out: nothing in the loop below changes the
+	// lighthouses, relays, blocklist or trust bundle, and rebuilding them per
+	// host made a single deactivation in a large network re-parse every
+	// inactive certificate once per peer.
+	ctx, err := sm.loadNetworkConfigContext(networkID)
+	if err != nil {
+		sm.logger.Warning("Failed to load network %s for regeneration: %v", networkID, err)
+		return
+	}
+
 	regenerated := 0
 	total := 0
 	for _, host := range hosts {
@@ -784,7 +794,7 @@ func (sm *Manager) regenerateNetworkHostConfigs(networkID, excludeHostID string)
 			continue
 		}
 		total++
-		if err := sm.generateHostConfig(host); err != nil {
+		if err := sm.generateHostConfigWith(host, ctx); err != nil {
 			sm.logger.Warning("Failed to regenerate config for host %s: %v", host.Id, err)
 			continue
 		}
@@ -918,11 +928,52 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 
 // generateHostConfig generates Nebula config for a host and updates the record.
 func (sm *Manager) generateHostConfig(record *core.Record) error {
-	// Get network
-	network, err := sm.app.FindRecordById(sm.options.NetworkCollectionName, record.GetString("network_id"))
+	ctx, err := sm.loadNetworkConfigContext(record.GetString("network_id"))
 	if err != nil {
-		return fmt.Errorf("%w: %v", types.ErrNetworkNotFound, err)
+		return err
 	}
+	return sm.generateHostConfigWith(record, ctx)
+}
+
+// networkConfigContext is the part of a host's config that is not about the
+// host at all: the trust bundle, the lighthouses, the relays and the revocation
+// list, every one of which is identical for every member of the network.
+//
+// WHY IT IS A TYPE AND NOT FIVE LOOKUPS PER HOST:
+// A fan-out regenerates every host in a network, and each one used to re-run
+// the same two record lookups and three queries -- and getBlocklist parses the
+// certificate of every inactive host, every time. Deactivating one host in a
+// 200-host network meant 200 identical blocklist builds. Nothing inside the
+// loop can change any of it: the loop writes config_yaml and nothing else.
+//
+// Loading it once also turns a missing network from N identical failures into
+// one, which is both cheaper and easier to read in a log.
+type networkConfigContext struct {
+	network     *core.Record
+	caBundle    string
+	lighthouses []types.LighthouseInfo
+	relays      []string
+	blocklist   []string
+}
+
+// loadNetworkConfigContext gathers everything a network's hosts render in
+// common.
+//
+// PARAMETERS:
+//   - networkID: the network to load
+//
+// RETURNS:
+//   - the context, or an error wrapping ErrNetworkNotFound if the network or its
+//     peers cannot be read
+//
+// SIDE EFFECTS: Logging only (reads).
+func (sm *Manager) loadNetworkConfigContext(networkID string) (*networkConfigContext, error) {
+	network, err := sm.app.FindRecordById(sm.options.NetworkCollectionName, networkID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", types.ErrNetworkNotFound, err)
+	}
+
+	ctx := &networkConfigContext{network: network}
 
 	// Trust bundle for pki.ca, read from the CA record on every generation.
 	// That is what makes rotation self-healing: any regeneration, for any
@@ -930,30 +981,29 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 	// recovering a partial one needs no re-signing. A lookup failure is not
 	// fatal -- fall back to the denormalized single certificate, matching the
 	// never-fatal discipline getBlocklist already follows.
-	bundle := ""
 	if ca, err := sm.app.FindRecordById(sm.options.CACollectionName, network.GetString("ca_id")); err == nil {
-		bundle = caBundle(ca)
+		ctx.caBundle = caBundle(ca)
 	} else {
 		sm.logger.Warning("Cannot load CA for network %s, falling back to the host's stored CA certificate: %v",
 			network.Id, err)
 	}
 
-	// Query lighthouses in this network
-	lighthouses, err := sm.getLighthouses(network.Id)
+	// Lighthouses peers discover each other through
+	ctx.lighthouses, err = sm.getLighthouses(network.Id)
 	if err != nil {
-		return fmt.Errorf("failed to get lighthouses: %w", err)
+		return nil, fmt.Errorf("failed to get lighthouses: %w", err)
 	}
 
-	// Relays this host can route through when it cannot hole-punch to a peer
-	relays, err := sm.getRelays(network.Id)
+	// Relays a host can route through when it cannot hole-punch to a peer
+	ctx.relays, err = sm.getRelays(network.Id)
 	if err != nil {
-		return fmt.Errorf("failed to get relays: %w", err)
+		return nil, fmt.Errorf("failed to get relays: %w", err)
 	}
 
 	// Certificate fingerprints this network refuses. Nebula has no CRL, so a
 	// deactivated host is only actually off the mesh once every peer config
 	// carries its fingerprint -- see getBlocklist.
-	blocklist, err := sm.getBlocklist(network.Id)
+	ctx.blocklist, err = sm.getBlocklist(network.Id)
 	if err != nil {
 		// Never fatal: a config without a blocklist is the config this library
 		// generated for years, and failing here would stop a host getting ANY
@@ -961,16 +1011,18 @@ func (sm *Manager) generateHostConfig(record *core.Record) error {
 		sm.logger.Warning("Failed to build revocation blocklist for network %s: %v", network.Id, err)
 	}
 
-	// Convert records to models
-	hostModel := sm.recordToHostModel(record)
+	return ctx, nil
+}
 
-	// Generate config (now uses host-level firewall rules)
+// generateHostConfigWith renders one host's config against an already-loaded
+// network context, and updates the record.
+func (sm *Manager) generateHostConfigWith(record *core.Record, ctx *networkConfigContext) error {
 	configYAML, err := sm.configGen.GenerateHostConfig(config.HostConfigInput{
-		Host:        hostModel,
-		Lighthouses: lighthouses,
-		Relays:      relays,
-		Blocklist:   blocklist,
-		CABundle:    bundle,
+		Host:        sm.recordToHostModel(record),
+		Lighthouses: ctx.lighthouses,
+		Relays:      ctx.relays,
+		Blocklist:   ctx.blocklist,
+		CABundle:    ctx.caBundle,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", types.ErrConfigGeneration, err)
