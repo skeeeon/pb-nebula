@@ -740,6 +740,26 @@ Returns sensible defaults:
 - Console logging: enabled
 - Standard collection names
 
+### HostCertNetworkIsStale
+
+```go
+func HostCertNetworkIsStale(certPEM, overlayIP, networkCIDR string) (bool, error)
+```
+
+Reports whether a host's certificate still carries a network that no longer
+matches the overlay it belongs to — the predicate behind the `/32` audit, so a
+console can badge the affected hosts and offer the fix beside them instead of
+leaving it in a server log.
+
+The comparison is exact rather than mask-only, so an edited `overlay_ip` counts
+as stale too. An empty `certPEM` returns `false` (a host mid-creation is not yet
+wrong). Skip inactive hosts: they are revoked, and re-signing one would publish
+a new fingerprint while the old certificate stayed valid.
+
+Fix a `true` by setting `renew = true` on the host record. Do not sweep a fleet
+with it unprompted — re-signing moves fingerprints, which rewrites every peer
+config in the network.
+
 ### Event Types
 
 ```go

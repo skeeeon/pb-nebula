@@ -196,6 +196,15 @@ Every `nebula-cert sign` example upstream uses the overlay mask (`-networks "192
 
 That restraint is the point. Re-signing moves a certificate's fingerprint, and a fingerprint is what `pki.blocklist` revokes, so a sweep that re-signed on its own would churn every fingerprint and every peer config in a fleet on the strength of a library upgrade. **Inactive hosts are excluded** for the usual reason: they are revoked, and re-signing one would publish a new fingerprint while the old certificate stayed valid. `cert.HostCertNetworkIsStale` is the predicate, compared exactly rather than mask-only so an edited `overlay_ip` counts too.
 
+`HostCertNetworkIsStale` is **re-exported from the root package** (`audit.go`)
+for the same reason the error sentinels are: a consumer with a console needs to
+badge the affected rows and offer the fix beside them, and a log line cannot do
+that. Re-deriving it caller-side would mean a second copy of what "matches"
+means, and a missing comparison is exactly how the /32 defect survived from the
+first commit. `audit_test.go` pins the wiring, because a re-export that
+swallowed its error would leave every consumer's badge dark with `internal/cert`
+still green.
+
 ### Host cert expiration is clamped
 `cert.Manager.GenerateHostCert` caps host cert `NotAfter` at the **parsed CA certificate's own `NotAfter`** — not the `expires_at` value stored in the DB. Cert timestamps have whole-second precision; a stored timestamp with sub-second precision can land fractionally after the real `NotAfter`, and `nebula/cert` then rejects the signing ("certificate expires after signing certificate"). Don't remove the clamp and don't reintroduce an external expiry source — `TestGenerateHostCertClampsToCAExpiry` guards this.
 
