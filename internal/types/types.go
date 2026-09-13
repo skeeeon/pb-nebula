@@ -124,6 +124,17 @@ type HostRecord struct {
 	UnsafeNetworks string `json:"unsafe_networks"` // JSON array of CIDRs this host may route for
 	UnsafeRoutes   string `json:"unsafe_routes"`   // JSON array of {route, via} this host sends into the tunnel
 
+	// PreferredRanges are UNDERLAY prefixes this host should favour when a peer
+	// advertises several addresses -- typically the LAN it sits on, so two
+	// hosts in the same rack use their private addresses instead of the public
+	// ones a lighthouse learned for them.
+	//
+	// This is a host column rather than a network one because it describes
+	// where the host physically is, not which overlay it belongs to. Two hosts
+	// in one pb-nebula network can sit in different datacenters, and two hosts
+	// in different networks can share a rack.
+	PreferredRanges string `json:"preferred_ranges"` // JSON array of underlay CIDRs to prefer
+
 	// Certificate validity
 	ValidityYears int       `json:"validity_years"` // Certificate validity period
 	ExpiresAt     time.Time `json:"expires_at"`     // Certificate expiration timestamp
@@ -396,6 +407,26 @@ func (h *HostRecord) SetFirewallRules(outbound, inbound []map[string]interface{}
 	}
 
 	return nil
+}
+
+// GetPreferredRanges parses the JSON preferred_ranges array into a string slice.
+//
+// Empty or "null" yields nil, so a host that expresses no preference renders no
+// preferred_ranges key at all.
+//
+// RETURNS:
+// - []string of underlay CIDRs, nil when unset
+// - error if the stored value is not a JSON array of strings
+func (h *HostRecord) GetPreferredRanges() ([]string, error) {
+	if h.PreferredRanges == "" || h.PreferredRanges == "null" {
+		return nil, nil
+	}
+
+	var ranges []string
+	if err := json.Unmarshal([]byte(h.PreferredRanges), &ranges); err != nil {
+		return nil, err
+	}
+	return ranges, nil
 }
 
 // GetUnsafeNetworks parses the JSON unsafe_networks array into a string slice.

@@ -521,3 +521,67 @@ func TestGenerateHostConfigSetsDisconnectInvalid(t *testing.T) {
 		t.Errorf("expected pki.disconnect_invalid true, got %v", pki["disconnect_invalid"])
 	}
 }
+
+// TestGenerateHostConfigPreferredRanges covers both directions of a setting
+// that is emitted only when the operator asks for it.
+//
+// The omission matters as much as the emission: every existing deployment has
+// no preference set, and a host that expresses none must render exactly the
+// config it always did rather than acquiring an empty key that shows up as a
+// diff in whatever ships these files.
+func TestGenerateHostConfigPreferredRanges(t *testing.T) {
+	g := NewGenerator()
+
+	t.Run("omitted when unset", func(t *testing.T) {
+		out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses()})
+		if err != nil {
+			t.Fatalf("GenerateHostConfig failed: %v", err)
+		}
+		if _, present := parseConfig(t, out)["preferred_ranges"]; present {
+			t.Error("expected preferred_ranges to be omitted when the host sets none")
+		}
+	})
+
+	t.Run("rendered in order when set", func(t *testing.T) {
+		host := testHost()
+		host.PreferredRanges = `["10.0.0.0/8","192.168.0.0/16"]`
+
+		out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()})
+		if err != nil {
+			t.Fatalf("GenerateHostConfig failed: %v", err)
+		}
+
+		raw, present := parseConfig(t, out)["preferred_ranges"]
+		if !present {
+			t.Fatal("expected preferred_ranges in the config")
+		}
+
+		got := raw.([]interface{})
+		want := []string{"10.0.0.0/8", "192.168.0.0/16"}
+		if len(got) != len(want) {
+			t.Fatalf("expected %d preferred ranges, got %v", len(want), got)
+		}
+		// Preserved as the operator wrote it. Nebula treats the list as a SET
+		// -- remote_list.go sorts on isPreferred(), a boolean membership test,
+		// not on position -- so order changes nothing at runtime. It is kept
+		// anyway because the value arrives as stored JSON rather than from an
+		// unordered query, so there is nothing to sort for and re-ordering it
+		// would only manufacture diffs. That is the opposite of getBlocklist
+		// and getRelays, which must sort precisely because their order is not
+		// guaranteed.
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("preferred_ranges[%d] = %v, want %s", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("malformed JSON is an error", func(t *testing.T) {
+		host := testHost()
+		host.PreferredRanges = `{"not":"an array"}`
+
+		if _, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()}); err == nil {
+			t.Error("expected an error for malformed preferred_ranges, got nil")
+		}
+	})
+}

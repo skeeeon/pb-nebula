@@ -69,6 +69,12 @@ type HostConfigInput struct {
 // - Lighthouse hosts: am_lighthouse=true, no static_host_map
 // - Regular hosts: am_lighthouse=false, static_host_map with lighthouse IPs
 //
+// PREFERRED RANGES:
+// Underlay prefixes this host favours when a peer advertises several addresses
+// -- typically the LAN it sits on, so two hosts in one rack use their private
+// addresses rather than the public ones a lighthouse learned. Omitted entirely
+// when the host expresses no preference.
+//
 // RELAY BEHAVIOR:
 // - Relay hosts: relay.am_relay=true and nothing else
 // - Other hosts: relay.relays listing the network's relays
@@ -214,6 +220,17 @@ func (g *Generator) GenerateHostConfig(in HostConfigInput) (string, error) {
 			"outbound": outbound,
 			"inbound":  inbound,
 		},
+	}
+
+	// Underlay addresses this host favours when a peer advertises several.
+	// Omitted when unset, so a host that expresses no preference renders the
+	// config it always did -- the same discipline as blocklist and relay.
+	preferredRanges, err := host.GetPreferredRanges()
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", types.ErrInvalidPreferredRange, err)
+	}
+	if len(preferredRanges) > 0 {
+		config["preferred_ranges"] = preferredRanges
 	}
 
 	// Lighthouses don't need a static_host_map (they are the discovery

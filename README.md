@@ -401,6 +401,14 @@ default and the real one disagree, the config says what it means. Revocation
 does not depend on it (a blocklisted certificate is disconnected regardless),
 but an expired certificate and a finished CA rotation both do.
 
+The blocklist is scoped to the **CA**, not the network — because that is where
+Nebula's trust boundary is. Every host carrying a CA in `pki.ca` will verify
+anything that CA signed, including hosts in a *different* pb-nebula network
+under the same CA. A network-scoped blocklist would revoke a host from its own
+peers and leave it verifiable by its siblings. So deactivating a host
+regenerates every config under its CA; lighthouse and relay changes stay
+network-scoped, since no host renders another network's lighthouses.
+
 An empty blocklist is **omitted** rather than written as an empty list, so a
 network with nothing revoked renders exactly the config it did before this
 feature. Fingerprints are sorted — unsorted, map iteration order would make
@@ -438,6 +446,38 @@ rather than defaulted-if-absent because by the time a hook sees the record,
 "field omitted" and "explicitly false" are indistinguishable; creating an
 already-revoked host is not a meaningful operation, and deactivation is an
 update.
+
+## Preferred Ranges
+
+`preferred_ranges` tells a host which **underlay** prefixes to favour when a peer
+advertises several addresses — typically the LAN it sits on, so two hosts in one
+rack use their private addresses rather than the public ones a lighthouse
+learned for them.
+
+```json
+{
+  "preferred_ranges": ["10.0.0.0/8", "192.168.0.0/16"]
+}
+```
+
+It is a **host** field, not a network one, because it describes where the host
+physically sits rather than which overlay it belongs to — two hosts in one
+network can be in different datacenters, and two hosts in different networks can
+share a rack. Config-only: changing it re-renders that host's `config_yaml` and
+nothing else.
+
+Validation rejects unparseable CIDRs, host bits (`172.16.0.5/24` — you meant
+`172.16.0.0/24`), duplicates, and more than 16 entries. That matters because
+Nebula's own failure mode is silence: it parses each entry and, on error, logs a
+warning and skips it, so a typo costs the host its preference while the tunnel
+still forms over the public path.
+
+**IPv6 is accepted here even though pb-nebula's overlay is IPv4-only** — these
+are underlay prefixes, and Nebula ranks IPv6 addresses in `preferred_ranges`
+highest of all. Overlapping entries are allowed: Nebula matches an address
+against the set, so a broad range plus a narrower one inside it is coherent.
+
+Omitted from the config entirely when unset.
 
 ## Firewall Rules
 

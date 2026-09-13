@@ -536,6 +536,14 @@ func hostFields() []core.Field {
 			MaxSize: 2000,
 		},
 
+		// Underlay prefixes to prefer when a peer advertises several
+		// addresses. A host column, not a network one: it describes where the
+		// host physically sits, not which overlay it belongs to.
+		&core.JSONField{
+			Name:    "preferred_ranges",
+			MaxSize: 1000,
+		},
+
 		// Certificate validity
 		&core.NumberField{
 			Name:    "validity_years",

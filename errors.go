@@ -30,12 +30,13 @@ var (
 	ErrIPv6NotSupported = types.ErrIPv6NotSupported
 
 	// Host errors - Host management
-	ErrInvalidIP            = types.ErrInvalidIP
-	ErrIPNotInNetwork       = types.ErrIPNotInNetwork
-	ErrLighthouseNoPublicIP = types.ErrLighthouseNoPublicIP
-	ErrRelayNoPublicIP      = types.ErrRelayNoPublicIP
-	ErrInvalidUnsafeNetwork = types.ErrInvalidUnsafeNetwork
-	ErrInvalidUnsafeRoute   = types.ErrInvalidUnsafeRoute
+	ErrInvalidIP             = types.ErrInvalidIP
+	ErrIPNotInNetwork        = types.ErrIPNotInNetwork
+	ErrLighthouseNoPublicIP  = types.ErrLighthouseNoPublicIP
+	ErrRelayNoPublicIP       = types.ErrRelayNoPublicIP
+	ErrInvalidUnsafeNetwork  = types.ErrInvalidUnsafeNetwork
+	ErrInvalidUnsafeRoute    = types.ErrInvalidUnsafeRoute
+	ErrInvalidPreferredRange = types.ErrInvalidPreferredRange
 
 	// Config errors - Configuration generation
 	ErrConfigGeneration = types.ErrConfigGeneration

@@ -356,3 +356,80 @@ func (m *Manager) networkCIDR(networkID string) (*net.IPNet, error) {
 func networksOverlap(a, b *net.IPNet) bool {
 	return a.Contains(b.IP) || b.Contains(a.IP)
 }
+
+// MaxPreferredRangesPerHost bounds how many underlay prefixes one host may
+// prefer. Config only, so the cost is local -- but a bound keeps one host from
+// bloating its own rendered config without limit, like MaxUnsafeRoutesPerHost.
+const MaxPreferredRangesPerHost = 16
+
+// ValidatePreferredRanges validates the UNDERLAY prefixes a host should favour
+// when a peer advertises several addresses.
+//
+// WHY THIS IS VALIDATED AT ALL:
+// Nebula parses these with netip.ParsePrefix and, on failure, logs a warning
+// and skips the entry (hostmap.go, reload). A typo therefore costs the host its
+// address preference silently -- the tunnel still forms, over the public path,
+// and the only symptom is traffic taking the slow route. Rejecting on write is
+// the only point at which that is visible.
+//
+// WHAT IS CHECKED:
+// - Each entry parses as a CIDR
+// - Canonical masked form: 172.16.0.0/24, never 172.16.0.5/24
+// - No duplicates
+// - At most MaxPreferredRangesPerHost entries
+//
+// IPv6 IS ALLOWED HERE, UNLIKE EVERYWHERE ELSE:
+// The rest of pb-nebula is IPv4-only, but that is a constraint on the OVERLAY.
+// These are underlay prefixes, and Nebula ranks "IPv6 in preferred_ranges" at
+// the very top of its address priority list -- refusing them would rule out the
+// case the feature is best at.
+//
+// NOT CHECKED, DELIBERATELY:
+// Any relationship to the overlay CIDR. A preferred range is an underlay
+// address space; overlapping the overlay is meaningless rather than wrong, and
+// there is no correct assertion to make about a network this library cannot
+// see. Overlaps BETWEEN entries are allowed too: Nebula treats the list as a
+// set of prefixes to match against, so a broad range plus a narrow one inside
+// it is a coherent thing to write.
+//
+// PARAMETERS:
+//   - cidrs: Underlay prefixes this host prefers
+//
+// RETURNS:
+// - nil if every prefix is valid
+// - error wrapping ErrInvalidPreferredRange otherwise
+//
+// SIDE EFFECTS: None (pure -- no network lookup is needed or possible).
+func ValidatePreferredRanges(cidrs []string) error {
+	if len(cidrs) == 0 {
+		return nil
+	}
+
+	if len(cidrs) > MaxPreferredRangesPerHost {
+		return fmt.Errorf("%w: at most %d allowed, got %d",
+			types.ErrInvalidPreferredRange, MaxPreferredRangesPerHost, len(cidrs))
+	}
+
+	seen := make(map[string]struct{}, len(cidrs))
+	for _, cidr := range cidrs {
+		ip, prefix, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return fmt.Errorf("%w: %s: %v", types.ErrInvalidPreferredRange, cidr, err)
+		}
+
+		// Host bits set means the operator was thinking of an address rather
+		// than a range. Nebula would mask it silently; say so instead.
+		if !ip.Equal(prefix.IP) {
+			return fmt.Errorf("%w: %s has host bits set, did you mean %s?",
+				types.ErrInvalidPreferredRange, cidr, prefix.String())
+		}
+
+		if _, dup := seen[prefix.String()]; dup {
+			return fmt.Errorf("%w: %s appears more than once",
+				types.ErrInvalidPreferredRange, prefix.String())
+		}
+		seen[prefix.String()] = struct{}{}
+	}
+
+	return nil
+}

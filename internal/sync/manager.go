@@ -328,6 +328,8 @@ var configFields = []string{
 	// The consumer half of gateway routing. No peer embeds another host's
 	// routes, so this one has no fan-out entry.
 	"unsafe_routes",
+	// Underlay preference: local to this host, so no fan-out either.
+	"preferred_ranges",
 }
 
 // changedFields returns the names of the fields that differ between the stored
@@ -753,6 +755,18 @@ func (sm *Manager) validateHostRecord(record *core.Record) error {
 			types.ErrInvalidUnsafeRoute, err)
 	}
 	if err := sm.ipamManager.ValidateUnsafeRoutes(unsafeRoutes, record.GetString("network_id")); err != nil {
+		return err
+	}
+
+	// Underlay preference. Purely local to this host -- no peer, network or
+	// certificate is involved -- so it is validated on its own.
+	hostModel.PreferredRanges = record.GetString("preferred_ranges")
+	preferredRanges, err := hostModel.GetPreferredRanges()
+	if err != nil {
+		return fmt.Errorf("%w: preferred_ranges must be a JSON array of CIDR strings: %v",
+			types.ErrInvalidPreferredRange, err)
+	}
+	if err := ipam.ValidatePreferredRanges(preferredRanges); err != nil {
 		return err
 	}
 
@@ -1252,5 +1266,6 @@ func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
 		FirewallInbound:  record.GetString("firewall_inbound"),
 		UnsafeNetworks:   record.GetString("unsafe_networks"),
 		UnsafeRoutes:     record.GetString("unsafe_routes"),
+		PreferredRanges:  record.GetString("preferred_ranges"),
 	}
 }
