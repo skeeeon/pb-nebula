@@ -427,6 +427,23 @@ not in the database cannot be blocklisted. **Deleting a host leaves its
 certificate valid until it expires.** Deletion is for hosts you are content to
 leave trusted.
 
+### An inactive host is never re-signed
+
+The blocklist is built from the certificate **stored** on each inactive host, so
+replacing that certificate would revoke one nobody holds and un-revoke the one
+the device still has. Nothing re-signs an inactive host:
+
+- **`renew = true` is refused** with an error wrapping `ErrHostInactive` (a 400
+  through the record API, with the reason in the message). Reactivate the host
+  instead: reactivation issues a new certificate by itself.
+- **Certificate-field edits are kept but not signed.** Renaming a decommissioned
+  host or freeing its `overlay_ip` is legitimate, so `hostname`, `overlay_ip`,
+  `groups`, `unsafe_networks` and `validity_years` still save; the certificate
+  stays as it was, and reactivation re-issues from the record as it then stands.
+  This includes a single save that deactivates a host *and* edits one of those
+  fields: the certificate revoked is the one the device holds.
+- The renewal cron and the CA rotation sweep skip inactive hosts.
+
 ### The config is not the delivery
 
 Regenerating `config_yaml` updates the database; it does not push anything to a

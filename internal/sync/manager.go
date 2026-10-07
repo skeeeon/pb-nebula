@@ -465,7 +465,29 @@ func (sm *Manager) setupHostHooks() {
 		if err := sm.validateHostRecord(e.Record); err != nil {
 			return badRequest(err)
 		}
+		if err := checkHostRenew(e.Record, e.Record.Original()); err != nil {
+			return badRequest(err)
+		}
 
+		return e.Next()
+	})
+
+	// The renew refusal again, at the MODEL layer, for the reason the CA
+	// rotation check is bound there too: the request hook above fires only for
+	// the record API, and a consumer setting renew from its own route calls
+	// app.Save(). This returns the RAW error so a Go caller can errors.Is it
+	// against ErrHostInactive.
+	//
+	// No isInternalSave guard, unlike the CA hook: every internal host save
+	// either leaves renew alone or has just reset it to false, so none of them
+	// can present the false -> true transition this refuses.
+	sm.app.OnRecordUpdate().BindFunc(func(e *core.RecordEvent) error {
+		if e.Record.Collection().Name != sm.options.HostCollectionName {
+			return e.Next()
+		}
+		if err := checkHostRenew(e.Record, e.Record.Original()); err != nil {
+			return err
+		}
 		return e.Next()
 	})
 
@@ -658,6 +680,31 @@ func (sm *Manager) setupHostHooks() {
 			needsCertRegeneration = true
 		}
 
+		// An INACTIVE host is never re-signed, whatever asked for it -- the same
+		// rule the renewal and rotation sweeps follow. Its revocation is the
+		// fingerprint of its STORED certificate, which getBlocklist reads on
+		// every rebuild; re-signing replaces that certificate, so the next
+		// rebuild revokes one nobody holds and drops the one the device does.
+		//
+		// Keyed on the state this save LEAVES, not the one it found, so a single
+		// save that deactivates a host and edits a certificate field revokes the
+		// certificate the device holds rather than a fresh one.
+		//
+		// renew never gets this far (checkHostRenew refuses it before the
+		// write); this catches the certificate-tier fields and validity_years.
+		// Those edits are kept, not refused -- renaming a decommissioned host
+		// or freeing its overlay IP is legitimate -- and take effect when the
+		// host is reactivated, since reactivation re-issues from the record as
+		// it then stands. Downgraded to a config refresh so a config-tier field
+		// changed in the same save, which the tier check above skipped while a
+		// re-sign was pending, is still rendered.
+		if needsCertRegeneration && !e.Record.GetBool("active") {
+			sm.logger.Warning("Host %s is inactive: not re-issuing its certificate, which its peers blocklist by fingerprint. The change is stored and takes effect on reactivation.",
+				e.Record.GetString("hostname"))
+			needsCertRegeneration = false
+			needsConfigRegeneration = true
+		}
+
 		if !needsCertRegeneration && !needsConfigRegeneration && !needsPeerFanOut {
 			// A renew flag that produced no regeneration still has to be cleared,
 			// or it stays set and fires again on the next unrelated edit.
@@ -735,6 +782,44 @@ func (sm *Manager) setupHostHooks() {
 
 		return e.Next()
 	})
+}
+
+// checkHostRenew refuses a renew request on a host that this save leaves
+// inactive.
+//
+// WHY REFUSE RATHER THAN SKIP:
+// renew has one purpose, re-issuing the certificate, and on an inactive host
+// that is exactly what must not happen (see the inactive-host gate in the
+// update hook). Skipping it and clearing the flag would answer the request with
+// a 200 and do nothing, leaving the admin to work out why the certificate did
+// not change. A refusal reaches them with the reason and the way forward, which
+// is reactivation -- it re-issues by itself.
+//
+// Keyed on the false -> true transition against original, the same edge the
+// update hook acts on, so the two agree on which saves are a renew request. A
+// level check would also refuse a save that merely carried a renew left set by
+// a failed regeneration -- including the deactivation that is the reason the
+// host is inactive at all.
+//
+// PARAMETERS:
+//   - record: the host as this save will store it
+//   - original: the host as last read (Record.Original())
+//
+// RETURNS:
+// - an error wrapping ErrHostInactive, or nil
+//
+// SIDE EFFECTS: None (pure).
+func checkHostRenew(record, original *core.Record) error {
+	if !record.GetBool("renew") || record.GetBool("active") {
+		return nil
+	}
+	if original != nil && original.GetBool("renew") {
+		return nil
+	}
+	return fmt.Errorf("%w: %s is inactive, so its certificate is revoked by fingerprint in every peer's pki.blocklist, "+
+		"and renewing it would replace that certificate and un-revoke the one the device still holds; "+
+		"reactivate the host instead, which issues a new certificate",
+		types.ErrHostInactive, record.GetString("hostname"))
 }
 
 // badRequest turns a validation error into a 400 whose message survives the
