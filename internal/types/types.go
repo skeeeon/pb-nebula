@@ -111,6 +111,26 @@ type HostRecord struct {
 	// peer config, so extra addresses on a relay are stored and unused.
 	AdditionalHostPorts string `json:"additional_host_ports"` // JSON array of further HOST:PORT endpoints
 
+	// AdvertiseAddrs are routable addresses this host REPORTS to the
+	// lighthouses, added to the ones Nebula discovers for itself.
+	//
+	// This is the complement of static_host_map, not a duplicate of it, and
+	// behind NAT both are needed. static_host_map is the BOOTSTRAP path: it is
+	// carried by peers and tells them where to find this host before any
+	// handshake. advertise_addrs is what this host SAYS ABOUT ITSELF once it is
+	// talking to a lighthouse. The case that needs both is cloud 1:1 NAT -- a
+	// host in AWS or GCP sees only its private 10.x address on the wire, so
+	// without this it reports the private one to every peer even while
+	// static_host_map correctly points them at the public one.
+	//
+	// Format is "ip:port", and a port of 0 means "use the real listening port",
+	// which is what makes it usable on a host with listen.port 0.
+	//
+	// This applies to ANY host, not only a lighthouse, and it is config-only:
+	// nothing about it reaches a peer's config, because the reporting happens
+	// at runtime over the mesh.
+	AdvertiseAddrs string `json:"advertise_addrs"` // JSON array of "ip:port" to report to lighthouses
+
 	// Per-host tun overrides. The zero value means "inherit the generator
 	// default" so an existing host renders exactly the config it always did.
 	MTU       int    `json:"mtu"`        // Overrides tun.mtu when > 0
@@ -509,6 +529,28 @@ func (h *HostRecord) LighthouseAddresses() ([]string, error) {
 
 	if len(addrs) == 0 {
 		return nil, nil
+	}
+	return addrs, nil
+}
+
+// GetAdvertiseAddrs parses the JSON advertise_addrs array into a string slice.
+// These are routable addresses this host REPORTS to the lighthouses, on top of
+// the ones Nebula discovers for itself.
+//
+// Empty or "null" yields nil, so a host that advertises nothing extra renders
+// no advertise_addrs key at all.
+//
+// RETURNS:
+// - []string of "ip:port" entries, nil when unset
+// - error if the stored value is not a JSON array of strings
+func (h *HostRecord) GetAdvertiseAddrs() ([]string, error) {
+	if h.AdvertiseAddrs == "" || h.AdvertiseAddrs == "null" {
+		return nil, nil
+	}
+
+	var addrs []string
+	if err := json.Unmarshal([]byte(h.AdvertiseAddrs), &addrs); err != nil {
+		return nil, err
 	}
 	return addrs, nil
 }

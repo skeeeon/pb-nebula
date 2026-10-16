@@ -67,8 +67,8 @@ Fields whose zero value means "inherit the default" (`mtu`, `tun_device`) rely o
 The update hook in `internal/sync/manager.go` (`setupHostHooks`) distinguishes what *has* to be regenerated:
 
 - **Cert regeneration (expensive)** when `hostname`, `overlay_ip`, `groups`, `unsafe_networks`, or `validity_years` change — these are embedded in the certificate.
-- **Config-only regeneration (cheap)** when `is_lighthouse`, `is_relay`, `public_host_port`, `additional_host_ports`, `firewall_outbound`, `firewall_inbound`, `mtu`, `tun_device`, `unsafe_routes`, or `preferred_ranges` change — these are config-only.
-- **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `additional_host_ports`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. The same applies to relays (`is_relay`, `active`, `overlay_ip` — but *not* `public_host_port`, since peers carry only a relay's overlay IP, not its endpoint). Fan-out also fires on active lighthouse/relay create and delete, and on network `cidr_range` change.
+- **Config-only regeneration (cheap)** when `is_lighthouse`, `is_relay`, `public_host_port`, `additional_host_ports`, `firewall_outbound`, `firewall_inbound`, `mtu`, `tun_device`, `unsafe_routes`, `preferred_ranges`, or `advertise_addrs` change — these are config-only.
+- **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `additional_host_ports`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. The same applies to relays (`is_relay`, `active`, `overlay_ip` — but *not* `public_host_port`, since peers carry only a relay's overlay IP, not its endpoint). Fan-out also fires on active lighthouse/relay create and delete, and on network `cidr_range` change. `advertise_addrs` is deliberately absent: a host reports it at runtime over the mesh rather than through any peer's config file.
 
   `regenerateNetworkHostConfigs` loads the network-level state — trust bundle, lighthouses, relays, blocklist — **once** into a `networkConfigContext` and reuses it for every host, because nothing in the loop can change any of it (the loop writes `config_yaml` and nothing else). Rebuilding it per host meant one deactivation in a 200-host network re-parsed every inactive certificate 200 times. Single-host callers still use `generateHostConfig`, which loads a context for one host; the shared renderer is `generateHostConfigWith`.
 
@@ -219,6 +219,18 @@ The scalar **stays the primary** and a second column, `additional_host_ports`, c
 `additional_host_ports` is in **both** the config-only tier and the lighthouse fan-out condition, which is the `is_relay` lesson applied in advance: every peer carries the whole list in its `static_host_map`, so a change has to reach them — and `regenerateNetworkHostConfigs` excludes the edited record, so without the config-tier entry the lighthouse's own config would be the one left stale.
 
 **Extra addresses on a relay are stored and unused.** A relay's endpoint is learned through the lighthouse at runtime and never embedded in a peer config, so only a lighthouse's list reaches anyone else. That is the same asymmetry that keeps `public_host_port` out of the relay fan-out condition.
+
+### `advertise_addrs` is what a host says about itself; `static_host_map` is what peers are told
+
+These two look like duplicates and are not, and **behind NAT both are needed**. `static_host_map` is the **bootstrap** path: it lives in every *other* host's config and is how a peer finds this one before any handshake. `lighthouse.advertise_addrs` is what this host **reports** about itself once it is talking to a lighthouse, added to the addresses Nebula discovered on its own interfaces.
+
+The case that needs both is cloud 1:1 NAT. A lighthouse in AWS or GCP sees only its private `10.x` address on the wire, so that is the address it reports to every peer that queries — while `static_host_map` is simultaneously, and correctly, pointing those peers at the public one. The peer ends up holding both and burning handshakes on the one that cannot work.
+
+Format is `"ip:port"`, and **a port of `0` means "use the real listening port"** (Nebula substitutes `lh.nebulaPort`), which is what makes the setting usable on a host with `listen.port: 0`. That one rule is the whole reason `ValidateAdvertiseAddrs` exists separately from `ValidatePublicHostPort`, which refuses `0` — a peer reading a `static_host_map` entry has to dial the value as written.
+
+**It applies to any host, not only a lighthouse**, so it is rendered in both branches of `buildLighthouseConfig`. Config-only tier, **no fan-out**: the reporting happens at runtime over the mesh, so nothing about it reaches a peer's config file.
+
+**Validated rather than warned about, unlike `preferred_ranges`.** Nebula skips an unparseable preferred range and carries on; `LightHouse.reload` returns a contextual error for an `advertise_addrs` entry it cannot split, resolve or read a port out of, and a config error at startup stops the process. A typo here does not cost a host an optimisation, it costs the host its next restart — which on an unattended edge is indistinguishable from the device being dead.
 
 ### Firewall rules are host-based, not network-based
 This mirrors Nebula's own design. `nebula_networks` has no firewall fields. Every host carries `firewall_outbound` and `firewall_inbound` as JSON arrays in Nebula's native format. The config generator (`internal/config/generator.go`) applies Nebula-recommended defaults (allow-all outbound, ICMP-only inbound) when a host's rules are empty.

@@ -382,6 +382,7 @@ func networkFields() []core.Field {
 // - Relations: network_id (foreign key)
 // - Generated: ca_certificate (denormalized), config_yaml (complete Nebula config)
 // - Lighthouse: is_lighthouse, public_host_port, additional_host_ports
+// - Underlay reporting: advertise_addrs
 // - Firewall: firewall_outbound, firewall_inbound (host-specific rules)
 //
 // FIREWALL RULES (HOST-BASED):
@@ -509,6 +510,19 @@ func hostFields() []core.Field {
 		// one-address deployment render byte-identical config.
 		&core.JSONField{
 			Name:    "additional_host_ports",
+			MaxSize: 1000,
+		},
+
+		// Addresses this host REPORTS to the lighthouses, on top of what
+		// Nebula discovers for itself. The complement of static_host_map, not
+		// a duplicate: behind cloud 1:1 NAT a host sees only its private
+		// address on the wire and would otherwise report that one to peers.
+		//
+		// A host column because it names where THIS host can be reached, which
+		// is an underlay fact about one machine -- the same test that puts
+		// preferred_ranges here rather than on nebula_networks.
+		&core.JSONField{
+			Name:    "advertise_addrs",
 			MaxSize: 1000,
 		},
 

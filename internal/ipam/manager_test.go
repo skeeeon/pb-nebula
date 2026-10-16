@@ -333,3 +333,43 @@ func TestValidateAdditionalHostPorts(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateAdvertiseAddrs pins the inverse rule: port 0 is MEANINGFUL here,
+// because Nebula substitutes the real listening port for it. Refusing it would
+// rule out the host this setting is best on -- one with listen.port 0.
+func TestValidateAdvertiseAddrs(t *testing.T) {
+	tests := []struct {
+		name    string
+		addrs   []string
+		wantErr bool
+	}{
+		{"unset", nil, false},
+		{"one address", []string{"203.0.113.9:4242"}, false},
+		{"port 0 means the real listening port", []string{"203.0.113.9:0"}, false},
+		{"bracketed IPv6", []string{"[2001:db8::1]:4242"}, false},
+		{"a DNS name", []string{"edge.example.com:4242"}, false},
+
+		{"no port", []string{"203.0.113.9"}, true},
+		{"unbracketed IPv6", []string{"2001:db8::1:4242"}, true},
+		{"non-numeric port", []string{"203.0.113.9:http"}, true},
+		{"port out of range", []string{"203.0.113.9:70000"}, true},
+		{"duplicate", []string{"203.0.113.9:0", "203.0.113.9:0"}, true},
+		{"over the bound", []string{
+			"1.2.3.4:1", "1.2.3.4:2", "1.2.3.4:3", "1.2.3.4:4", "1.2.3.4:5",
+			"1.2.3.4:6", "1.2.3.4:7", "1.2.3.4:8", "1.2.3.4:9",
+		}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateAdvertiseAddrs(tt.addrs)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateAdvertiseAddrs(%v) error = %v, wantErr %v", tt.addrs, err, tt.wantErr)
+			}
+			if err != nil && !errors.Is(err, types.ErrInvalidHostPort) {
+				t.Errorf("error does not wrap ErrInvalidHostPort: %v", err)
+			}
+		})
+	}
+}
+

@@ -752,3 +752,81 @@ func TestGenerateHostConfigSkipsALighthouseWithNoAddress(t *testing.T) {
 		t.Errorf("expected both lighthouses in lighthouse.hosts, got %v", hosts)
 	}
 }
+
+// TestGenerateHostConfigAdvertiseAddrs covers the complement of
+// static_host_map: what the host REPORTS about itself.
+//
+// The omission half matters as much as the emission half, for the reason given
+// on TestGenerateHostConfigPreferredRanges -- every existing host sets none.
+func TestGenerateHostConfigAdvertiseAddrs(t *testing.T) {
+	g := NewGenerator()
+
+	t.Run("omitted when unset", func(t *testing.T) {
+		out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses()})
+		if err != nil {
+			t.Fatalf("GenerateHostConfig failed: %v", err)
+		}
+		lh := parseConfig(t, out)["lighthouse"].(map[string]interface{})
+		if _, present := lh["advertise_addrs"]; present {
+			t.Error("expected advertise_addrs to be omitted when the host sets none")
+		}
+	})
+
+	t.Run("rendered in order when set", func(t *testing.T) {
+		host := testHost()
+		// The second entry is the port-0 form: Nebula substitutes the real
+		// listening port, which is what makes this usable with listen.port 0.
+		host.AdvertiseAddrs = `["203.0.113.9:4242","198.51.100.7:0"]`
+
+		out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()})
+		if err != nil {
+			t.Fatalf("GenerateHostConfig failed: %v", err)
+		}
+
+		lh := parseConfig(t, out)["lighthouse"].(map[string]interface{})
+		got := lh["advertise_addrs"].([]interface{})
+		want := []string{"203.0.113.9:4242", "198.51.100.7:0"}
+		if len(got) != len(want) {
+			t.Fatalf("expected %d advertise_addrs, got %v", len(want), got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("advertise_addrs[%d] = %v, want %s", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("rendered on a lighthouse too", func(t *testing.T) {
+		// This is the case that motivated the setting: a lighthouse behind
+		// cloud 1:1 NAT sees only its private address, so without this it
+		// reports 10.x to every peer even while static_host_map correctly
+		// bootstraps them to the public one.
+		host := testHost()
+		host.IsLighthouse = true
+		host.PublicHostPort = "203.0.113.9:4242"
+		host.AdvertiseAddrs = `["203.0.113.9:4242"]`
+
+		out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()})
+		if err != nil {
+			t.Fatalf("GenerateHostConfig failed: %v", err)
+		}
+
+		lh := parseConfig(t, out)["lighthouse"].(map[string]interface{})
+		if lh["am_lighthouse"] != true {
+			t.Error("expected am_lighthouse true")
+		}
+		if _, present := lh["advertise_addrs"]; !present {
+			t.Error("expected advertise_addrs on a lighthouse, which is the case this exists for")
+		}
+	})
+
+	t.Run("malformed JSON is an error", func(t *testing.T) {
+		host := testHost()
+		host.AdvertiseAddrs = `{"not":"an array"}`
+
+		if _, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()}); err == nil {
+			t.Error("expected an error for malformed advertise_addrs, got nil")
+		}
+	})
+}
+

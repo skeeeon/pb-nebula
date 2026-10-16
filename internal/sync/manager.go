@@ -371,6 +371,10 @@ var configFields = []string{
 	"unsafe_routes",
 	// Underlay preference: local to this host, so no fan-out either.
 	"preferred_ranges",
+	// What this host reports about itself. It reaches peers at RUNTIME, over
+	// the mesh, rather than through a peer's config file -- so there is no
+	// fan-out entry, for the same reason preferred_ranges has none.
+	"advertise_addrs",
 }
 
 // changedFields returns the names of the fields that differ between the stored
@@ -962,6 +966,19 @@ func (sm *Manager) validateHostRecord(record *core.Record) error {
 			types.ErrInvalidHostPort, err)
 	}
 	if err := ipam.ValidateAdditionalHostPorts(additionalHostPorts); err != nil {
+		return err
+	}
+
+	// What this host REPORTS about itself. Port 0 IS allowed here, and means
+	// "use the real listening port" -- the case that makes the setting usable
+	// on a host with listen.port 0.
+	hostModel.AdvertiseAddrs = record.GetString("advertise_addrs")
+	advertiseAddrs, err := hostModel.GetAdvertiseAddrs()
+	if err != nil {
+		return fmt.Errorf("%w: advertise_addrs must be a JSON array of \"ip:port\" strings: %v",
+			types.ErrInvalidHostPort, err)
+	}
+	if err := ipam.ValidateAdvertiseAddrs(advertiseAddrs); err != nil {
 		return err
 	}
 
@@ -1577,5 +1594,6 @@ func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
 		PreferredRanges:  record.GetString("preferred_ranges"),
 
 		AdditionalHostPorts: record.GetString("additional_host_ports"),
+		AdvertiseAddrs:      record.GetString("advertise_addrs"),
 	}
 }

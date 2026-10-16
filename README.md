@@ -154,6 +154,7 @@ Host configurations with PocketBase authentication.
 | is_lighthouse | bool | Is this a lighthouse? |
 | public_host_port | text | Public HOST:PORT (required if lighthouse or relay) |
 | additional_host_ports | json | Further endpoints peers can reach this host at — see [Lighthouse Addresses](#lighthouse-addresses) |
+| advertise_addrs | json | Addresses this host reports to the lighthouses, format `"ip:port"` with `0` meaning the real listening port |
 | certificate | text | PEM host certificate (auto-generated) |
 | private_key | text | PEM host private key (auto-generated) |
 | ca_certificate | text | PEM CA cert (denormalized) |
@@ -336,6 +337,7 @@ These fields are **only in the config** and don't require certificate regenerati
 | `is_lighthouse` | Regenerate config only | Config setting |
 | `public_host_port` | Regenerate config only | Config setting |
 | `additional_host_ports` | Regenerate config for **every host in the network** | Peers carry the whole address list in `static_host_map` |
+| `advertise_addrs` | Regenerate config only | Reported at runtime, so no peer config holds it |
 | `firewall_outbound` | Regenerate config only | Config setting |
 | `firewall_inbound` | Regenerate config only | Config setting |
 | `active` | Regenerate config for **every host in the network** | Revocation lives in each peer's `pki.blocklist` — see [Certificate Revocation](#certificate-revocation) |
@@ -544,6 +546,43 @@ extra addresses on a relay are stored and unused.
 
 Changing either column fans out to every host in the network, because every one
 of them carries the list.
+
+## Advertising a Host's Own Addresses
+
+`advertise_addrs` is the complement of `static_host_map`, not a duplicate of it,
+and **behind NAT both are needed**:
+
+- `static_host_map` is the **bootstrap** path. It lives in every *other* host's
+  config and is how a peer finds this one before any handshake.
+- `advertise_addrs` is what this host **reports about itself** once it is
+  talking to a lighthouse — routable addresses added to the ones Nebula
+  discovers on its own interfaces.
+
+It applies to **any** host, not only a lighthouse, and it is config-only:
+changing it re-renders that host's `config_yaml` and nothing else.
+
+```json
+{
+  "advertise_addrs": ["198.51.100.10:4242", "203.0.113.7:0"]
+}
+```
+
+The case this exists for is **cloud 1:1 NAT**: a host in AWS or GCP sees only
+its private `10.x` address on the wire, so that is the address it reports to
+every peer that queries — while `static_host_map` is simultaneously, and
+correctly, pointing those peers at the public one.
+
+Format is `"ip:port"`, and **a port of `0` means "use the real listening
+port"**, which is what makes this usable on a host with `listen.port: 0`. That
+is the one rule where it differs from `additional_host_ports`.
+
+A DNS name is accepted, but Nebula resolves this column **once, at startup**
+(unlike `static_host_map`, which re-resolves on a cadence), so a name is a
+weaker choice here.
+
+Entries are validated rather than merely warned about, because **Nebula refuses
+to start** on one it cannot parse — a typo costs the host its next restart, not
+just an optimisation.
 
 ## Firewall Rules
 

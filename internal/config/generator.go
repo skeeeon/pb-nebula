@@ -74,6 +74,16 @@ type HostConfigInput struct {
 // dual-stack, sit behind two internet paths, or be reached at a LAN address by
 // the peers in its own rack.
 //
+// REPORTING VERSUS BOOTSTRAPPING (advertise_addrs):
+// static_host_map is what every OTHER host carries about this one; it is the
+// path peers dial before any handshake. advertise_addrs is what this host says
+// about ITSELF once it is talking to a lighthouse, and it applies to any host
+// rather than only a lighthouse. It adds routable addresses Nebula cannot
+// discover on its own: behind cloud 1:1 NAT it is the difference between
+// reporting a private 10.x address to every peer and reporting the public one,
+// even while static_host_map already points peers at the public address.
+// Omitted entirely when unset.
+//
 // PREFERRED RANGES:
 // Underlay prefixes this host favours when a peer advertises several addresses
 // -- typically the LAN it sits on, so two hosts in one rack use their private
@@ -204,10 +214,25 @@ func (g *Generator) GenerateHostConfig(in HostConfigInput) (string, error) {
 		tun["unsafe_routes"] = entries
 	}
 
+	// What this host reports about ITSELF, as opposed to what peers are told
+	// about it in static_host_map. Both are needed behind NAT: one is the
+	// bootstrap path peers dial, the other is the address this host names when
+	// a lighthouse asks. Omitted when unset, so a host that sets none renders
+	// exactly the lighthouse section it always did.
+	lighthouse := g.buildLighthouseConfig(lighthouses, host.IsLighthouse)
+
+	advertiseAddrs, err := host.GetAdvertiseAddrs()
+	if err != nil {
+		return "", fmt.Errorf("%w: advertise_addrs: %v", types.ErrInvalidHostPort, err)
+	}
+	if len(advertiseAddrs) > 0 {
+		lighthouse["advertise_addrs"] = advertiseAddrs
+	}
+
 	// Build config structure
 	config := map[string]interface{}{
 		"pki":        pki,
-		"lighthouse": g.buildLighthouseConfig(lighthouses, host.IsLighthouse),
+		"lighthouse": lighthouse,
 		"listen": map[string]interface{}{
 			"host": "0.0.0.0",
 			"port": g.extractPort(host.PublicHostPort, host.IsLighthouse, host.IsRelay),

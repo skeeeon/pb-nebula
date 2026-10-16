@@ -555,12 +555,18 @@ func isPlausibleDNSName(host string) bool {
 	return strings.TrimLeft(last, "0123456789") != ""
 }
 
-// MaxAdditionalHostPortsPerHost bounds a list that is cheap individually and
-// unbounded in aggregate: every entry is copied into the static_host_map of
-// EVERY host in the network, so one lighthouse with a long list inflates every
-// config. Generous for the cases that motivated it -- dual-stack is two, two
-// internet paths plus a LAN address is three.
-const MaxAdditionalHostPortsPerHost = 8
+// MaxAdditionalHostPortsPerHost and MaxAdvertiseAddrsPerHost bound two lists
+// that are cheap individually and unbounded in aggregate.
+//
+// Additional host ports are the costlier of the two: every entry is copied
+// into the static_host_map of EVERY host in the network, so one lighthouse
+// with a long list inflates every config. Advertise addrs are local to the
+// host that sets them. Both are generous for the cases that motivated them --
+// dual-stack is two, two internet paths plus a LAN address is three.
+const (
+	MaxAdditionalHostPortsPerHost = 8
+	MaxAdvertiseAddrsPerHost      = 8
+)
 
 // ValidateAdditionalHostPorts validates the FURTHER underlay endpoints a host
 // can be reached at, beyond public_host_port.
@@ -611,6 +617,85 @@ func ValidateAdditionalHostPorts(addrs []string) error {
 		if _, dup := seen[addr]; dup {
 			return fmt.Errorf("%w: additional_host_ports lists %q more than once",
 				types.ErrInvalidHostPort, addr)
+		}
+		seen[addr] = struct{}{}
+	}
+
+	return nil
+}
+
+// ValidateAdvertiseAddrs validates the routable addresses a host REPORTS to
+// the lighthouses, on top of the ones Nebula discovers for itself.
+//
+// WHY THIS IS VALIDATED WHERE preferred_ranges IS ONLY WARNED ABOUT:
+// Nebula skips an unparseable preferred range and carries on. It does NOT do
+// that here: LightHouse.reload returns a contextual error for an entry it
+// cannot split, resolve, or parse a port out of, and a config error at startup
+// stops the process. So a typo in this column does not cost a host an
+// optimisation, it costs the host its next restart -- which on an unattended
+// edge is indistinguishable from the device being dead.
+//
+// PORT 0 IS ALLOWED HERE, UNLIKE EVERYWHERE ELSE:
+// Nebula substitutes the real listening port for a 0 (lighthouse.go), which is
+// the whole point of the setting on a host with listen.port 0 -- it can name
+// the address it is reachable at without knowing the port it will get. That is
+// the opposite of static_host_map, where a peer has to dial the value as
+// written, so the two validators differ on exactly this one rule.
+//
+// A HOSTNAME IS ACCEPTED because Nebula resolves the host half with
+// net.DefaultResolver when it is not an IP literal. It resolves ONCE, at
+// startup, unlike static_host_map's re-resolving goroutine, so a name is a
+// less good idea in this column -- but it is not an error, and refusing it
+// would rule out a deployment that has a stable name and a moving address.
+//
+// PARAMETERS:
+//   - addrs: the parsed advertise_addrs entries, possibly empty
+//
+// RETURNS:
+// - nil if every entry is well-formed and distinct
+// - error wrapping ErrInvalidHostPort otherwise
+//
+// SIDE EFFECTS: None (pure -- no name is resolved).
+func ValidateAdvertiseAddrs(addrs []string) error {
+	if len(addrs) == 0 {
+		return nil
+	}
+
+	if len(addrs) > MaxAdvertiseAddrsPerHost {
+		return fmt.Errorf("%w: advertise_addrs allows at most %d entries, got %d",
+			types.ErrInvalidHostPort, MaxAdvertiseAddrsPerHost, len(addrs))
+	}
+
+	seen := make(map[string]struct{}, len(addrs))
+	for _, addr := range addrs {
+		host, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			return fmt.Errorf("%w: advertise_addrs %q: expected ip:port, with an IPv6 address bracketed as [2001:db8::1]:4242: %v",
+				types.ErrInvalidHostPort, addr, err)
+		}
+
+		if host == "" {
+			return fmt.Errorf("%w: advertise_addrs %q has no host part", types.ErrInvalidHostPort, addr)
+		}
+
+		if net.ParseIP(host) == nil && !isPlausibleDNSName(host) {
+			return fmt.Errorf("%w: advertise_addrs %q is neither an IP address nor a DNS name",
+				types.ErrInvalidHostPort, host)
+		}
+
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return fmt.Errorf("%w: advertise_addrs %q: port must be a number", types.ErrInvalidHostPort, addr)
+		}
+
+		// 0 means "use the real listening port" and is the reason this
+		// validator exists separately from ValidatePublicHostPort.
+		if port < 0 || port > 65535 {
+			return fmt.Errorf("%w: advertise_addrs port %d is outside 0-65535", types.ErrInvalidHostPort, port)
+		}
+
+		if _, dup := seen[addr]; dup {
+			return fmt.Errorf("%w: advertise_addrs lists %q more than once", types.ErrInvalidHostPort, addr)
 		}
 		seen[addr] = struct{}{}
 	}
