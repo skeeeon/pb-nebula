@@ -67,8 +67,8 @@ Fields whose zero value means "inherit the default" (`mtu`, `tun_device`) rely o
 The update hook in `internal/sync/manager.go` (`setupHostHooks`) distinguishes what *has* to be regenerated:
 
 - **Cert regeneration (expensive)** when `hostname`, `overlay_ip`, `groups`, `unsafe_networks`, or `validity_years` change — these are embedded in the certificate.
-- **Config-only regeneration (cheap)** when `is_lighthouse`, `is_relay`, `public_host_port`, `additional_host_ports`, `firewall_outbound`, `firewall_inbound`, `mtu`, `tun_device`, `unsafe_routes`, `preferred_ranges`, or `advertise_addrs` change — these are config-only.
-- **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `additional_host_ports`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. The same applies to relays (`is_relay`, `active`, `overlay_ip` — but *not* `public_host_port`, since peers carry only a relay's overlay IP, not its endpoint). Fan-out also fires on active lighthouse/relay create and delete, and on network `cidr_range` change. `advertise_addrs` is deliberately absent: a host reports it at runtime over the mesh rather than through any peer's config file.
+- **Config-only regeneration (cheap)** when `is_lighthouse`, `is_relay`, `public_host_port`, `additional_host_ports`, `firewall_outbound`, `firewall_inbound`, `mtu`, `tun_device`, `unsafe_routes`, `preferred_ranges`, `advertise_addrs`, or `local_allow_list` change — these are config-only.
+- **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `additional_host_ports`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. The same applies to relays (`is_relay`, `active`, `overlay_ip` — but *not* `public_host_port`, since peers carry only a relay's overlay IP, not its endpoint). Fan-out also fires on active lighthouse/relay create and delete, and on network `cidr_range` change. `advertise_addrs` and `local_allow_list` are deliberately absent: a host reports those at runtime over the mesh rather than through any peer's config file.
 
   `regenerateNetworkHostConfigs` loads the network-level state — trust bundle, lighthouses, relays, blocklist — **once** into a `networkConfigContext` and reuses it for every host, because nothing in the loop can change any of it (the loop writes `config_yaml` and nothing else). Rebuilding it per host meant one deactivation in a 200-host network re-parsed every inactive certificate 200 times. Single-host callers still use `generateHostConfig`, which loads a context for one host; the shared renderer is `generateHostConfigWith`.
 
@@ -231,6 +231,26 @@ Format is `"ip:port"`, and **a port of `0` means "use the real listening port"**
 **It applies to any host, not only a lighthouse**, so it is rendered in both branches of `buildLighthouseConfig`. Config-only tier, **no fan-out**: the reporting happens at runtime over the mesh, so nothing about it reaches a peer's config file.
 
 **Validated rather than warned about, unlike `preferred_ranges`.** Nebula skips an unparseable preferred range and carries on; `LightHouse.reload` returns a contextual error for an `advertise_addrs` entry it cannot split, resolve or read a port out of, and a config error at startup stops the process. A typo here does not cost a host an optimisation, it costs the host its next restart — which on an unattended edge is indistinguishable from the device being dead.
+
+### `local_allow_list` exists because the platform's edges run in containers
+
+Without it a host advertises **every** local interface address to the lighthouse: `docker0` at `172.17.0.1`, VM bridges, other tun devices. Peers then attempt handshakes against those and wait out a timeout each, so the symptom is slow tunnel establishment rather than anything that logs as an error. Nebula's own reference config uses blocking `tun0` and all docker interfaces as its example, which says how routine this is. The platform's edge agents run in containers, so it is a fair bet this is already happening in production.
+
+The value is Nebula's own structure, stored as a JSON object and **rendered verbatim**: an optional `interfaces` sub-map of regex-to-bool matched against interface *names*, plus CIDR-to-bool entries matched against addresses. It is a generic map rather than a typed struct because the CIDR keys are data, not field names.
+
+**`ValidateLocalAllowList` restates Nebula's acceptance rules, and that is not belt-and-braces.** `newAllowList` (`allow_list.go`) *refuses to start* on a list it cannot make sense of rather than skipping the bad entry, so the choice is a 400 at the API or an edge that does not come back from its next restart. Three constraints:
+
+- every value is a bool, and every key that is not `interfaces` is a CIDR
+- the interface rules must all carry the same true/false value
+- if the CIDR rules of one address family mix true and false, that family needs an explicit default — `0.0.0.0/0` for v4, `::/0` for v6
+
+The third is the one nobody expects: Nebula infers the default as the *inverse* of the rules when they agree and refuses outright when they do not. So blocking `172.17.0.0/16` alone is fine and allowing `10.0.0.0/8` alone is fine, but doing both at once without a default is a startup error. The two families are judged independently, exactly as Nebula judges them.
+
+**Host bits are allowed here**, unlike `preferred_ranges`. Nebula masks the prefix itself, and a single-address rule written `172.17.0.1/32` is an ordinary thing to want; the `preferred_ranges` check refuses host bits because there a masked value silently means something broader than what was written.
+
+Host column and config-only, **no fan-out**, for the `preferred_ranges` reason: it describes the machine's own interfaces, which the overlay knows nothing about.
+
+**`remote_allow_list` is deliberately left out.** It is the inverse filter — which remote IPs this node will handshake *to* — and it would share this validator and this column shape, so adding it later is one column and no new concepts. It is out for now because nothing has asked for it, while `local_allow_list` fixes a defect that is probably live: a container advertising `docker0` is happening today, whereas refusing to handshake to a remote range is a tuning decision somebody has to want.
 
 ### Firewall rules are host-based, not network-based
 This mirrors Nebula's own design. `nebula_networks` has no firewall fields. Every host carries `firewall_outbound` and `firewall_inbound` as JSON arrays in Nebula's native format. The config generator (`internal/config/generator.go`) applies Nebula-recommended defaults (allow-all outbound, ICMP-only inbound) when a host's rules are empty.

@@ -373,3 +373,106 @@ func TestValidateAdvertiseAddrs(t *testing.T) {
 	}
 }
 
+// TestValidateLocalAllowList restates Nebula's own acceptance rules, because
+// Nebula REFUSES TO START on a list it cannot make sense of rather than
+// skipping the bad entry. Every case below is the difference between a 400 at
+// the API and an unattended edge that does not come back from its next restart.
+func TestValidateLocalAllowList(t *testing.T) {
+	tests := []struct {
+		name      string
+		allowList map[string]interface{}
+		wantErr   bool
+	}{
+		{"unset", nil, false},
+		{"empty", map[string]interface{}{}, false},
+
+		{
+			// Nebula's own example from examples/config.yml.
+			name: "block tun0 and docker",
+			allowList: map[string]interface{}{
+				"interfaces": map[string]interface{}{"tun0": false, "docker.*": false},
+			},
+		},
+		{
+			name:      "a single deny rule, default inferred as allow",
+			allowList: map[string]interface{}{"172.17.0.0/16": false},
+		},
+		{
+			name:      "a single allow rule, default inferred as deny",
+			allowList: map[string]interface{}{"10.0.0.0/8": true},
+		},
+		{
+			name: "mixed rules WITH the required default",
+			allowList: map[string]interface{}{
+				"0.0.0.0/0": true, "10.0.0.0/8": false, "10.42.42.0/24": true,
+			},
+		},
+		{
+			// Each family is judged on its own, so v4 rules that agree are
+			// fine alongside v6 rules that agree differently.
+			name: "families are independent",
+			allowList: map[string]interface{}{
+				"172.17.0.0/16": false, "2001:db8::/32": true,
+			},
+		},
+		{
+			name:      "host bits are fine here, unlike preferred_ranges",
+			allowList: map[string]interface{}{"172.17.0.1/32": false},
+		},
+
+		{
+			// The constraint nobody expects: Nebula infers the default as the
+			// inverse when the rules agree and refuses outright when they do
+			// not.
+			name:      "mixed IPv4 rules with no default",
+			allowList: map[string]interface{}{"10.0.0.0/8": true, "172.17.0.0/16": false},
+			wantErr:   true,
+		},
+		{
+			name:      "mixed IPv6 rules with no default",
+			allowList: map[string]interface{}{"2001:db8::/32": true, "fd00::/8": false},
+			wantErr:   true,
+		},
+		{
+			name: "interface rules that disagree",
+			allowList: map[string]interface{}{
+				"interfaces": map[string]interface{}{"tun0": false, "eth0": true},
+			},
+			wantErr: true,
+		},
+		{
+			name: "an interface pattern that will not compile",
+			allowList: map[string]interface{}{
+				"interfaces": map[string]interface{}{"docker(": false},
+			},
+			wantErr: true,
+		},
+		{
+			name:      "a key that is neither interfaces nor a CIDR",
+			allowList: map[string]interface{}{"eth0": false},
+			wantErr:   true,
+		},
+		{
+			name:      "a non-bool value",
+			allowList: map[string]interface{}{"10.0.0.0/8": "yes"},
+			wantErr:   true,
+		},
+		{
+			name:      "interfaces that is not an object",
+			allowList: map[string]interface{}{"interfaces": "tun0"},
+			wantErr:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateLocalAllowList(tt.allowList)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateLocalAllowList(%v) error = %v, wantErr %v", tt.allowList, err, tt.wantErr)
+			}
+			if err != nil && !errors.Is(err, types.ErrInvalidAllowList) {
+				t.Errorf("error does not wrap ErrInvalidAllowList: %v", err)
+			}
+		})
+	}
+}

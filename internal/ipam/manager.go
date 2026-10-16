@@ -4,6 +4,8 @@ package ipam
 import (
 	"fmt"
 	"net"
+	"net/netip"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -568,6 +570,12 @@ const (
 	MaxAdvertiseAddrsPerHost      = 8
 )
 
+// MaxLocalAllowListEntries bounds the combined CIDR and interface rules of one
+// host's local_allow_list. Nebula builds a prefix table and a regex list from
+// them at startup, and this is config-only, so the bound exists to keep one
+// record from bloating its own config rather than to protect anything.
+const MaxLocalAllowListEntries = 32
+
 // ValidateAdditionalHostPorts validates the FURTHER underlay endpoints a host
 // can be reached at, beyond public_host_port.
 //
@@ -698,6 +706,151 @@ func ValidateAdvertiseAddrs(addrs []string) error {
 			return fmt.Errorf("%w: advertise_addrs lists %q more than once", types.ErrInvalidHostPort, addr)
 		}
 		seen[addr] = struct{}{}
+	}
+
+	return nil
+}
+
+// ValidateLocalAllowList validates the filter deciding which of a host's own
+// interface addresses it advertises to the lighthouses.
+//
+// WHY A HOST NEEDS ONE AT ALL:
+// Nebula's default is to advertise every local address. On a containerised
+// host that includes docker0 at 172.17.0.1, every VM bridge, and any other tun
+// device -- addresses that are either unroutable from a peer or, worse,
+// collide with the same private range on the peer's own machine. The peer
+// tries them and waits out a handshake timeout each, so the symptom is slow
+// tunnel establishment rather than an error anybody can see.
+//
+// WHY THE RULES ARE NEBULA'S AND NOT A SIMPLIFICATION:
+// newAllowList (allow_list.go) REFUSES to start on a list it cannot make sense
+// of, rather than warning and skipping. Restating its three constraints here
+// is the only way an operator finds out at the API instead of on the next
+// restart of an unattended device:
+//
+//   - every value is a bool, and every key that is not "interfaces" is a CIDR
+//   - the interface rules must all carry the same true/false value
+//   - if the CIDR rules of one address family mix true and false, that family
+//     needs an explicit default: 0.0.0.0/0 for v4, ::/0 for v6
+//
+// The third is the one nobody expects. Nebula infers the default as the
+// inverse of the rules when they agree and refuses when they do not, so
+// blocking 172.17.0.0/16 alone is fine, allowing 10.0.0.0/8 alone is fine, and
+// doing both at once without a default is a startup error.
+//
+// HOST BITS ARE ALLOWED, UNLIKE preferred_ranges:
+// Nebula masks the prefix itself here (netip.PrefixFrom on the parsed value),
+// and a single-address rule written as 172.17.0.1/32 is an ordinary thing to
+// want. The preferred_ranges check refuses host bits because a masked value
+// there silently means something broader than what was written.
+//
+// PARAMETERS:
+//   - allowList: the parsed local_allow_list object, nil when unset
+//
+// RETURNS:
+// - nil if the structure is one Nebula will accept
+// - error wrapping ErrInvalidAllowList otherwise
+//
+// SIDE EFFECTS: None (pure).
+func ValidateLocalAllowList(allowList map[string]interface{}) error {
+	if len(allowList) == 0 {
+		return nil
+	}
+
+	entries := 0
+
+	// Tracks, per address family, whether the CIDR rules so far agree and
+	// whether an explicit default was given. Mirrors allowListRules in
+	// Nebula's allow_list.go, which is the code that has to accept this.
+	type familyRules struct {
+		seenAny    bool
+		allValue   bool
+		allAgree   bool
+		defaultSet bool
+	}
+	v4 := &familyRules{allAgree: true}
+	v6 := &familyRules{allAgree: true}
+
+	for key, raw := range allowList {
+		if key == "interfaces" {
+			ifaces, ok := raw.(map[string]interface{})
+			if !ok {
+				return fmt.Errorf("%w: local_allow_list.interfaces must be an object mapping an interface-name pattern to true or false",
+					types.ErrInvalidAllowList)
+			}
+
+			var firstValue bool
+			first := true
+			for name, rawAllow := range ifaces {
+				entries++
+
+				allow, ok := rawAllow.(bool)
+				if !ok {
+					return fmt.Errorf("%w: local_allow_list.interfaces[%q] must be true or false",
+						types.ErrInvalidAllowList, name)
+				}
+
+				// Nebula anchors the pattern, so an operator writing
+				// "docker.*" gets ^docker.*$ and a pattern that will not
+				// compile is a startup error. Compile the anchored form it
+				// will actually use, not the one that was typed.
+				if _, err := regexp.Compile("^" + name + "$"); err != nil {
+					return fmt.Errorf("%w: local_allow_list.interfaces[%q] is not a valid regular expression: %v",
+						types.ErrInvalidAllowList, name, err)
+				}
+
+				if first {
+					firstValue = allow
+					first = false
+				} else if allow != firstValue {
+					return fmt.Errorf("%w: local_allow_list.interfaces rules must all be true or all be false; Nebula takes the default as the inverse and refuses a mix",
+						types.ErrInvalidAllowList)
+				}
+			}
+			continue
+		}
+
+		entries++
+
+		allow, ok := raw.(bool)
+		if !ok {
+			return fmt.Errorf("%w: local_allow_list[%q] must be true or false",
+				types.ErrInvalidAllowList, key)
+		}
+
+		prefix, err := netip.ParsePrefix(key)
+		if err != nil {
+			return fmt.Errorf("%w: local_allow_list key %q is neither \"interfaces\" nor a CIDR: %v",
+				types.ErrInvalidAllowList, key, err)
+		}
+
+		family := v6
+		if prefix.Addr().Unmap().Is4() {
+			family = v4
+		}
+		if !family.seenAny {
+			family.allValue = allow
+			family.seenAny = true
+		} else if allow != family.allValue {
+			family.allAgree = false
+		}
+		if prefix.Bits() == 0 {
+			family.defaultSet = true
+		}
+	}
+
+	if entries > MaxLocalAllowListEntries {
+		return fmt.Errorf("%w: local_allow_list allows at most %d rules, got %d",
+			types.ErrInvalidAllowList, MaxLocalAllowListEntries, entries)
+	}
+
+	if v4.seenAny && !v4.allAgree && !v4.defaultSet {
+		return fmt.Errorf("%w: local_allow_list mixes allow and deny rules for IPv4 without a default; add \"0.0.0.0/0\"",
+			types.ErrInvalidAllowList)
+	}
+	if v6.seenAny && !v6.allAgree && !v6.defaultSet {
+		return fmt.Errorf("%w: local_allow_list mixes allow and deny rules for IPv6 without a default; add \"::/0\"",
+			types.ErrInvalidAllowList)
 	}
 
 	return nil

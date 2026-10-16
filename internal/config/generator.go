@@ -74,15 +74,21 @@ type HostConfigInput struct {
 // dual-stack, sit behind two internet paths, or be reached at a LAN address by
 // the peers in its own rack.
 //
-// REPORTING VERSUS BOOTSTRAPPING (advertise_addrs):
+// REPORTING VERSUS BOOTSTRAPPING (advertise_addrs, local_allow_list):
 // static_host_map is what every OTHER host carries about this one; it is the
-// path peers dial before any handshake. advertise_addrs is what this host says
-// about ITSELF once it is talking to a lighthouse, and it applies to any host
-// rather than only a lighthouse. It adds routable addresses Nebula cannot
-// discover on its own: behind cloud 1:1 NAT it is the difference between
-// reporting a private 10.x address to every peer and reporting the public one,
-// even while static_host_map already points peers at the public address.
-// Omitted entirely when unset.
+// path peers dial before any handshake. These two are what this host says
+// about ITSELF once it is talking to a lighthouse, and they apply to any host
+// rather than only a lighthouse:
+//
+//   - advertise_addrs adds routable addresses Nebula cannot discover on its
+//     own. Behind cloud 1:1 NAT it is the difference between reporting a
+//     private 10.x address to every peer and reporting the public one, even
+//     while static_host_map already points peers at the public address.
+//   - local_allow_list filters which of this host's own interface addresses it
+//     reports. Without it a container advertises docker0 and every bridge, and
+//     peers then burn a handshake timeout per unreachable address.
+//
+// Both are omitted entirely when unset.
 //
 // PREFERRED RANGES:
 // Underlay prefixes this host favours when a peer advertises several addresses
@@ -215,10 +221,10 @@ func (g *Generator) GenerateHostConfig(in HostConfigInput) (string, error) {
 	}
 
 	// What this host reports about ITSELF, as opposed to what peers are told
-	// about it in static_host_map. Both are needed behind NAT: one is the
-	// bootstrap path peers dial, the other is the address this host names when
-	// a lighthouse asks. Omitted when unset, so a host that sets none renders
-	// exactly the lighthouse section it always did.
+	// about it in static_host_map. Both sections are needed behind NAT: one is
+	// the bootstrap path peers dial, the other is the address this host names
+	// when a lighthouse asks. Each is omitted when unset, so a host that sets
+	// neither renders exactly the lighthouse section it always did.
 	lighthouse := g.buildLighthouseConfig(lighthouses, host.IsLighthouse)
 
 	advertiseAddrs, err := host.GetAdvertiseAddrs()
@@ -227,6 +233,14 @@ func (g *Generator) GenerateHostConfig(in HostConfigInput) (string, error) {
 	}
 	if len(advertiseAddrs) > 0 {
 		lighthouse["advertise_addrs"] = advertiseAddrs
+	}
+
+	localAllowList, err := host.GetLocalAllowList()
+	if err != nil {
+		return "", fmt.Errorf("%w: local_allow_list: %v", types.ErrInvalidAllowList, err)
+	}
+	if len(localAllowList) > 0 {
+		lighthouse["local_allow_list"] = localAllowList
 	}
 
 	// Build config structure

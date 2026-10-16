@@ -131,6 +131,23 @@ type HostRecord struct {
 	// at runtime over the mesh.
 	AdvertiseAddrs string `json:"advertise_addrs"` // JSON array of "ip:port" to report to lighthouses
 
+	// LocalAllowList filters which of this host's LOCAL interface addresses it
+	// advertises to the lighthouses. Nebula's default is all of them, which on
+	// a containerised host means docker0 at 172.17.0.1, every VM bridge, and
+	// any other tun device -- addresses no peer can reach. Peers then try them
+	// and wait out a handshake timeout per address before falling back to one
+	// that works.
+	//
+	// The structure is Nebula's own: an optional "interfaces" sub-map of
+	// regular-expression-to-bool matched against interface NAMES, plus
+	// CIDR-to-bool entries matched against the addresses. Stored as a JSON
+	// object and rendered verbatim.
+	//
+	// Host column and config-only, for the same reason as PreferredRanges: it
+	// describes the underlay the host sits on, which has nothing to do with
+	// which overlay it belongs to.
+	LocalAllowList string `json:"local_allow_list"` // JSON object: Nebula's lighthouse.local_allow_list
+
 	// Per-host tun overrides. The zero value means "inherit the generator
 	// default" so an existing host renders exactly the config it always did.
 	MTU       int    `json:"mtu"`        // Overrides tun.mtu when > 0
@@ -553,6 +570,34 @@ func (h *HostRecord) GetAdvertiseAddrs() ([]string, error) {
 		return nil, err
 	}
 	return addrs, nil
+}
+
+// GetLocalAllowList parses the JSON local_allow_list object.
+//
+// The value is Nebula's own structure and is rendered verbatim: an optional
+// "interfaces" sub-map of regular expression to bool, plus CIDR-to-bool
+// entries. It is returned as a generic map rather than a typed struct because
+// the CIDR keys are data, not field names, and Nebula reads it the same way.
+//
+// Empty, "null" or an empty object yields nil, so a host that filters nothing
+// renders no local_allow_list key at all.
+//
+// RETURNS:
+// - map[string]interface{} as stored, nil when unset
+// - error if the stored value is not a JSON object
+func (h *HostRecord) GetLocalAllowList() (map[string]interface{}, error) {
+	if h.LocalAllowList == "" || h.LocalAllowList == "null" {
+		return nil, nil
+	}
+
+	var allowList map[string]interface{}
+	if err := json.Unmarshal([]byte(h.LocalAllowList), &allowList); err != nil {
+		return nil, err
+	}
+	if len(allowList) == 0 {
+		return nil, nil
+	}
+	return allowList, nil
 }
 
 // GetUnsafeNetworks parses the JSON unsafe_networks array into a string slice.

@@ -830,3 +830,94 @@ func TestGenerateHostConfigAdvertiseAddrs(t *testing.T) {
 	})
 }
 
+// TestGenerateHostConfigLocalAllowList covers the filter on which of a host's
+// own addresses it reports.
+//
+// The structure is Nebula's and is rendered verbatim, including the
+// "interfaces" sub-map, because the CIDR keys are data rather than field names
+// and there is nothing to translate.
+func TestGenerateHostConfigLocalAllowList(t *testing.T) {
+	g := NewGenerator()
+
+	t.Run("omitted when unset", func(t *testing.T) {
+		out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: testLighthouses()})
+		if err != nil {
+			t.Fatalf("GenerateHostConfig failed: %v", err)
+		}
+		lh := parseConfig(t, out)["lighthouse"].(map[string]interface{})
+		if _, present := lh["local_allow_list"]; present {
+			t.Error("expected local_allow_list to be omitted when the host filters nothing")
+		}
+	})
+
+	t.Run("an empty object is omitted too", func(t *testing.T) {
+		// A form that posts {} rather than leaving the column null must not
+		// hand an existing host a config diff.
+		host := testHost()
+		host.LocalAllowList = `{}`
+
+		out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()})
+		if err != nil {
+			t.Fatalf("GenerateHostConfig failed: %v", err)
+		}
+		lh := parseConfig(t, out)["lighthouse"].(map[string]interface{})
+		if _, present := lh["local_allow_list"]; present {
+			t.Error("expected an empty local_allow_list object to be omitted")
+		}
+	})
+
+	t.Run("interfaces and CIDR rules render verbatim", func(t *testing.T) {
+		// Nebula's own example: block tun0 and every docker interface.
+		host := testHost()
+		host.LocalAllowList = `{"interfaces":{"tun0":false,"docker.*":false},"172.17.0.0/16":false}`
+
+		out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()})
+		if err != nil {
+			t.Fatalf("GenerateHostConfig failed: %v", err)
+		}
+
+		lh := parseConfig(t, out)["lighthouse"].(map[string]interface{})
+		allowList, present := lh["local_allow_list"].(map[string]interface{})
+		if !present {
+			t.Fatal("expected local_allow_list in the lighthouse section")
+		}
+
+		if allowList["172.17.0.0/16"] != false {
+			t.Errorf("expected the CIDR rule to render as false, got %v", allowList["172.17.0.0/16"])
+		}
+
+		interfaces, ok := allowList["interfaces"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected an interfaces sub-map, got %T", allowList["interfaces"])
+		}
+		if interfaces["tun0"] != false || interfaces["docker.*"] != false {
+			t.Errorf("expected both interface rules to render as false, got %v", interfaces)
+		}
+	})
+
+	t.Run("rendered on a lighthouse too", func(t *testing.T) {
+		host := testHost()
+		host.IsLighthouse = true
+		host.PublicHostPort = "1.2.3.4:4242"
+		host.LocalAllowList = `{"172.17.0.0/16":false}`
+
+		out, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()})
+		if err != nil {
+			t.Fatalf("GenerateHostConfig failed: %v", err)
+		}
+
+		lh := parseConfig(t, out)["lighthouse"].(map[string]interface{})
+		if _, present := lh["local_allow_list"]; !present {
+			t.Error("expected local_allow_list on a lighthouse, which advertises its own addresses too")
+		}
+	})
+
+	t.Run("malformed JSON is an error", func(t *testing.T) {
+		host := testHost()
+		host.LocalAllowList = `["not","an object"]`
+
+		if _, err := g.GenerateHostConfig(HostConfigInput{Host: host, Lighthouses: testLighthouses()}); err == nil {
+			t.Error("expected an error for malformed local_allow_list, got nil")
+		}
+	})
+}

@@ -371,10 +371,12 @@ var configFields = []string{
 	"unsafe_routes",
 	// Underlay preference: local to this host, so no fan-out either.
 	"preferred_ranges",
-	// What this host reports about itself. It reaches peers at RUNTIME, over
-	// the mesh, rather than through a peer's config file -- so there is no
-	// fan-out entry, for the same reason preferred_ranges has none.
+	// What this host reports about itself and which of its own addresses it
+	// reports. Both reach peers at RUNTIME, over the mesh, rather than through
+	// a peer's config file -- so neither has a fan-out entry, for the same
+	// reason preferred_ranges does not.
 	"advertise_addrs",
+	"local_allow_list",
 }
 
 // changedFields returns the names of the fields that differ between the stored
@@ -979,6 +981,20 @@ func (sm *Manager) validateHostRecord(record *core.Record) error {
 			types.ErrInvalidHostPort, err)
 	}
 	if err := ipam.ValidateAdvertiseAddrs(advertiseAddrs); err != nil {
+		return err
+	}
+
+	// Which of this host's own addresses it advertises. Nebula REFUSES TO
+	// START on a malformed allow list rather than skipping the entry, so
+	// rejecting on write is the difference between a 400 and an edge that
+	// never comes back up after its next restart.
+	hostModel.LocalAllowList = record.GetString("local_allow_list")
+	localAllowList, err := hostModel.GetLocalAllowList()
+	if err != nil {
+		return fmt.Errorf("%w: local_allow_list must be a JSON object: %v",
+			types.ErrInvalidAllowList, err)
+	}
+	if err := ipam.ValidateLocalAllowList(localAllowList); err != nil {
 		return err
 	}
 
@@ -1595,5 +1611,6 @@ func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
 
 		AdditionalHostPorts: record.GetString("additional_host_ports"),
 		AdvertiseAddrs:      record.GetString("advertise_addrs"),
+		LocalAllowList:      record.GetString("local_allow_list"),
 	}
 }

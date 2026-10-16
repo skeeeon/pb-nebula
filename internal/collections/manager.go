@@ -382,7 +382,7 @@ func networkFields() []core.Field {
 // - Relations: network_id (foreign key)
 // - Generated: ca_certificate (denormalized), config_yaml (complete Nebula config)
 // - Lighthouse: is_lighthouse, public_host_port, additional_host_ports
-// - Underlay reporting: advertise_addrs
+// - Underlay reporting: advertise_addrs, local_allow_list
 // - Firewall: firewall_outbound, firewall_inbound (host-specific rules)
 //
 // FIREWALL RULES (HOST-BASED):
@@ -524,6 +524,20 @@ func hostFields() []core.Field {
 		&core.JSONField{
 			Name:    "advertise_addrs",
 			MaxSize: 1000,
+		},
+
+		// Which of this host's own interface addresses it advertises. Nebula's
+		// default is all of them, so a containerised host offers docker0 and
+		// every VM bridge to peers that then wait out a handshake timeout per
+		// unreachable address.
+		//
+		// An object, not an array: Nebula's structure is an optional
+		// "interfaces" sub-map of regex-to-bool plus CIDR-to-bool entries.
+		// A host column for the preferred_ranges reason -- it describes the
+		// machine's own interfaces, which the overlay knows nothing about.
+		&core.JSONField{
+			Name:    "local_allow_list",
+			MaxSize: 2000,
 		},
 
 		// Per-host tun overrides. Both use the zero value to mean "inherit the
