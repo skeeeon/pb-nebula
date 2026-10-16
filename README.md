@@ -582,9 +582,20 @@ Format is `"ip:port"`, and **a port of `0` means "use the real listening
 port"**, which is what makes this usable on a host with `listen.port: 0`. That
 is the one rule where it differs from `additional_host_ports`.
 
-A DNS name is accepted, but Nebula resolves this column **once, at startup**
-(unlike `static_host_map`, which re-resolves on a cadence), so a name is a
-weaker choice here.
+A DNS name is accepted, but **its failure mode here is the opposite of
+`public_host_port`'s, so prefer an IP literal.** In `static_host_map` Nebula
+resolves a name in a background goroutine and re-resolves on a cadence, so a
+lookup failure is logged and the entry simply does not work yet. Here it
+resolves **synchronously at startup**, and both a lookup error and an empty
+result stop Nebula starting — there is no retry. An unresolvable name costs a
+`static_host_map` entry its usefulness and costs an `advertise_addrs` host its
+next reboot. Only the first address returned is used, so a name with several A
+records silently advertises one of them.
+
+It is accepted rather than refused because this validation is offline: it
+cannot tell a name that will resolve at the edge from one that will not, and
+refusing a shape Nebula accepts on the strength of a condition pb-nebula cannot
+evaluate would be a guess rather than a check.
 
 Entries are validated rather than merely warned about, because **Nebula refuses
 to start** on one it cannot parse — a typo costs the host its next restart, not

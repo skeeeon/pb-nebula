@@ -476,3 +476,58 @@ func TestValidateLocalAllowList(t *testing.T) {
 		})
 	}
 }
+
+// TestAdvertiseAddrsAndHostPortsDisagreeOnlyWhereIntended pins the two places
+// the sibling validators deliberately differ, because both differences are
+// counter-intuitive and a later "tidy-up" that routed one through the other
+// would silently change behaviour in production.
+//
+// Port 0: refused for an address a PEER DIALS (static_host_map takes the value
+// as written), accepted for one the host REPORTS (Nebula substitutes the real
+// listening port, lighthouse.go).
+//
+// A DNS name: accepted by both, but NOT the same bet, which is why this is a
+// test and not just a comment. In static_host_map a name resolves in a
+// background goroutine and re-resolves on a cadence, so a lookup failure
+// degrades one entry. In advertise_addrs it resolves synchronously in
+// LightHouse.reload, where a lookup error and an empty result both return a
+// contextual error that at startup reaches main.go -- so Nebula does not
+// start. Both are accepted because this validation is offline and cannot tell
+// a name that resolves at the edge from one that does not; the asymmetry lives
+// in the doc comments, and this pins the behaviour they describe.
+func TestAdvertiseAddrsAndHostPortsDisagreeOnlyWhereIntended(t *testing.T) {
+	t.Run("port 0 is refused for an address peers dial", func(t *testing.T) {
+		if err := ValidateAdditionalHostPorts([]string{"1.2.3.4:0"}); err == nil {
+			t.Error("expected port 0 to be refused in additional_host_ports: a peer cannot dial it")
+		}
+	})
+
+	t.Run("port 0 is accepted for an address the host reports", func(t *testing.T) {
+		if err := ValidateAdvertiseAddrs([]string{"1.2.3.4:0"}); err != nil {
+			t.Errorf("expected port 0 to be accepted in advertise_addrs (Nebula substitutes the real listening port): %v", err)
+		}
+	})
+
+	t.Run("both accept a DNS name", func(t *testing.T) {
+		if err := ValidateAdditionalHostPorts([]string{"lh.example.com:4242"}); err != nil {
+			t.Errorf("additional_host_ports should accept a DNS name: %v", err)
+		}
+		if err := ValidateAdvertiseAddrs([]string{"edge.example.com:4242"}); err != nil {
+			t.Errorf("advertise_addrs should accept a DNS name: %v", err)
+		}
+	})
+
+	t.Run("neither resolves anything", func(t *testing.T) {
+		// The validators are pure. A name that cannot resolve anywhere must
+		// still pass, or these would fail differently on a machine with a
+		// search domain, in CI, and on the edge -- and a validator whose
+		// answer depends on where it runs is worse than none.
+		const unresolvable = "no-such-host.invalid:4242"
+		if err := ValidateAdditionalHostPorts([]string{unresolvable}); err != nil {
+			t.Errorf("validation must not resolve: %v", err)
+		}
+		if err := ValidateAdvertiseAddrs([]string{unresolvable}); err != nil {
+			t.Errorf("validation must not resolve: %v", err)
+		}
+	})
+}

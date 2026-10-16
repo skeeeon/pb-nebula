@@ -650,11 +650,26 @@ func ValidateAdditionalHostPorts(addrs []string) error {
 // the opposite of static_host_map, where a peer has to dial the value as
 // written, so the two validators differ on exactly this one rule.
 //
-// A HOSTNAME IS ACCEPTED because Nebula resolves the host half with
-// net.DefaultResolver when it is not an IP literal. It resolves ONCE, at
-// startup, unlike static_host_map's re-resolving goroutine, so a name is a
-// less good idea in this column -- but it is not an error, and refusing it
-// would rule out a deployment that has a stable name and a moving address.
+// A HOSTNAME IS ACCEPTED, BUT ITS FAILURE MODE IS THE OPPOSITE OF
+// public_host_port's, SO DO NOT READ THE TWO DOC COMMENTS AS SAYING THE SAME
+// THING. In static_host_map, NewHostnameResults resolves a name in a
+// background goroutine and re-resolves on a cadence, so a lookup failure is
+// logged and the entry simply does not work yet. Here, LightHouse.reload
+// resolves synchronously with net.DefaultResolver.LookupNetIP, and BOTH a
+// lookup error and an empty result return a contextual error -- which at
+// startup reaches main.go and Nebula DOES NOT START. There is no background
+// resolver and no retry. So an unresolvable name costs a static_host_map entry
+// its usefulness, and costs an advertise_addrs host its next reboot.
+//
+// Note also that only addrs[0] is used (upstream has a TODO about it), so a
+// name with several A records silently advertises one of them.
+//
+// It is accepted anyway, and deliberately: this validator is PURE, so it
+// cannot tell a name that will resolve on the edge from one that will not, and
+// refusing a shape Nebula itself accepts on the strength of a condition we
+// cannot evaluate is not validation, it is a guess. An operator with a
+// reliable internal resolver has a legitimate use for it. What this comment
+// must not do is imply the name is as safe here as in public_host_port.
 //
 // PARAMETERS:
 //   - addrs: the parsed advertise_addrs entries, possibly empty
