@@ -170,26 +170,42 @@ func TestExtractPort(t *testing.T) {
 	g := NewGenerator()
 
 	tests := []struct {
+		name         string
 		hostPort     string
 		isLighthouse bool
 		isRelay      bool
 		want         int
 	}{
-		{"1.2.3.4:4242", true, false, 4242},
-		{"1.2.3.4:4242", false, false, 0}, // regular hosts use ephemeral port
-		{"1.2.3.4:4242", false, true, 4242},
-		{"1.2.3.4:4242", true, true, 4242}, // lighthouse that also relays
-		{"", true, false, 0},
-		{"", false, true, 0},
-		{"no-port", true, false, 0},
-		{"[fd00::1]:4242", true, false, 4242}, // IPv6 public endpoint
+		{name: "IPv4 with a port", hostPort: "1.2.3.4:4242", isLighthouse: true, want: 4242},
+		{name: "a relay gets the same port", hostPort: "1.2.3.4:4242", isRelay: true, want: 4242},
+		{name: "lighthouse that also relays", hostPort: "1.2.3.4:4242", isLighthouse: true, isRelay: true, want: 4242},
+		{name: "bracketed IPv6 with a port", hostPort: "[fd00::1]:4242", isLighthouse: true, want: 4242},
+		{name: "bracketed IPv6, longer form", hostPort: "[2001:db8::1]:4242", isLighthouse: true, want: 4242},
+		{name: "a DNS name with a port", hostPort: "lighthouse.example.com:4242", isLighthouse: true, want: 4242},
+
+		// An ordinary host listens on an ephemeral port whatever it carries.
+		{name: "neither lighthouse nor relay", hostPort: "1.2.3.4:4242", want: 0},
+		{name: "neither, and no endpoint", hostPort: "", want: 0},
+
+		{name: "empty on a lighthouse", hostPort: "", isLighthouse: true, want: 0},
+		{name: "empty on a relay", hostPort: "", isRelay: true, want: 0},
+
+		// The two shapes validation now refuses. Both reached the generator
+		// before, and both rendered a listen.port that cannot work.
+		{name: "IPv4 with the port left off", hostPort: "1.2.3.4", isLighthouse: true, want: 0},
+		{name: "unbracketed IPv6, no port, used to yield 1", hostPort: "2001:db8::1", isLighthouse: true, want: 0},
+		{name: "unbracketed IPv6, link-local shape", hostPort: "fd00::1", isLighthouse: true, want: 0},
+		{name: "not an endpoint at all", hostPort: "no-port", isLighthouse: true, want: 0},
+		{name: "a port that is not a number", hostPort: "1.2.3.4:http", isLighthouse: true, want: 0},
 	}
 
 	for _, tt := range tests {
-		if got := g.extractPort(tt.hostPort, tt.isLighthouse, tt.isRelay); got != tt.want {
-			t.Errorf("extractPort(%q, lighthouse=%v, relay=%v) = %d, want %d",
-				tt.hostPort, tt.isLighthouse, tt.isRelay, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if got := g.extractPort(tt.hostPort, tt.isLighthouse, tt.isRelay); got != tt.want {
+				t.Errorf("extractPort(%q, lighthouse=%v, relay=%v) = %d, want %d",
+					tt.hostPort, tt.isLighthouse, tt.isRelay, got, tt.want)
+			}
+		})
 	}
 }
 

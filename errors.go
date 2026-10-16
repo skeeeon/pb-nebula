@@ -34,6 +34,7 @@ var (
 	ErrIPNotInNetwork        = types.ErrIPNotInNetwork
 	ErrLighthouseNoPublicIP  = types.ErrLighthouseNoPublicIP
 	ErrRelayNoPublicIP       = types.ErrRelayNoPublicIP
+	ErrInvalidPublicHostPort = types.ErrInvalidPublicHostPort
 	ErrInvalidUnsafeNetwork  = types.ErrInvalidUnsafeNetwork
 	ErrInvalidUnsafeRoute    = types.ErrInvalidUnsafeRoute
 	ErrInvalidPreferredRange = types.ErrInvalidPreferredRange

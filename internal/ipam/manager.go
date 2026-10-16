@@ -4,6 +4,8 @@ package ipam
 import (
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 
 	"github.com/pocketbase/pocketbase"
 	"github.com/skeeeon/pb-nebula/internal/types"
@@ -432,4 +434,123 @@ func ValidatePreferredRanges(cidrs []string) error {
 	}
 
 	return nil
+}
+
+// ValidatePublicHostPort validates a host's public underlay endpoint -- the
+// "HOST:PORT" string a lighthouse or a relay is reached at.
+//
+// WHY THE FORMAT MATTERS MORE THAN IT LOOKS:
+// This one value lands in two places. Every OTHER host in the network carries
+// it verbatim as a static_host_map entry, and the host itself listens on the
+// port, because a peer handed a fixed address cannot chase an ephemeral one.
+// A malformed value is therefore not cosmetic: the host is advertised to the
+// whole network and reachable from none of it. Two shapes used to get through
+// and fail silently -- an address with the port left off rendered listen.port
+// 0, and an unbracketed IPv6 address rendered listen.port 1 (the last colon
+// split read "1" out of "2001:db8::1").
+//
+// HOSTNAMES ARE ALLOWED, DELIBERATELY:
+// Nebula v1.11.0 splits each static_host_map value with net.SplitHostPort and,
+// when the host half does not parse as an IP, treats it as a DNS name and
+// resolves it in a background goroutine, re-resolving on a cadence
+// (NewHostnameResults, remote_list.go). So a lighthouse on a dynamic address
+// can legitimately be addressed by name, and refusing names here would rule
+// that out. What Nebula will not do is guess a port, which is why the port
+// half is required of every value.
+//
+// AN EMPTY VALUE IS VALID:
+// public_host_port is optional for an ordinary host, and most records have it
+// blank. The separate requirement that a lighthouse or relay HAVE one lives in
+// validateHostRecord (ErrLighthouseNoPublicIP / ErrRelayNoPublicIP), so an
+// existing ordinary host keeps validating unchanged.
+//
+// PARAMETERS:
+//   - hostPort: the stored public_host_port value, possibly empty
+//
+// RETURNS:
+// - nil if the value is empty or well-formed
+// - error wrapping ErrInvalidPublicHostPort otherwise
+//
+// SIDE EFFECTS: None (pure -- no name is resolved, see isPlausibleDNSName).
+func ValidatePublicHostPort(hostPort string) error {
+	if hostPort == "" {
+		return nil
+	}
+
+	host, portStr, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return fmt.Errorf("%w: %q: expected HOST:PORT, with an IPv6 address bracketed as [2001:db8::1]:4242: %v",
+			types.ErrInvalidPublicHostPort, hostPort, err)
+	}
+
+	if host == "" {
+		return fmt.Errorf("%w: %q has no host part", types.ErrInvalidPublicHostPort, hostPort)
+	}
+
+	if net.ParseIP(host) == nil && !isPlausibleDNSName(host) {
+		return fmt.Errorf("%w: %q is neither an IP address nor a DNS name",
+			types.ErrInvalidPublicHostPort, host)
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return fmt.Errorf("%w: %q: port must be a number", types.ErrInvalidPublicHostPort, hostPort)
+	}
+
+	// 0 is what Nebula treats as "pick an ephemeral port", which is the exact
+	// thing a lighthouse or relay must not do, so it is refused here rather
+	// than accepted and rendered.
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("%w: port %d is outside 1-65535", types.ErrInvalidPublicHostPort, port)
+	}
+
+	return nil
+}
+
+// isPlausibleDNSName reports whether host has the shape of a DNS name.
+//
+// This is a shape check and never a lookup. pb-nebula cannot know what an
+// edge's resolver will answer, and a lighthouse named for a record that does
+// not exist yet is a reasonable thing to write. So it refuses only what is
+// certainly not a name: the wrong characters, an empty or over-long label, a
+// hyphen on a label boundary -- plus an all-digit final label, which is the
+// shape a mistyped IPv4 address takes ("1.2.3") and which no real TLD has.
+//
+// PARAMETERS:
+//   - host: the host half of a HOST:PORT value, already known not to be an IP
+//
+// RETURNS:
+// - true if host could be a DNS name
+//
+// SIDE EFFECTS: None.
+func isPlausibleDNSName(host string) bool {
+	if len(host) > 253 {
+		return false
+	}
+
+	// An absolute name is still a name.
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return false
+	}
+
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			isAlnum := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+			if !isAlnum && c != '-' {
+				return false
+			}
+		}
+	}
+
+	last := labels[len(labels)-1]
+	return strings.TrimLeft(last, "0123456789") != ""
 }

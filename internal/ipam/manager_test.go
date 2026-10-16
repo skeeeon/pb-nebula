@@ -229,3 +229,66 @@ func TestValidatePreferredRangesRespectsTheCap(t *testing.T) {
 		t.Errorf("expected %d preferred ranges to be accepted: %v", MaxPreferredRangesPerHost, err)
 	}
 }
+
+func TestValidatePublicHostPort(t *testing.T) {
+	tests := []struct {
+		name     string
+		hostPort string
+		wantErr  bool
+	}{
+		// An ordinary host leaves this blank. Whether a lighthouse or relay is
+		// allowed to is a separate check, in validateHostRecord.
+		{name: "empty is fine", hostPort: ""},
+
+		{name: "IPv4", hostPort: "1.2.3.4:4242"},
+		{name: "bracketed IPv6", hostPort: "[2001:db8::1]:4242"},
+		{name: "bracketed IPv6, short form", hostPort: "[fd00::1]:4242"},
+		{name: "the lowest port", hostPort: "1.2.3.4:1"},
+		{name: "the highest port", hostPort: "1.2.3.4:65535"},
+
+		// Nebula resolves a non-IP host half as a DNS name and re-resolves it
+		// on a cadence, so a lighthouse on a dynamic address can be named.
+		{name: "a DNS name", hostPort: "lighthouse.example.com:4242"},
+		{name: "a single label", hostPort: "lighthouse:4242"},
+		{name: "an absolute name", hostPort: "lighthouse.example.com.:4242"},
+		{name: "a hyphen inside a label", hostPort: "lh-01.example.com:4242"},
+
+		// The two that used to render a broken listen.port.
+		{name: "IPv4 with the port left off", hostPort: "1.2.3.4", wantErr: true},
+		{name: "unbracketed IPv6", hostPort: "2001:db8::1", wantErr: true},
+
+		{name: "a name with no port", hostPort: "lighthouse.example.com", wantErr: true},
+		{name: "a trailing colon and no port", hostPort: "1.2.3.4:", wantErr: true},
+		{name: "a port and no host", hostPort: ":4242", wantErr: true},
+		{name: "port 0 is the ephemeral request", hostPort: "1.2.3.4:0", wantErr: true},
+		{name: "port above the range", hostPort: "1.2.3.4:65536", wantErr: true},
+		{name: "a negative port", hostPort: "1.2.3.4:-1", wantErr: true},
+		{name: "a named port", hostPort: "1.2.3.4:http", wantErr: true},
+		{name: "a URL, not an endpoint", hostPort: "https://1.2.3.4:4242", wantErr: true},
+		{name: "an underscore is not a hostname character", hostPort: "light_house:4242", wantErr: true},
+		{name: "a leading hyphen", hostPort: "-lighthouse.example.com:4242", wantErr: true},
+		{name: "an empty label", hostPort: "lighthouse..example.com:4242", wantErr: true},
+		// A mistyped IPv4 address passes the label rules; an all-digit final
+		// label is what gives it away.
+		{name: "a truncated IPv4 address", hostPort: "1.2.3:4242", wantErr: true},
+		{name: "only digits", hostPort: "4242:4242", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidatePublicHostPort(tt.hostPort)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected an error, got nil")
+				}
+				if !errors.Is(err, types.ErrInvalidPublicHostPort) {
+					t.Errorf("expected ErrInvalidPublicHostPort, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+}

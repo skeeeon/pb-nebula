@@ -196,6 +196,16 @@ The rendered order is the operator's and is **not sorted**, unlike `getBlocklist
 
 Relays are **not** added to `static_host_map` — unlike a lighthouse, a relay's address is learned through the lighthouse at runtime. But a relay does need `public_host_port`, because `extractPort` would otherwise give it `listen.port: 0` (ephemeral) while every peer is handed its overlay IP as a usable path. `validateHostRecord` rejects a relay without one rather than letting that fail silently.
 
+### `public_host_port` is validated for shape, not just presence
+
+Having the field is not the same as having a usable value, and this value goes two places at once: every *other* host in the network carries it verbatim as a `static_host_map` entry, and the host itself listens on its port. A malformed one therefore advertises a host to the whole network and makes it reachable from none of it. Two shapes used to get through — an address with the port left off rendered `listen.port: 0`, and a bare `2001:db8::1` rendered `listen.port: 1`, because `extractPort` split on the last colon and a comment claimed that "handles IPv6" (it handles the bracketed form, and only that).
+
+`extractPort` now parses with `net.SplitHostPort`, which is the function Nebula itself parses `static_host_map` values with (`NewHostnameResults`, `remote_list.go`), so the two agree on what is well-formed. `ipam.ValidatePublicHostPort` refuses the malformed shapes at the API, wrapping `ErrInvalidPublicHostPort`. **Hostnames are allowed deliberately**: Nebula v1.11.0 treats a host half that does not parse as an IP as a DNS name and resolves it in a background goroutine on a cadence, so a lighthouse on a dynamic address can be addressed by name. What Nebula will not do is guess a port, so the port half is required of every value and must be in 1–65535 — `0` is precisely the ephemeral request a lighthouse must not make.
+
+An **empty value stays valid**: the field is optional for an ordinary host, and the requirement that a lighthouse or relay have one is the separate presence check above, so existing records keep validating. `extractPort` still falls back to `0` rather than erroring, because it also runs over records written before this check existed and a regeneration sweep must not fail a whole network over one stale row.
+
+The `TextField` declaration deliberately carries **no `Pattern`**. A regex that expresses the port bound is unreadable, so in practice it would be laxer than the Go check and let exactly these values through — a second, divergent definition of "valid" rather than a second line of defence. It would also be the weaker half where it is needed most: `addMissingFields` identifies a field by name and leaves an existing one alone, so a `Pattern` added now reaches only a fresh database, never a deployment that already has the column.
+
 ### Firewall rules are host-based, not network-based
 This mirrors Nebula's own design. `nebula_networks` has no firewall fields. Every host carries `firewall_outbound` and `firewall_inbound` as JSON arrays in Nebula's native format. The config generator (`internal/config/generator.go`) applies Nebula-recommended defaults (allow-all outbound, ICMP-only inbound) when a host's rules are empty.
 

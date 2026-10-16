@@ -3,8 +3,8 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"strconv"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -356,7 +356,7 @@ func (g *Generator) buildRelayConfig(relays []string, isRelay bool) map[string]i
 	}
 }
 
-// extractPort extracts the port number from a "IP:PORT" string.
+// extractPort extracts the port number from a "HOST:PORT" string.
 // Returns 0 for a host that needs no stable listening port.
 //
 // WHY LIGHTHOUSES AND RELAYS BOTH NEED ONE:
@@ -365,26 +365,39 @@ func (g *Generator) buildRelayConfig(relays []string, isRelay bool) map[string]i
 // practical reason -- peers are handed its overlay IP and have to reach it at a
 // fixed address to use it as a path. An ordinary host gets 0 (ephemeral).
 //
+// WHY net.SplitHostPort AND NOT A COLON SPLIT:
+// The split this replaced took the last colon-separated element, which the
+// comment claimed "handles IPv6". It handles the bracketed form and nothing
+// else: a bare "2001:db8::1" yielded "1", so the config rendered listen.port 1
+// while every peer was handed an entry Nebula could not parse. SplitHostPort
+// accepts the bracketed form, and errors on the bare one and on a missing port
+// -- the same function Nebula itself parses static_host_map values with
+// (NewHostnameResults, remote_list.go), so the two agree on what is well-formed.
+//
+// A 0 FROM A LIGHTHOUSE OR RELAY MEANS THE RECORD BYPASSED VALIDATION:
+// ipam.ValidatePublicHostPort refuses these shapes at the API now, so a
+// well-formed port is the normal case. The generator still falls back to 0
+// rather than erroring, because it also runs over records written before that
+// check existed, and a regeneration sweep that failed on one stale row would
+// take the whole network's configs with it.
+//
 // PARAMETERS:
-//   - publicHostPort: Public IP:PORT string (e.g., "1.2.3.4:4242")
+//   - publicHostPort: Public HOST:PORT string (e.g., "1.2.3.4:4242")
 //   - isLighthouse: True if this host is a lighthouse
 //   - isRelay: True if this host is a relay
 //
 // RETURNS:
-// - int: Port number, or 0 if the host needs no stable port
+// - int: Port number, or 0 if the host needs no stable port or the value is malformed
 func (g *Generator) extractPort(publicHostPort string, isLighthouse, isRelay bool) int {
 	if (!isLighthouse && !isRelay) || publicHostPort == "" {
 		return 0
 	}
 
-	// Split on last colon to handle IPv6 addresses
-	parts := strings.Split(publicHostPort, ":")
-	if len(parts) < 2 {
+	_, portStr, err := net.SplitHostPort(publicHostPort)
+	if err != nil {
 		return 0
 	}
 
-	// Get last part (port)
-	portStr := parts[len(parts)-1]
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return 0

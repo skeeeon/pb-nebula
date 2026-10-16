@@ -476,6 +476,22 @@ func hostFields() []core.Field {
 		&core.BoolField{
 			Name: "is_relay",
 		},
+		// The public underlay endpoint, "HOST:PORT". Deliberately carries no
+		// Pattern, unlike tun_device below.
+		//
+		// A pattern here would have to accept IPv4, a bracketed IPv6 address, a
+		// DNS name and the empty string (the field is optional for an ordinary
+		// host), while rejecting port 0 and anything above 65535 -- and a regex
+		// that expresses the port bound is unreadable, so in practice it would
+		// be laxer than ipam.ValidatePublicHostPort and let exactly the values
+		// that caused this bug through. That makes it a second, divergent
+		// definition of "valid" rather than a second line of defence.
+		//
+		// It would also be the weaker half in the place it is needed most.
+		// addMissingFields identifies a field by name and leaves an existing one
+		// completely alone, so adding a Pattern now would never reach a
+		// deployment that already has this column -- only a fresh database would
+		// get it, and the two would then validate differently. The hook runs on
 		&core.TextField{
 			Name: "public_host_port",
 			Max:  100,

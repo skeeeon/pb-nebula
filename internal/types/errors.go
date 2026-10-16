@@ -30,6 +30,7 @@ var (
 	ErrIPNotInNetwork        = errors.New("IP address not within network CIDR")
 	ErrLighthouseNoPublicIP  = errors.New("lighthouse hosts require public_host_port")
 	ErrRelayNoPublicIP       = errors.New("relay hosts require public_host_port")
+	ErrInvalidPublicHostPort = errors.New("invalid public_host_port")
 	ErrInvalidUnsafeNetwork  = errors.New("invalid unsafe network")
 	ErrInvalidUnsafeRoute    = errors.New("invalid unsafe route")
 	ErrInvalidPreferredRange = errors.New("invalid preferred range")

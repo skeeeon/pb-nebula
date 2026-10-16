@@ -883,6 +883,15 @@ func (sm *Manager) validateHostRecord(record *core.Record) error {
 		return types.ErrRelayNoPublicIP
 	}
 
+	// Having a public_host_port is not the same as having a usable one, and the
+	// two checks are separate so the presence errors above stay specific to
+	// their cause. This one runs for every host, including ordinary ones, and
+	// passes an empty value through -- the field is optional for a host that is
+	// neither lighthouse nor relay, so existing records keep validating.
+	if err := ipam.ValidatePublicHostPort(record.GetString("public_host_port")); err != nil {
+		return err
+	}
+
 	// Validate groups is valid JSON array
 	groupsJSON := record.GetString("groups")
 	if groupsJSON != "" && groupsJSON != "null" {
