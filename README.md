@@ -152,7 +152,8 @@ Host configurations with PocketBase authentication.
 | overlay_ip | text | Overlay IP (e.g., "10.128.0.100") |
 | groups | json | Array of group names (embedded in cert) |
 | is_lighthouse | bool | Is this a lighthouse? |
-| public_host_port | text | Public IP:PORT (required if lighthouse) |
+| public_host_port | text | Public HOST:PORT (required if lighthouse or relay) |
+| additional_host_ports | json | Further endpoints peers can reach this host at — see [Lighthouse Addresses](#lighthouse-addresses) |
 | certificate | text | PEM host certificate (auto-generated) |
 | private_key | text | PEM host private key (auto-generated) |
 | ca_certificate | text | PEM CA cert (denormalized) |
@@ -334,6 +335,7 @@ These fields are **only in the config** and don't require certificate regenerati
 |--------------|--------|-----|
 | `is_lighthouse` | Regenerate config only | Config setting |
 | `public_host_port` | Regenerate config only | Config setting |
+| `additional_host_ports` | Regenerate config for **every host in the network** | Peers carry the whole address list in `static_host_map` |
 | `firewall_outbound` | Regenerate config only | Config setting |
 | `firewall_inbound` | Regenerate config only | Config setting |
 | `active` | Regenerate config for **every host in the network** | Revocation lives in each peer's `pki.blocklist` — see [Certificate Revocation](#certificate-revocation) |
@@ -495,6 +497,53 @@ highest of all. Overlapping entries are allowed: Nebula matches an address
 against the set, so a broad range plus a narrower one inside it is coherent.
 
 Omitted from the config entirely when unset.
+
+## Lighthouse Addresses
+
+Nebula's `static_host_map` maps an overlay IP to a **list** of underlay
+endpoints, and tries them. `public_host_port` is the primary; `additional_host_ports`
+carries any others.
+
+```json
+{
+  "public_host_port": "198.51.100.10:4242",
+  "additional_host_ports": ["[2001:db8::10]:4242", "192.168.10.5:4242"]
+}
+```
+
+Every peer in the network then gets:
+
+```yaml
+static_host_map:
+  10.128.0.1:
+    - 198.51.100.10:4242
+    - '[2001:db8::10]:4242'
+    - 192.168.10.5:4242
+```
+
+Three ordinary deployments need this and none of them fit in a single value:
+
+- **dual-stack** — the lighthouse has a v4 and a v6 address
+- **two internet paths** — two uplinks, two public addresses
+- **split horizon** — peers in the lighthouse's own rack should bootstrap via
+  its LAN address, roaming peers via the public one
+
+The order is yours and is not sorted: `public_host_port` leads, then
+`additional_host_ports` as stored.
+
+`listen.port` still comes from `public_host_port` alone — a host listens on one
+port, and the extra entries name other *addresses* it is reachable at.
+
+Every entry is validated like `public_host_port` (host:port, IPv6 bracketed, a
+port in 1–65535, no duplicates). **Port `0` is refused here**: a peer has to
+dial the value as written.
+
+**Only a lighthouse's list reaches anyone else.** A relay's endpoint is learned
+through the lighthouse at runtime and is never embedded in a peer config, so
+extra addresses on a relay are stored and unused.
+
+Changing either column fans out to every host in the network, because every one
+of them carries the list.
 
 ## Firewall Rules
 

@@ -27,6 +27,7 @@ func hostRecordPair(t *testing.T, before, after map[string]any) (*core.Record, *
 		&core.NumberField{Name: "mtu"},
 		&core.TextField{Name: "tun_device", Max: 15},
 		&core.JSONField{Name: "preferred_ranges"},
+		&core.JSONField{Name: "additional_host_ports"},
 	)
 
 	build := func(fields map[string]any) *core.Record {
@@ -149,7 +150,7 @@ func TestTiersAreDisjointAndComplete(t *testing.T) {
 		// Certificate tier
 		"hostname", "overlay_ip", "groups", "unsafe_networks",
 		// Config tier
-		"is_lighthouse", "is_relay", "public_host_port",
+		"is_lighthouse", "is_relay", "public_host_port", "additional_host_ports",
 		"firewall_outbound", "firewall_inbound", "mtu", "tun_device", "unsafe_routes",
 		"preferred_ranges",
 	}

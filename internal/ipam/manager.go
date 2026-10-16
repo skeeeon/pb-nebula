@@ -554,3 +554,66 @@ func isPlausibleDNSName(host string) bool {
 	last := labels[len(labels)-1]
 	return strings.TrimLeft(last, "0123456789") != ""
 }
+
+// MaxAdditionalHostPortsPerHost bounds a list that is cheap individually and
+// unbounded in aggregate: every entry is copied into the static_host_map of
+// EVERY host in the network, so one lighthouse with a long list inflates every
+// config. Generous for the cases that motivated it -- dual-stack is two, two
+// internet paths plus a LAN address is three.
+const MaxAdditionalHostPortsPerHost = 8
+
+// ValidateAdditionalHostPorts validates the FURTHER underlay endpoints a host
+// can be reached at, beyond public_host_port.
+//
+// WHY THE SAME RULES AS public_host_port, AND WHY PORT 0 IS STILL REFUSED:
+// These entries land in exactly the same place -- the list value of this
+// host's static_host_map entry in every peer's config. A peer reads that list
+// and dials the addresses in it, so a 0 is not a placeholder there the way it
+// is in advertise_addrs: it is an address nothing can connect to, advertised
+// to the whole network. ValidatePublicHostPort already refuses it, which is
+// why this delegates rather than restating the checks.
+//
+// DUPLICATES ARE REFUSED:
+// A repeated address is not harmful -- Nebula would simply try it twice -- but
+// it is always a mistake, and saying so costs one map.
+//
+// PARAMETERS:
+//   - addrs: the parsed additional_host_ports entries, possibly empty
+//
+// RETURNS:
+// - nil if every entry is well-formed and distinct
+// - error wrapping ErrInvalidHostPort otherwise
+//
+// SIDE EFFECTS: None (pure -- no name is resolved).
+func ValidateAdditionalHostPorts(addrs []string) error {
+	if len(addrs) == 0 {
+		return nil
+	}
+
+	if len(addrs) > MaxAdditionalHostPortsPerHost {
+		return fmt.Errorf("%w: additional_host_ports allows at most %d entries, got %d",
+			types.ErrInvalidHostPort, MaxAdditionalHostPortsPerHost, len(addrs))
+	}
+
+	seen := make(map[string]struct{}, len(addrs))
+	for _, addr := range addrs {
+		if addr == "" {
+			return fmt.Errorf("%w: additional_host_ports contains an empty entry",
+				types.ErrInvalidHostPort)
+		}
+
+		// Deliberately the same validator the primary uses, so the two halves
+		// of one address list can never disagree about what is well-formed.
+		if err := ValidatePublicHostPort(addr); err != nil {
+			return fmt.Errorf("%w: additional_host_ports: %v", types.ErrInvalidHostPort, err)
+		}
+
+		if _, dup := seen[addr]; dup {
+			return fmt.Errorf("%w: additional_host_ports lists %q more than once",
+				types.ErrInvalidHostPort, addr)
+		}
+		seen[addr] = struct{}{}
+	}
+
+	return nil
+}

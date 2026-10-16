@@ -69,6 +69,11 @@ type HostConfigInput struct {
 // - Lighthouse hosts: am_lighthouse=true, no static_host_map
 // - Regular hosts: am_lighthouse=false, static_host_map with lighthouse IPs
 //
+// Each static_host_map entry carries the lighthouse's whole address LIST, not
+// one address, because Nebula's value is a list and a lighthouse can be
+// dual-stack, sit behind two internet paths, or be reached at a LAN address by
+// the peers in its own rack.
+//
 // PREFERRED RANGES:
 // Underlay prefixes this host favours when a peer advertises several addresses
 // -- typically the LAN it sits on, so two hosts in one rack use their private
@@ -266,6 +271,13 @@ func (g *Generator) GenerateHostConfig(in HostConfigInput) (string, error) {
 //   - lighthouses: List of lighthouses in the network
 //   - isLighthouse: True if this host is a lighthouse
 //
+// THE VALUE IS A LIST BECAUSE NEBULA'S IS:
+// One lighthouse can legitimately be reachable at several addresses -- a
+// dual-stack pair, two internet paths, or a LAN address for the peers in its
+// own rack alongside the public one for everybody else. Nebula tries the
+// entries, so the list is the feature rather than an accident of the format.
+// A lighthouse with one address renders the one-element list it always did.
+//
 // RETURNS:
 // - map[string][]string: Static host map (overlay IP -> public endpoints)
 // - nil if this host is a lighthouse
@@ -274,9 +286,16 @@ func (g *Generator) buildStaticHostMap(lighthouses []types.LighthouseInfo, isLig
 		return nil // Lighthouses don't need static host map
 	}
 
-	hostMap := make(map[string][]string)
+	hostMap := make(map[string][]string, len(lighthouses))
 	for _, lh := range lighthouses {
-		hostMap[lh.OverlayIP] = []string{lh.PublicHostPort}
+		// A lighthouse with no address at all is skipped rather than rendered
+		// as an empty entry. validateHostRecord refuses to save one, so this
+		// only reaches a record written before that check existed -- and an
+		// entry Nebula cannot parse would stop the peer starting.
+		if len(lh.Addresses) == 0 {
+			continue
+		}
+		hostMap[lh.OverlayIP] = lh.Addresses
 	}
 	return hostMap
 }

@@ -94,6 +94,23 @@ type HostRecord struct {
 	IsRelay        bool   `json:"is_relay"`         // True if this host relays for peers that cannot punch
 	PublicHostPort string `json:"public_host_port"` // Public IP:PORT (required if lighthouse or relay)
 
+	// AdditionalHostPorts are FURTHER underlay endpoints this host can be
+	// reached at, beyond PublicHostPort. Nebula's static_host_map value is a
+	// LIST on purpose -- a lighthouse may be dual-stack, sit behind two
+	// internet paths, or be reachable at a LAN address by the peers in its own
+	// rack and a public one by everybody else -- and a single scalar makes all
+	// three inexpressible.
+	//
+	// PublicHostPort stays the primary and is never duplicated here. It is
+	// what listen.port is derived from and what every existing deployment
+	// already carries, so a host with nothing in this column renders exactly
+	// the static_host_map entry it always did.
+	//
+	// Only a LIGHTHOUSE's addresses reach anyone else. A relay's endpoint is
+	// learned through the lighthouse at runtime and is never embedded in a
+	// peer config, so extra addresses on a relay are stored and unused.
+	AdditionalHostPorts string `json:"additional_host_ports"` // JSON array of further HOST:PORT endpoints
+
 	// Per-host tun overrides. The zero value means "inherit the generator
 	// default" so an existing host renders exactly the config it always did.
 	MTU       int    `json:"mtu"`        // Overrides tun.mtu when > 0
@@ -168,9 +185,21 @@ type UnsafeRoute struct {
 // LIGHTHOUSE DISCOVERY:
 // Non-lighthouse hosts need to know where lighthouses are located (public IP:PORT).
 // This information is used to build the static_host_map section in Nebula configs.
+//
+// ADDRESSES IS A LIST BECAUSE static_host_map's VALUE IS:
+// Nebula takes a list per entry and tries them, which is how a dual-stack
+// lighthouse, one reachable over two internet paths, and a split-horizon
+// deployment (LAN address for the peers in the rack, public address for
+// everyone else) are all expressed. A one-element list is the common case and
+// renders exactly what a scalar did.
+//
+// The order is the operator's: HostRecord.PublicHostPort first, then
+// HostRecord.AdditionalHostPorts as stored. It is not sorted, for the same
+// reason PreferredRanges is not -- the value arrives from a column rather than
+// from an unordered query, so re-ordering it could only manufacture diffs.
 type LighthouseInfo struct {
-	OverlayIP      string `json:"overlay_ip"`       // Lighthouse overlay IP (e.g., "10.128.0.1")
-	PublicHostPort string `json:"public_host_port"` // Lighthouse public IP:PORT (e.g., "1.2.3.4:4242")
+	OverlayIP string   `json:"overlay_ip"` // Lighthouse overlay IP (e.g., "10.128.0.1")
+	Addresses []string `json:"addresses"`  // Underlay endpoints, primary first (e.g., ["1.2.3.4:4242"])
 }
 
 // Options configures the behavior of Nebula certificate and config generation.
@@ -427,6 +456,61 @@ func (h *HostRecord) GetPreferredRanges() ([]string, error) {
 		return nil, err
 	}
 	return ranges, nil
+}
+
+// GetAdditionalHostPorts parses the JSON additional_host_ports array into a
+// string slice. These are further underlay endpoints THIS host can be reached
+// at, beyond public_host_port.
+//
+// Empty or "null" yields nil, so a host with one address builds the
+// one-element static_host_map entry it always did.
+//
+// RETURNS:
+// - []string of HOST:PORT endpoints, nil when unset
+// - error if the stored value is not a JSON array of strings
+func (h *HostRecord) GetAdditionalHostPorts() ([]string, error) {
+	if h.AdditionalHostPorts == "" || h.AdditionalHostPorts == "null" {
+		return nil, nil
+	}
+
+	var addrs []string
+	if err := json.Unmarshal([]byte(h.AdditionalHostPorts), &addrs); err != nil {
+		return nil, err
+	}
+	return addrs, nil
+}
+
+// LighthouseAddresses returns every underlay endpoint peers should be handed
+// for this host, primary first.
+//
+// This is the one place the scalar and the list are joined, so nothing else has
+// to remember that public_host_port leads. An empty primary is skipped rather
+// than rendered as "" -- a lighthouse cannot be saved without one, but a record
+// written before that check existed can still be read here.
+//
+// RETURNS:
+// - []string: public_host_port followed by additional_host_ports, nil when none
+// - error if additional_host_ports is not a JSON array of strings
+func (h *HostRecord) LighthouseAddresses() ([]string, error) {
+	additional, err := h.GetAdditionalHostPorts()
+	if err != nil {
+		return nil, err
+	}
+
+	addrs := make([]string, 0, 1+len(additional))
+	if h.PublicHostPort != "" {
+		addrs = append(addrs, h.PublicHostPort)
+	}
+	for _, addr := range additional {
+		if addr != "" {
+			addrs = append(addrs, addr)
+		}
+	}
+
+	if len(addrs) == 0 {
+		return nil, nil
+	}
+	return addrs, nil
 }
 
 // GetUnsafeNetworks parses the JSON unsafe_networks array into a string slice.

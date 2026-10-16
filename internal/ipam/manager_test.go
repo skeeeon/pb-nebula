@@ -292,3 +292,44 @@ func TestValidatePublicHostPort(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateAdditionalHostPorts pins the rule that separates this column
+// from advertise_addrs: a peer DIALS these, so none of them may be port 0.
+func TestValidateAdditionalHostPorts(t *testing.T) {
+	tests := []struct {
+		name    string
+		addrs   []string
+		wantErr bool
+	}{
+		{"unset", nil, false},
+		{"empty slice", []string{}, false},
+		{"one address", []string{"1.2.3.4:4242"}, false},
+		{"dual stack", []string{"1.2.3.4:4242", "[2001:db8::1]:4242"}, false},
+		{"a DNS name, which Nebula re-resolves for static_host_map", []string{"lh.example.com:4242"}, false},
+
+		// Port 0 is the whole difference from advertise_addrs. A peer handed
+		// one has nothing to connect to.
+		{"port 0", []string{"1.2.3.4:0"}, true},
+
+		{"no port", []string{"1.2.3.4"}, true},
+		{"unbracketed IPv6", []string{"2001:db8::1:4242"}, true},
+		{"empty entry", []string{""}, true},
+		{"duplicate", []string{"1.2.3.4:4242", "1.2.3.4:4242"}, true},
+		{"over the bound", []string{
+			"1.2.3.4:1", "1.2.3.4:2", "1.2.3.4:3", "1.2.3.4:4", "1.2.3.4:5",
+			"1.2.3.4:6", "1.2.3.4:7", "1.2.3.4:8", "1.2.3.4:9",
+		}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateAdditionalHostPorts(tt.addrs)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateAdditionalHostPorts(%v) error = %v, wantErr %v", tt.addrs, err, tt.wantErr)
+			}
+			if err != nil && !errors.Is(err, types.ErrInvalidHostPort) {
+				t.Errorf("error does not wrap ErrInvalidHostPort: %v", err)
+			}
+		})
+	}
+}

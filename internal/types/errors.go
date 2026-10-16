@@ -34,6 +34,7 @@ var (
 	ErrInvalidUnsafeNetwork  = errors.New("invalid unsafe network")
 	ErrInvalidUnsafeRoute    = errors.New("invalid unsafe route")
 	ErrInvalidPreferredRange = errors.New("invalid preferred range")
+	ErrInvalidHostPort       = errors.New("invalid host:port address")
 	ErrHostInactive          = errors.New("host is inactive")
 
 	// Config errors - Configuration generation

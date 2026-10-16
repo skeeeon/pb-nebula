@@ -381,7 +381,7 @@ func networkFields() []core.Field {
 // - Generated keys: certificate, private_key
 // - Relations: network_id (foreign key)
 // - Generated: ca_certificate (denormalized), config_yaml (complete Nebula config)
-// - Lighthouse: is_lighthouse, public_host_port
+// - Lighthouse: is_lighthouse, public_host_port, additional_host_ports
 // - Firewall: firewall_outbound, firewall_inbound (host-specific rules)
 //
 // FIREWALL RULES (HOST-BASED):
@@ -492,9 +492,24 @@ func hostFields() []core.Field {
 		// completely alone, so adding a Pattern now would never reach a
 		// deployment that already has this column -- only a fresh database would
 		// get it, and the two would then validate differently. The hook runs on
+		// both, so the hook is where the check belongs.
 		&core.TextField{
 			Name: "public_host_port",
 			Max:  100,
+		},
+
+		// Further endpoints peers can reach this host at, beyond
+		// public_host_port, because Nebula's static_host_map value is a list:
+		// a dual-stack lighthouse, one on two internet paths, and a
+		// split-horizon deployment all need more than one address.
+		//
+		// A separate column rather than a widened public_host_port because
+		// addMissingFields never retypes an existing field -- and because
+		// keeping the scalar as the primary is what makes an existing
+		// one-address deployment render byte-identical config.
+		&core.JSONField{
+			Name:    "additional_host_ports",
+			MaxSize: 1000,
 		},
 
 		// Per-host tun overrides. Both use the zero value to mean "inherit the

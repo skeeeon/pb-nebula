@@ -23,7 +23,7 @@ func testHost() *types.HostRecord {
 
 func testLighthouses() []types.LighthouseInfo {
 	return []types.LighthouseInfo{
-		{OverlayIP: "10.128.0.1", PublicHostPort: "1.2.3.4:4242"},
+		{OverlayIP: "10.128.0.1", Addresses: []string{"1.2.3.4:4242"}},
 	}
 }
 
@@ -600,4 +600,155 @@ func TestGenerateHostConfigPreferredRanges(t *testing.T) {
 			t.Error("expected an error for malformed preferred_ranges, got nil")
 		}
 	})
+}
+
+// TestGenerateHostConfigIsByteIdenticalForASingleAddressLighthouse is the
+// regression test that makes this whole feature safe to ship.
+//
+// Every existing deployment has exactly one lighthouse address, no
+// advertise_addrs and no local_allow_list. For those -- which is all of them on
+// the day this lands -- the generator must emit the same bytes it emitted
+// before any of this existed, because config_yaml is pulled by devices and
+// shipped by whatever puts files on them: a config that differs only in
+// whitespace or key order still reads as "every host changed" and still earns a
+// restart of the entire fleet.
+//
+// The expected value is the literal output of the generator at the commit
+// before the lighthouse address list, advertise_addrs and local_allow_list were
+// added. It is deliberately a whole-document comparison and not a set of key
+// assertions: key assertions pass while a marshalling change reorders
+// everything, which is the diff this is here to catch.
+func TestGenerateHostConfigIsByteIdenticalForASingleAddressLighthouse(t *testing.T) {
+	g := NewGenerator()
+
+	out, err := g.GenerateHostConfig(HostConfigInput{
+		Host:        testHost(),
+		Lighthouses: testLighthouses(),
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+
+	const want = `firewall:
+    inbound:
+        - host: any
+          port: any
+          proto: icmp
+    outbound:
+        - host: any
+          port: any
+          proto: any
+lighthouse:
+    am_lighthouse: false
+    hosts:
+        - 10.128.0.1
+    interval: 60
+listen:
+    host: 0.0.0.0
+    port: 0
+logging:
+    format: text
+    level: info
+pki:
+    ca: CA-PEM
+    cert: CERT-PEM
+    disconnect_invalid: true
+    key: KEY-PEM
+punchy:
+    punch: true
+    respond: true
+static_host_map:
+    10.128.0.1:
+        - 1.2.3.4:4242
+tun:
+    dev: nebula1
+    disabled: false
+    drop_local_broadcast: false
+    drop_multicast: false
+    mtu: 1300
+    tx_queue: 500
+`
+
+	if out != want {
+		t.Errorf("config for a one-address lighthouse changed.\n got:\n%s\nwant:\n%s", out, want)
+	}
+}
+
+// TestGenerateHostConfigRendersEveryLighthouseAddress covers the case a single
+// public_host_port could not express.
+//
+// Nebula's static_host_map value is a list, and a lighthouse can legitimately
+// be reachable at more than one address: dual-stack, two internet paths, or a
+// LAN address for the peers in its own rack and a public one for everybody
+// else. All of those are one lighthouse with several endpoints, not several
+// lighthouses, so the overlay IP stays the single key.
+func TestGenerateHostConfigRendersEveryLighthouseAddress(t *testing.T) {
+	g := NewGenerator()
+
+	lighthouses := []types.LighthouseInfo{
+		{
+			OverlayIP: "10.128.0.1",
+			Addresses: []string{"1.2.3.4:4242", "[2001:db8::1]:4242", "192.168.10.5:4242"},
+		},
+	}
+
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: lighthouses})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+
+	shm := parseConfig(t, out)["static_host_map"].(map[string]interface{})
+	if len(shm) != 1 {
+		t.Fatalf("expected one static_host_map entry, got %v", shm)
+	}
+
+	got := shm["10.128.0.1"].([]interface{})
+	want := []string{"1.2.3.4:4242", "[2001:db8::1]:4242", "192.168.10.5:4242"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d endpoints, got %v", len(want), got)
+	}
+	// Order is the operator's: public_host_port leads, then additional_host_ports
+	// as stored. Nebula tries the entries, so the order is a preference the
+	// operator expressed, not an artifact to normalise away.
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("static_host_map endpoint %d = %v, want %s", i, got[i], want[i])
+		}
+	}
+}
+
+// TestGenerateHostConfigSkipsALighthouseWithNoAddress pins the degenerate case
+// the API refuses but an old record can still hold.
+//
+// Rendering it would put an entry Nebula cannot parse into every peer's config,
+// and a config error stops Nebula starting -- so one unsaveable row would take
+// out every host in the network on its next restart. Skipping costs that one
+// lighthouse its static entry and nothing else.
+func TestGenerateHostConfigSkipsALighthouseWithNoAddress(t *testing.T) {
+	g := NewGenerator()
+
+	lighthouses := []types.LighthouseInfo{
+		{OverlayIP: "10.128.0.1", Addresses: nil},
+		{OverlayIP: "10.128.0.2", Addresses: []string{"1.2.3.4:4242"}},
+	}
+
+	out, err := g.GenerateHostConfig(HostConfigInput{Host: testHost(), Lighthouses: lighthouses})
+	if err != nil {
+		t.Fatalf("GenerateHostConfig failed: %v", err)
+	}
+
+	shm := parseConfig(t, out)["static_host_map"].(map[string]interface{})
+	if _, present := shm["10.128.0.1"]; present {
+		t.Error("expected the addressless lighthouse to be left out of static_host_map")
+	}
+	if _, present := shm["10.128.0.2"]; !present {
+		t.Error("expected the addressed lighthouse to still be in static_host_map")
+	}
+
+	// It is still a discovery target: the overlay IP is what lighthouse.hosts
+	// carries, and that half does not depend on knowing an endpoint.
+	hosts := parseConfig(t, out)["lighthouse"].(map[string]interface{})["hosts"].([]interface{})
+	if len(hosts) != 2 {
+		t.Errorf("expected both lighthouses in lighthouse.hosts, got %v", hosts)
+	}
 }

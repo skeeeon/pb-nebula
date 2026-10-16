@@ -38,6 +38,7 @@ var (
 	ErrInvalidUnsafeNetwork  = types.ErrInvalidUnsafeNetwork
 	ErrInvalidUnsafeRoute    = types.ErrInvalidUnsafeRoute
 	ErrInvalidPreferredRange = types.ErrInvalidPreferredRange
+	ErrInvalidHostPort       = types.ErrInvalidHostPort
 	ErrHostInactive          = types.ErrHostInactive
 
 	// Config errors - Configuration generation

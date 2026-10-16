@@ -67,8 +67,8 @@ Fields whose zero value means "inherit the default" (`mtu`, `tun_device`) rely o
 The update hook in `internal/sync/manager.go` (`setupHostHooks`) distinguishes what *has* to be regenerated:
 
 - **Cert regeneration (expensive)** when `hostname`, `overlay_ip`, `groups`, `unsafe_networks`, or `validity_years` change — these are embedded in the certificate.
-- **Config-only regeneration (cheap)** when `is_lighthouse`, `is_relay`, `public_host_port`, `firewall_outbound`, `firewall_inbound`, `mtu`, `tun_device`, or `unsafe_routes` change — these are config-only.
-- **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. The same applies to relays (`is_relay`, `active`, `overlay_ip` — but *not* `public_host_port`, since peers carry only a relay's overlay IP, not its endpoint). Fan-out also fires on active lighthouse/relay create and delete, and on network `cidr_range` change.
+- **Config-only regeneration (cheap)** when `is_lighthouse`, `is_relay`, `public_host_port`, `additional_host_ports`, `firewall_outbound`, `firewall_inbound`, `mtu`, `tun_device`, `unsafe_routes`, or `preferred_ranges` change — these are config-only.
+- **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `additional_host_ports`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. The same applies to relays (`is_relay`, `active`, `overlay_ip` — but *not* `public_host_port`, since peers carry only a relay's overlay IP, not its endpoint). Fan-out also fires on active lighthouse/relay create and delete, and on network `cidr_range` change.
 
   `regenerateNetworkHostConfigs` loads the network-level state — trust bundle, lighthouses, relays, blocklist — **once** into a `networkConfigContext` and reuses it for every host, because nothing in the loop can change any of it (the loop writes `config_yaml` and nothing else). Rebuilding it per host meant one deactivation in a 200-host network re-parsed every inactive certificate 200 times. Single-host callers still use `generateHostConfig`, which loads a context for one host; the shared renderer is `generateHostConfigWith`.
 
@@ -205,6 +205,20 @@ Having the field is not the same as having a usable value, and this value goes t
 An **empty value stays valid**: the field is optional for an ordinary host, and the requirement that a lighthouse or relay have one is the separate presence check above, so existing records keep validating. `extractPort` still falls back to `0` rather than erroring, because it also runs over records written before this check existed and a regeneration sweep must not fail a whole network over one stale row.
 
 The `TextField` declaration deliberately carries **no `Pattern`**. A regex that expresses the port bound is unreadable, so in practice it would be laxer than the Go check and let exactly these values through — a second, divergent definition of "valid" rather than a second line of defence. It would also be the weaker half where it is needed most: `addMissingFields` identifies a field by name and leaves an existing one alone, so a `Pattern` added now reaches only a fresh database, never a deployment that already has the column.
+
+### A lighthouse has an address LIST, because `static_host_map`'s value is one
+
+`static_host_map` maps an overlay IP to a **list** of underlay endpoints, and Nebula tries them. One address was never the shape of the feature, it was the shape of the column: `public_host_port` is a single `TextField`, and `buildStaticHostMap` wrapped it in a one-element slice. That made three ordinary deployments inexpressible — a dual-stack lighthouse (v4 *and* v6), one reachable over two internet paths, and split horizon, where the peers in a lighthouse's own rack should bootstrap via its LAN address while roaming peers use the public one.
+
+The scalar **stays the primary** and a second column, `additional_host_ports`, carries the rest. Not because a list column would be worse, but because `addMissingFields` never retypes an existing field, so widening `public_host_port` in place is not something this library can do to a deployment that already has it — and keeping the scalar is also what guarantees an existing one-address host renders byte-identical config. `HostRecord.LighthouseAddresses()` is the single place the two are joined, primary first; nothing else should remember that ordering. `getLighthouses` calls it, and `types.LighthouseInfo.Addresses` carries the result.
+
+**The order is the operator's and is not sorted** — same reasoning as `preferred_ranges`. It arrives from columns rather than from an unordered query, so there is nothing to sort for and re-ordering could only manufacture diffs.
+
+`listen.port` still comes from `public_host_port` alone. A host listens on one port; the extra entries name other *addresses* it is reachable at, not other ports it binds.
+
+`additional_host_ports` is in **both** the config-only tier and the lighthouse fan-out condition, which is the `is_relay` lesson applied in advance: every peer carries the whole list in its `static_host_map`, so a change has to reach them — and `regenerateNetworkHostConfigs` excludes the edited record, so without the config-tier entry the lighthouse's own config would be the one left stale.
+
+**Extra addresses on a relay are stored and unused.** A relay's endpoint is learned through the lighthouse at runtime and never embedded in a peer config, so only a lighthouse's list reaches anyone else. That is the same asymmetry that keeps `public_host_port` out of the relay fan-out condition.
 
 ### Firewall rules are host-based, not network-based
 This mirrors Nebula's own design. `nebula_networks` has no firewall fields. Every host carries `firewall_outbound` and `firewall_inbound` as JSON arrays in Nebula's native format. The config generator (`internal/config/generator.go`) applies Nebula-recommended defaults (allow-all outbound, ICMP-only inbound) when a host's rules are empty.

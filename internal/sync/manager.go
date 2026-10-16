@@ -357,6 +357,11 @@ var configFields = []string{
 	"is_lighthouse",
 	"is_relay",
 	"public_host_port",
+	// The rest of a lighthouse's static_host_map entry. Every peer carries it,
+	// so it has a fan-out entry too -- and this config-tier entry is the half
+	// that keeps the edited host's OWN config in step, which is the mistake
+	// is_relay shipped with.
+	"additional_host_ports",
 	"firewall_outbound",
 	"firewall_inbound",
 	"mtu",
@@ -651,12 +656,18 @@ func (sm *Manager) setupHostHooks() {
 			}
 
 			// Check if peer configs are now stale. Peers embed this host's
-			// lighthouse data (overlay_ip -> public_host_port) in their own
+			// lighthouse data (overlay_ip -> its address list) in their own
 			// configs, so changes to a lighthouse must fan out.
+			//
+			// additional_host_ports belongs here for exactly the reason
+			// public_host_port does: both halves of the address list are
+			// copied verbatim into every peer's static_host_map, so dropping
+			// one leaves peers dialling an address this host no longer has.
 			if orig.GetBool("is_lighthouse") || e.Record.GetBool("is_lighthouse") {
 				if orig.GetBool("is_lighthouse") != e.Record.GetBool("is_lighthouse") ||
 					orig.GetBool("active") != e.Record.GetBool("active") ||
 					orig.GetString("public_host_port") != e.Record.GetString("public_host_port") ||
+					orig.GetString("additional_host_ports") != e.Record.GetString("additional_host_ports") ||
 					orig.GetString("overlay_ip") != e.Record.GetString("overlay_ip") {
 					needsPeerFanOut = true
 				}
@@ -937,6 +948,20 @@ func (sm *Manager) validateHostRecord(record *core.Record) error {
 			types.ErrInvalidPreferredRange, err)
 	}
 	if err := ipam.ValidatePreferredRanges(preferredRanges); err != nil {
+		return err
+	}
+
+	// The rest of this host's static_host_map entry. Validated with the same
+	// rules as public_host_port because peers carry both halves verbatim: a
+	// malformed entry is advertised to the whole network and reachable from
+	// none of it. Port 0 is refused here -- a peer cannot dial it.
+	hostModel.AdditionalHostPorts = record.GetString("additional_host_ports")
+	additionalHostPorts, err := hostModel.GetAdditionalHostPorts()
+	if err != nil {
+		return fmt.Errorf("%w: additional_host_ports must be a JSON array of HOST:PORT strings: %v",
+			types.ErrInvalidHostPort, err)
+	}
+	if err := ipam.ValidateAdditionalHostPorts(additionalHostPorts); err != nil {
 		return err
 	}
 
@@ -1362,6 +1387,17 @@ func (sm *Manager) getBlocklist(caID string) ([]string, error) {
 }
 
 // getLighthouses queries all active lighthouse hosts in a network.
+//
+// Each lighthouse contributes its whole address list -- public_host_port first,
+// then additional_host_ports -- because Nebula's static_host_map value is a
+// list and a lighthouse may legitimately be reachable at several addresses.
+// HostRecord.LighthouseAddresses is the single place that ordering lives.
+//
+// A lighthouse whose additional_host_ports is malformed JSON is NOT fatal here.
+// It contributes its primary address and logs, because this runs inside every
+// regeneration: failing would take the configs of every host in the network
+// with it over one bad row, and validation already refuses the shape at the
+// API. Same restraint as a failed blocklist build.
 func (sm *Manager) getLighthouses(networkID string) ([]types.LighthouseInfo, error) {
 	records, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
 		dbx.HashExp{"network_id": networkID, "is_lighthouse": true, "active": true})
@@ -1371,9 +1407,22 @@ func (sm *Manager) getLighthouses(networkID string) ([]types.LighthouseInfo, err
 
 	lighthouses := make([]types.LighthouseInfo, len(records))
 	for i, record := range records {
+		host := &types.HostRecord{
+			PublicHostPort:      record.GetString("public_host_port"),
+			AdditionalHostPorts: record.GetString("additional_host_ports"),
+		}
+
+		addresses, err := host.LighthouseAddresses()
+		if err != nil {
+			sm.logger.Warning("Lighthouse %s has malformed additional_host_ports, using its primary address only: %v",
+				record.GetString("hostname"), err)
+			host.AdditionalHostPorts = ""
+			addresses, _ = host.LighthouseAddresses()
+		}
+
 		lighthouses[i] = types.LighthouseInfo{
-			OverlayIP:      record.GetString("overlay_ip"),
-			PublicHostPort: record.GetString("public_host_port"),
+			OverlayIP: record.GetString("overlay_ip"),
+			Addresses: addresses,
 		}
 	}
 
@@ -1526,5 +1575,7 @@ func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
 		UnsafeNetworks:   record.GetString("unsafe_networks"),
 		UnsafeRoutes:     record.GetString("unsafe_routes"),
 		PreferredRanges:  record.GetString("preferred_ranges"),
+
+		AdditionalHostPorts: record.GetString("additional_host_ports"),
 	}
 }
