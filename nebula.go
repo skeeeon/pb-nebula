@@ -29,8 +29,8 @@ package pbnebula
 import (
 	"fmt"
 
-	"github.com/pocketbase/pocketbase"
-	"github.com/pocketbase/pocketbase/core"
+	"ganigeorgiev.com/pocketbase/pocketbase"
+	"ganigeorgiev.com/pocketbase/pocketbase/core"
 	"github.com/skeeeon/pb-nebula/internal/cert"
 	"github.com/skeeeon/pb-nebula/internal/collections"
 	"github.com/skeeeon/pb-nebula/internal/config"

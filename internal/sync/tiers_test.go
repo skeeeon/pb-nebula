@@ -4,7 +4,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/pocketbase/pocketbase/core"
+	"ganigeorgiev.com/pocketbase/pocketbase/core"
 )
 
 // hostRecordPair builds two detached host records with the real field types, so

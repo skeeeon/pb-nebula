@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/pocketbase/pocketbase/core"
+	"ganigeorgiev.com/pocketbase/pocketbase/core"
 	"github.com/skeeeon/pb-nebula/internal/types"
 )
 

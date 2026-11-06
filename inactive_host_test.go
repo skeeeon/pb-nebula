@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pocketbase/pocketbase"
-	"github.com/pocketbase/pocketbase/apis"
-	"github.com/pocketbase/pocketbase/core"
+	"ganigeorgiev.com/pocketbase/pocketbase"
+	"ganigeorgiev.com/pocketbase/pocketbase/apis"
+	"ganigeorgiev.com/pocketbase/pocketbase/core"
 	nebulacert "github.com/slackhq/nebula/cert"
 
 	pbnebula "github.com/skeeeon/pb-nebula"

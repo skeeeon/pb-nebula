@@ -3,7 +3,7 @@ package sync
 import (
 	"testing"
 
-	"github.com/pocketbase/pocketbase/core"
+	"ganigeorgiev.com/pocketbase/pocketbase/core"
 )
 
 // caRecord builds a detached CA record for the pure helpers below. No app is

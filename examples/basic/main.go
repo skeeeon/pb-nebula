@@ -4,7 +4,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/pocketbase/pocketbase"
+	"ganigeorgiev.com/pocketbase/pocketbase"
 	"github.com/skeeeon/pb-nebula"
 )
 

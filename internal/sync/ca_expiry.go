@@ -3,7 +3,7 @@ package sync
 import (
 	"time"
 
-	"github.com/pocketbase/pocketbase/core"
+	"ganigeorgiev.com/pocketbase/pocketbase/core"
 
 	nebulacert "github.com/slackhq/nebula/cert"
 )

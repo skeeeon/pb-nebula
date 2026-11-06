@@ -1,7 +1,7 @@
 package sync
 
 import (
-	"github.com/pocketbase/dbx"
+	"ganigeorgiev.com/pocketbase/dbx"
 
 	"github.com/skeeeon/pb-nebula/internal/cert"
 )
