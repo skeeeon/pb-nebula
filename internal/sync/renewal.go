@@ -91,7 +91,8 @@ func shouldRenew(notBefore, notAfter, now time.Time, threshold float64) bool {
 }
 
 // renewExpiringHostCerts re-issues every active host certificate that has passed
-// the renewal threshold.
+// the renewal threshold, or whose private key does not pair with it (see
+// hostCertNeedsRenewal).
 //
 // ONLY ACTIVE HOSTS:
 // An inactive host is revoked -- its fingerprint is in every peer's
@@ -193,6 +194,28 @@ func (sm *Manager) hostCertNeedsRenewal(record *core.Record, now time.Time) (boo
 		// A host mid-creation, before its certificate is generated. The create
 		// hook owns that; the sweep should not race it.
 		return false, nil
+	}
+
+	// A private key that does not pair with its certificate is due now, however
+	// young the certificate. Nebula refuses to start on such a pair, so the host
+	// has never run on it, and every host key pb-nebula issued before host keys
+	// were X25519 is one. This is the one case where the library re-signs
+	// without being asked (see AuditHostCertNetworkMasks for why it otherwise
+	// never does): re-signing moves a fingerprint and rewrites peer configs, but
+	// it cannot break a host that could not start. It also skips the clamp check
+	// below, because a new key is the point even if the expiry cannot move.
+	keyPEM, err := types.DecryptField(record.GetString("private_key"), sm.options.EncryptionKey)
+	if err != nil {
+		return false, fmt.Errorf("private key does not decrypt: %w", err)
+	}
+	paired, err := cert.HostKeyPairs(certPEM, keyPEM)
+	if err != nil {
+		return false, err
+	}
+	if !paired {
+		sm.logger.Warning("Host %s has a private key that does not pair with its certificate, so Nebula cannot start on it; re-issuing",
+			record.GetString("hostname"))
+		return true, nil
 	}
 
 	notBefore, notAfter, err := cert.ValidityFromPEM(certPEM)

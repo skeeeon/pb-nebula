@@ -1,6 +1,8 @@
 package cert
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"net/netip"
 	"testing"
 	"time"
@@ -103,6 +105,87 @@ func TestGenerateHostCert(t *testing.T) {
 	}
 	if _, err := caPool.VerifyCertificate(time.Now(), hostCert); err != nil {
 		t.Errorf("host certificate does not verify against its CA: %v", err)
+	}
+}
+
+// A host certificate is useless without a private key that belongs to it:
+// Nebula runs VerifyPrivateKey before it starts and refuses a mismatch
+// (nebula/pki.go). Every assertion above passed while every host key pb-nebula
+// issued failed that check, because nothing ran it.
+func TestGenerateHostCertKeyPairsWithItsCertificate(t *testing.T) {
+	m := NewManager()
+	ca, err := m.GenerateCA("pair-ca", 10)
+	if err != nil {
+		t.Fatalf("GenerateCA failed: %v", err)
+	}
+	host, err := m.GenerateHostCert(HostCertParams{
+		Hostname:        "door-01",
+		OverlayIP:       "10.128.0.20",
+		NetworkCIDR:     "10.128.0.0/24",
+		ValidityYears:   1,
+		CACertPEM:       ca.CertificatePEM,
+		CAPrivateKeyPEM: ca.PrivateKeyPEM,
+	})
+	if err != nil {
+		t.Fatalf("GenerateHostCert failed: %v", err)
+	}
+
+	ok, err := HostKeyPairs(host.CertificatePEM, host.PrivateKeyPEM)
+	if err != nil {
+		t.Fatalf("HostKeyPairs failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("the generated private key does not pair with its certificate; Nebula would refuse to start")
+	}
+}
+
+// The paired negative: HostKeyPairs must be able to say no, or the test above
+// proves nothing. This builds a host the way pb-nebula used to (an Ed25519 key
+// pair, with the seed written as the X25519 private key), which Nebula refuses.
+func TestHostKeyPairsRefusesTheOldEd25519Construction(t *testing.T) {
+	m := NewManager()
+	ca, err := m.GenerateCA("pair-ca", 10)
+	if err != nil {
+		t.Fatalf("GenerateCA failed: %v", err)
+	}
+	caCert, _, err := nebulacert.UnmarshalCertificateFromPEM([]byte(ca.CertificatePEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	caKey, _, _, err := nebulacert.UnmarshalSigningPrivateKeyFromPEM([]byte(ca.PrivateKeyPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	c, err := (&nebulacert.TBSCertificate{
+		Version:   nebulacert.Version2,
+		Name:      "old-host",
+		Networks:  []netip.Prefix{netip.MustParsePrefix("10.128.0.21/24")},
+		NotBefore: now,
+		NotAfter:  now.Add(time.Hour),
+		PublicKey: pub,
+		Curve:     nebulacert.Curve_CURVE25519,
+	}).Sign(caCert, nebulacert.Curve_CURVE25519, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, err := c.MarshalPEM()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := nebulacert.MarshalPrivateKeyToPEM(nebulacert.Curve_CURVE25519, priv[:32])
+
+	ok, err := HostKeyPairs(string(certPEM), string(keyPEM))
+	if err != nil {
+		t.Fatalf("HostKeyPairs failed: %v", err)
+	}
+	if ok {
+		t.Fatal("HostKeyPairs accepted an Ed25519 seed as an X25519 key; Nebula refuses this pair")
 	}
 }
 

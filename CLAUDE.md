@@ -282,6 +282,14 @@ first commit. `audit_test.go` pins the wiring, because a re-export that
 swallowed its error would leave every consumer's badge dark with `internal/cert`
 still green.
 
+### A host key is an X25519 pair, and the renewal sweep repairs old ones
+
+Only the CA signs, so only the CA key is Ed25519. A host key is an X25519 (Diffie-Hellman) pair, generated exactly as `nebula-cert` does (`hostKeyPair`, after `x25519Keypair` in `nebula/cmd/nebula-cert/sign.go`). Nebula checks `X25519(private key, basepoint)` against the certificate's public key before it starts and refuses a mismatch (`VerifyPrivateKey`, `nebula/pki.go`).
+
+pb-nebula generated an Ed25519 pair for hosts through v0.5.0 and wrote the seed as the X25519 key, so **no host it issued could start**. Every other test passed, because nothing ran Nebula's pair check. `TestGenerateHostCertKeyPairsWithItsCertificate` and `TestNebulaStartsOnTheGeneratedCertificateAndKey` now do, the second on the generated `config_yaml` the way `blocklist_honoured_test.go` replays Nebula's CA pool. `cert.HostKeyPairs` is the predicate.
+
+**The renewal sweep re-issues an active host whose key does not pair**, however young its certificate and past the clamp check. This is the one exception to the restraint above: re-signing moves a fingerprint and rewrites peer configs, but it cannot break a host that could not start. Inactive hosts are still skipped. `key_pair_repair_test.go` pins all three cases (broken is re-issued, healthy is left alone, revoked is left alone) by running the cron job against a real PocketBase.
+
 ### Host cert expiration is clamped
 `cert.Manager.GenerateHostCert` caps host cert `NotAfter` at the **parsed CA certificate's own `NotAfter`** — not the `expires_at` value stored in the DB. Cert timestamps have whole-second precision; a stored timestamp with sub-second precision can land fractionally after the real `NotAfter`, and `nebula/cert` then rejects the signing ("certificate expires after signing certificate"). Don't remove the clamp and don't reintroduce an external expiry source — `TestGenerateHostCertClampsToCAExpiry` guards this.
 

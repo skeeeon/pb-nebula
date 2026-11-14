@@ -5,10 +5,12 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"net/netip"
 	"time"
 
 	nebulacert "github.com/slackhq/nebula/cert"
+	"golang.org/x/crypto/curve25519"
 )
 
 // Manager handles generating Nebula certificates for CAs and hosts.
@@ -186,8 +188,12 @@ func (m *Manager) GenerateHostCert(params HostCertParams) (*HostCertResult, erro
 		return nil, fmt.Errorf("failed to parse CA private key: %w", err)
 	}
 
-	// Generate Ed25519 key pair for host
-	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+	// A host key is an X25519 (Diffie-Hellman) pair, not an Ed25519 signing
+	// pair: only the CA signs. Nebula checks at startup that
+	// X25519(private key, basepoint) equals the certificate's public key, and
+	// refuses to start if not (VerifyPrivateKey, nebula/pki.go). The Ed25519
+	// pair this used to generate never passed that check, so no host could start.
+	pubKey, privKey, err := hostKeyPair()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate host key pair: %w", err)
 	}
@@ -234,15 +240,49 @@ func (m *Manager) GenerateHostCert(params HostCertParams) (*HostCertResult, erro
 		return nil, fmt.Errorf("failed to marshal host certificate to PEM: %w", err)
 	}
 
-	// For host certificates, we use X25519 key format (not Ed25519 signing format)
-	// The private key is the same bytes, but the PEM banner is different
-	privKeyPEM := nebulacert.MarshalPrivateKeyToPEM(nebulacert.Curve_CURVE25519, privKey[:32])
+	privKeyPEM := nebulacert.MarshalPrivateKeyToPEM(nebulacert.Curve_CURVE25519, privKey)
 
 	return &HostCertResult{
 		CertificatePEM: string(certPEM),
 		PrivateKeyPEM:  string(privKeyPEM),
 		ExpiresAt:      expiresAt,
 	}, nil
+}
+
+// hostKeyPair generates a host's X25519 key pair exactly as nebula-cert does
+// (x25519Keypair, nebula/cmd/nebula-cert/sign.go): 32 random bytes are the
+// private key, and the public key is derived from them.
+func hostKeyPair() (pub, priv []byte, err error) {
+	priv = make([]byte, curve25519.ScalarSize)
+	if _, err := io.ReadFull(rand.Reader, priv); err != nil {
+		return nil, nil, err
+	}
+	pub, err = curve25519.X25519(priv, curve25519.Basepoint)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pub, priv, nil
+}
+
+// HostKeyPairs reports whether a host's stored private key belongs to its
+// certificate, using the check Nebula runs before it starts. A false means the
+// host cannot start on this certificate and key.
+//
+// RETURNS:
+//   - true when the key pairs with the certificate
+//   - false when it does not, including every key pb-nebula issued before host
+//     keys were X25519
+//   - error if either PEM does not parse
+func HostKeyPairs(certPEM, privateKeyPEM string) (bool, error) {
+	c, _, err := nebulacert.UnmarshalCertificateFromPEM([]byte(certPEM))
+	if err != nil {
+		return false, fmt.Errorf("host certificate does not parse: %w", err)
+	}
+	key, _, curve, err := nebulacert.UnmarshalPrivateKeyFromPEM([]byte(privateKeyPEM))
+	if err != nil {
+		return false, fmt.Errorf("host private key does not parse: %w", err)
+	}
+	return c.VerifyPrivateKey(curve, key) == nil, nil
 }
 
 // overlayPrefix builds the prefix that goes into a host certificate's Networks:

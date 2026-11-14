@@ -996,6 +996,21 @@ go build ./examples/basic
 
 ## Troubleshooting
 
+### Nebula says "private key is not a pair with public key in nebula cert"
+
+**Problem:** A host issued by pb-nebula v0.5.0 or earlier will not start.
+
+**Cause:** Those versions generated an Ed25519 key pair for each host and wrote
+the seed as its X25519 private key. Nebula checks the pair before it starts,
+and that pair never matched, so no host issued by those versions could run.
+
+**Solution:** Upgrade. The renewal sweep re-issues every **active** host whose
+key does not pair with its certificate the next time it runs (daily at 03:00 by
+default), even a young certificate, because a host that cannot start has
+nothing to lose from a new fingerprint. To fix a host at once, set
+`renew = true` on it. With `DisableHostCertRenewal` set, `renew` is the only
+way. An inactive host is not re-issued: reactivating it issues a new pair.
+
 ### Host Creation Slow
 
 **Problem:** Host creation takes > 5 seconds
