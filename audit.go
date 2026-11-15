@@ -35,8 +35,7 @@ import (
 // library deliberately never does this on its own.
 //
 // INACTIVE HOSTS: the caller should skip them. An inactive host is revoked, and
-// re-signing it would publish a new fingerprint while the old certificate
-// stayed valid and unblocklisted -- silently un-revoking it.
+// renew is refused on one: its new certificate would be revoked from the start.
 //
 // PARAMETERS:
 //   - certPEM: the host's stored certificate, PEM encoded ("" if not yet issued)

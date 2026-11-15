@@ -160,6 +160,8 @@ Host configurations with PocketBase authentication.
 | private_key | text | PEM host private key (auto-generated) |
 | ca_certificate | text | PEM CA cert (denormalized) |
 | config_yaml | text | Complete Nebula config (auto-generated) |
+| revoked_certificates | json | PEM certificates this host was issued that every peer refuses (auto-generated) — see [A replaced certificate is still valid](#a-replaced-certificate-is-still-valid) |
+| retired_certificates | json | PEM certificates replaced by renewal or CA rotation, refused once the host is inactive (auto-generated) |
 | firewall_outbound | json | Outbound firewall rules |
 | firewall_inbound | json | Inbound firewall rules |
 | validity_years | number | Certificate validity (default: 1) |
@@ -322,6 +324,10 @@ These fields are **embedded in the certificate** and require regeneration:
 | `groups` | Regenerate certificate + config | Groups are in the certificate |
 | `validity_years` | Regenerate certificate + config | Changes certificate lifetime |
 
+Each of these, and `renew`, also **revokes the certificate it replaced**, so
+every other config under the CA is regenerated with it in `pki.blocklist` — see
+[A replaced certificate is still valid](#a-replaced-certificate-is-still-valid).
+
 **Log Output:**
 ```
 [15:04:05] ℹ️  INFO Groups changed for web-01, regenerating certificate
@@ -376,14 +382,15 @@ write reaches every server.
 
 Flip `active` on a host — in either direction — and pb-nebula:
 
-1. Computes the SHA-256 fingerprint of that host's certificate, from the stored
-   PEM rather than a cached column.
-2. Regenerates every *other* config in the network, with the fingerprints of all
-   inactive hosts in `pki.blocklist`.
+1. Computes the SHA-256 fingerprint of each certificate the host holds or held,
+   from the stored PEM rather than a cached column.
+2. Regenerates every *other* config in the network, with those fingerprints in
+   `pki.blocklist`.
 3. Regenerates the changed host's own config, since the peer fan-out
    deliberately excludes the record that triggered it.
 
-Reactivating a host drops its fingerprint from the list on the same pass.
+Reactivating a host issues it a new certificate, and the ones it held stay on
+the list (see below).
 
 ```yaml
 pki:
@@ -426,6 +433,29 @@ to build the list is never fatal: a config without a blocklist is the config
 this library generated for years, and failing would stop a host getting any
 config at all.
 
+### A replaced certificate is still valid
+
+Re-issuing a host does not make the certificate it replaces stop working; only
+expiry or the blocklist does. So pb-nebula keeps each replaced certificate on
+the host, until it expires or its CA leaves the trust bundle, and lists it:
+
+- **Revoked** when the re-issue was asked for: an edit to `hostname`,
+  `overlay_ip`, `groups`, `unsafe_networks` or `validity_years`, `renew`, or
+  reactivation. Every peer refuses it from then on, so a host taken out of a
+  group does not keep the group in its old certificate, and `renew` is a remedy
+  for a leaked key. The fan-out reaches every config under the CA. The host is
+  cut off from each peer that redeploys before it fetches its own new config.
+- **Retired** when the re-issue was routine: the renewal cron and CA rotation.
+  It keeps working, so a host that has not fetched yet stays on the mesh, and
+  rotation still needs no cut-over. It is listed only once the host is
+  deactivated, because the device may still hold it.
+
+Kept as `revoked_certificates` and `retired_certificates` on the host, as PEM.
+A certificate whose CA has left the bundle is never listed, since no host can
+verify it, so a finished CA rotation empties the list of everything the old CA
+signed. That is the remedy if the list grows toward the 50000-byte
+`config_yaml` cap (about 75 bytes an entry); pb-nebula warns past 400 entries.
+
 ### Deactivate to revoke — do not delete
 
 A deleted host record takes its certificate with it, and a fingerprint that is
@@ -435,9 +465,9 @@ leave trusted.
 
 ### An inactive host is never re-signed
 
-The blocklist is built from the certificate **stored** on each inactive host, so
-replacing that certificate would revoke one nobody holds and un-revoke the one
-the device still has. Nothing re-signs an inactive host:
+An inactive host is revoked, so a certificate issued to it would be revoked from
+the start, and one more fingerprint in every peer config. Nothing re-signs an
+inactive host:
 
 - **`renew = true` is refused** with an error wrapping `ErrHostInactive` (a 400
   through the record API, with the reason in the message). Reactivate the host

@@ -26,10 +26,10 @@ import (
 // `renew` action field is already the lever for it.
 //
 // INACTIVE HOSTS ARE SKIPPED, AND NOT AS AN OVERSIGHT:
-// An inactive host is revoked: its fingerprint sits in every peer's blocklist.
-// Re-signing it would publish a new fingerprint while the old certificate
-// stayed valid, silently un-revoking it. Warning about one would invite exactly
-// that, so it is left out -- the same rule the renewal and CA rotation sweeps
+// An inactive host is revoked: everything it holds or held sits in every
+// peer's blocklist. Re-signing it would issue a certificate revoked from the
+// start, and renew refuses it, so warning about one would point at a lever
+// that does not move -- the same rule the renewal and CA rotation sweeps
 // follow.
 //
 // PARAMETERS:

@@ -574,6 +574,19 @@ func hostFields() []core.Field {
 			Max:  50000,
 		},
 
+		// Certificates this host was issued and no longer holds, as PEM, kept
+		// until no peer could accept them. pki.blocklist reads them: a
+		// replaced certificate is valid until it expires. revoked ones are
+		// refused always, retired ones once the host is inactive. Written by
+		// pb-nebula only. No MaxSize: PocketBase's 1 MB default, because the
+		// 50000-byte config_yaml cap binds long before either list gets large.
+		&core.JSONField{
+			Name: "revoked_certificates",
+		},
+		&core.JSONField{
+			Name: "retired_certificates",
+		},
+
 		// Host-specific firewall rules (Nebula native JSON format)
 		&core.JSONField{
 			Name:    "firewall_outbound",

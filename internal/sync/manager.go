@@ -518,8 +518,9 @@ func (sm *Manager) setupHostHooks() {
 
 		sm.logger.Cert("Generating certificate and config for host %s...", e.Record.GetString("hostname"))
 
-		// Generate host certificate and config
-		if err := sm.generateHostCertAndConfig(e.Record); err != nil {
+		// Generate host certificate and config. Nothing is replaced yet, so
+		// retire and revoke are the same here.
+		if err := sm.generateHostCertAndConfig(e.Record, retire); err != nil {
 			sm.logger.Error("Failed to generate host certificate/config: %v", err)
 			return fmt.Errorf("failed to generate host certificate/config: %w", err)
 		}
@@ -698,14 +699,14 @@ func (sm *Manager) setupHostHooks() {
 		}
 
 		// An INACTIVE host is never re-signed, whatever asked for it -- the same
-		// rule the renewal and rotation sweeps follow. Its revocation is the
-		// fingerprint of its STORED certificate, which getBlocklist reads on
-		// every rebuild; re-signing replaces that certificate, so the next
-		// rebuild revokes one nobody holds and drops the one the device does.
+		// rule the renewal and rotation sweeps follow. It is revoked, so every
+		// certificate it holds or held is on every peer's blocklist, and a new
+		// one would be revoked from the start: a fingerprint in every config
+		// under the CA, for nothing.
 		//
 		// Keyed on the state this save LEAVES, not the one it found, so a single
 		// save that deactivates a host and edits a certificate field revokes the
-		// certificate the device holds rather than a fresh one.
+		// certificate the device holds and issues nothing.
 		//
 		// renew never gets this far (checkHostRenew refuses it before the
 		// write); this catches the certificate-tier fields and validity_years.
@@ -720,6 +721,24 @@ func (sm *Manager) setupHostHooks() {
 				e.Record.GetString("hostname"))
 			needsCertRegeneration = false
 			needsConfigRegeneration = true
+		}
+
+		// Every re-issue this hook makes was asked for -- a certificate field,
+		// validity_years, renew, reactivation -- so it REVOKES the certificate
+		// it replaces, and the ones retired before it. Without that, a host
+		// taken out of a group keeps the group for as long as its device keeps
+		// the old config, and reactivating a host that was deactivated after a
+		// leak takes the leaked certificate off every blocklist.
+		//
+		// The cost is availability: the host is cut off from each peer that
+		// redeploys before it fetches its own new config. That is what the
+		// change asked for. The sweeps retire instead (see replacement).
+		//
+		// The revocation lives in every other config under the CA, so fan out
+		// as far as an active flip does.
+		if needsCertRegeneration {
+			needsPeerFanOut = true
+			needsCAFanOut = true
 		}
 
 		if !needsCertRegeneration && !needsConfigRegeneration && !needsPeerFanOut {
@@ -739,7 +758,7 @@ func (sm *Manager) setupHostHooks() {
 		if needsCertRegeneration {
 			sm.logger.Cert("Regenerating certificate and config for host %s...", e.Record.GetString("hostname"))
 
-			if err := sm.generateHostCertAndConfig(e.Record); err != nil {
+			if err := sm.generateHostCertAndConfig(e.Record, revoke); err != nil {
 				sm.logger.Error("Failed to regenerate certificate for host %s: %v", e.Record.Id, err)
 				return e.Next()
 			}
@@ -833,8 +852,8 @@ func checkHostRenew(record, original *core.Record) error {
 	if original != nil && original.GetBool("renew") {
 		return nil
 	}
-	return fmt.Errorf("%w: %s is inactive, so its certificate is revoked by fingerprint in every peer's pki.blocklist, "+
-		"and renewing it would replace that certificate and un-revoke the one the device still holds; "+
+	return fmt.Errorf("%w: %s is inactive, so its certificates are revoked by fingerprint in every peer's pki.blocklist, "+
+		"and a renewed one would be revoked too; "+
 		"reactivate the host instead, which issues a new certificate",
 		types.ErrHostInactive, record.GetString("hostname"))
 }
@@ -1134,7 +1153,13 @@ func (sm *Manager) generateCA(record *core.Record) error {
 // The host private key is set as plaintext temporarily so generateHostConfig can read
 // it via recordToHostModel and embed it into config_yaml. It is encrypted on the
 // record afterwards, before the caller saves.
-func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
+//
+// THE CERTIFICATE IT REPLACES:
+// is kept on the record, retired or revoked as how says (see replacement). It
+// stays valid until it expires whatever we do, so it has to stay where
+// getBlocklist can find it. A caller that revokes must also fan out across the
+// CA, because the revocation lives in every other host's config.
+func (sm *Manager) generateHostCertAndConfig(record *core.Record, how replacement) error {
 	// Get network and CA
 	network, err := sm.app.FindRecordById(sm.options.NetworkCollectionName, record.GetString("network_id"))
 	if err != nil {
@@ -1192,6 +1217,9 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", types.ErrCertGeneration, err)
 	}
+
+	// Keep the certificate being replaced before it is overwritten.
+	replaceCertificate(record, how, trustedCAs(caBundle(ca)), time.Now())
 
 	// Store certificate and CA cert (denormalized).
 	// Set private_key as plaintext temporarily so generateHostConfig can embed it
@@ -1324,8 +1352,16 @@ func (sm *Manager) generateHostConfigWith(record *core.Record, ctx *networkConfi
 	return nil
 }
 
-// getBlocklist returns the certificate fingerprints of every DEACTIVATED host
-// under a CA, sorted.
+// getBlocklist returns the fingerprints of every certificate under a CA that its
+// hosts must refuse, sorted: every certificate a DEACTIVATED host holds or
+// held, and every certificate any host was revoked for (blocklistCandidates).
+//
+// A host's "held" certificates include the ones re-issues replaced, because a
+// replaced certificate stays valid until it expires and the device may still
+// be presenting it. Listing only the stored certificate meant a host taken out
+// of a group kept the group in its old certificate, and reactivating a host
+// took the certificate it had been deactivated for off every blocklist. See
+// replacement for which re-issues revoke and which only retire.
 //
 // This is the revocation list. Nebula has no CRL and no OCSP: the only way to
 // refuse a certificate it has already signed is pki.blocklist, a list of
@@ -1384,40 +1420,63 @@ func (sm *Manager) getBlocklist(caID string) ([]string, error) {
 		networkIDs[i] = network.Id
 	}
 
+	// The CAs a host trusts, so a certificate none of them signed is not
+	// listed. Unknown if the CA cannot be read, and then nothing is dropped
+	// for its issuer.
+	var trusted map[string]bool
+	if ca, err := sm.app.FindRecordById(sm.options.CACollectionName, caID); err == nil {
+		trusted = trustedCAs(caBundle(ca))
+	}
+
+	// Every host, active or not: an active host can carry revoked
+	// certificates too. One query, and no SQL over the JSON columns, because
+	// a filter that missed a row would drop a revocation without an error.
 	records, err := sm.app.FindAllRecords(sm.options.HostCollectionName,
-		dbx.In("network_id", networkIDs...), dbx.HashExp{"active": false})
+		dbx.In("network_id", networkIDs...))
 	if err != nil {
 		return nil, err
 	}
 
 	now := time.Now()
-	fingerprints := make([]string, 0, len(records))
+	var fingerprints []string
 	for _, record := range records {
-		certPEM := record.GetString("certificate")
-		if certPEM == "" {
-			continue // never issued one; nothing to revoke
+		for _, certPEM := range blocklistCandidates(record) {
+			// Drop what Nebula refuses already: an expired certificate, or
+			// one whose CA has left the bundle. Without this the list only
+			// ever grows, in a config_yaml field capped at 50000 bytes.
+			// Validity is read from the certificate, not from expires_at, for
+			// the same reason the expiry clamp does.
+			keep, err := stillAccepted(certPEM, trusted, now)
+			if err == nil && !keep {
+				continue
+			}
+			fp, err := cert.FingerprintFromPEM(certPEM)
+			if err != nil {
+				// One unparseable certificate must not cost the CA's hosts
+				// their whole blocklist, so log it and keep the rest.
+				sm.logger.Warning("Cannot fingerprint certificate for host %s, omitting from blocklist: %v", record.Id, err)
+				continue
+			}
+			fingerprints = append(fingerprints, fp)
 		}
-		// Drop expired certificates. Nebula refuses an expired certificate on
-		// its own, so blocklisting one buys nothing -- and without this the
-		// list only ever grows, in a config_yaml field capped at 50000 bytes.
-		// Read the validity from the certificate, not from expires_at, for the
-		// same reason the expiry clamp does.
-		if _, notAfter, err := cert.ValidityFromPEM(certPEM); err == nil && !now.Before(notAfter) {
-			continue
-		}
-		fp, err := cert.FingerprintFromPEM(certPEM)
-		if err != nil {
-			// One unparseable certificate must not cost the CA's hosts their
-			// whole blocklist, so log it and keep the rest.
-			sm.logger.Warning("Cannot fingerprint certificate for host %s, omitting from blocklist: %v", record.Id, err)
-			continue
-		}
-		fingerprints = append(fingerprints, fp)
+	}
+
+	// About 75 bytes of every config under the CA per entry, against a 50000
+	// cap. A config over the cap cannot be saved, so every regeneration under
+	// the CA would fail, revocations included. Warn well before that.
+	if len(fingerprints) > blocklistWarnEntries {
+		sm.logger.Warning("pki.blocklist for CA %s has %d entries, about %d bytes of every host config (capped at 50000). "+
+			"Rotating the CA clears every certificate the old CA signed once finish runs.",
+			caID, len(fingerprints), len(fingerprints)*75)
 	}
 
 	sort.Strings(fingerprints)
 	return fingerprints, nil
 }
+
+// blocklistWarnEntries is where getBlocklist starts warning: about 30000 bytes
+// of blocklist, leaving the rest of the 50000-byte config_yaml for the host.
+const blocklistWarnEntries = 400
 
 // getLighthouses queries all active lighthouse hosts in a network.
 //

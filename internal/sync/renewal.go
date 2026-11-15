@@ -95,11 +95,10 @@ func shouldRenew(notBefore, notAfter, now time.Time, threshold float64) bool {
 // hostCertNeedsRenewal).
 //
 // ONLY ACTIVE HOSTS:
-// An inactive host is revoked -- its fingerprint is in every peer's
-// pki.blocklist. Re-issuing it would change that fingerprint, so getBlocklist
-// would publish the NEW one while the OLD certificate stays valid and
-// unblocklisted. Renewing a revoked host would therefore un-revoke it. Same
-// rule, and the same reason, as the CA rotation sweep.
+// An inactive host is revoked -- everything it holds or held is in every
+// peer's pki.blocklist. Re-issuing it would add a certificate revoked from the
+// start, and a fingerprint to every peer config, for nothing. Same rule, and
+// the same reason, as the CA rotation sweep.
 //
 // FAILURES ARE PER-HOST:
 // One unreadable certificate or one record that fails auth validation must not
@@ -148,7 +147,10 @@ func (sm *Manager) renewExpiringHostCerts() {
 
 		sm.logger.Cert("Renewing certificate for host %s...", fresh.GetString("hostname"))
 
-		if err := sm.generateHostCertAndConfig(fresh); err != nil {
+		// Retire, not revoke: a renewal is routine, and the host keeps working
+		// on its old certificate until it fetches the new one. No peer config
+		// changes, so there is nothing to fan out.
+		if err := sm.generateHostCertAndConfig(fresh, retire); err != nil {
 			sm.logger.Warning("Failed to renew certificate for host %s: %v", fresh.GetString("hostname"), err)
 			continue
 		}

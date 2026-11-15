@@ -66,7 +66,7 @@ Fields whose zero value means "inherit the default" (`mtu`, `tun_device`) rely o
 ### Tiered regeneration (do not break this)
 The update hook in `internal/sync/manager.go` (`setupHostHooks`) distinguishes what *has* to be regenerated:
 
-- **Cert regeneration (expensive)** when `hostname`, `overlay_ip`, `groups`, `unsafe_networks`, or `validity_years` change — these are embedded in the certificate.
+- **Cert regeneration (expensive)** when `hostname`, `overlay_ip`, `groups`, `unsafe_networks`, or `validity_years` change — these are embedded in the certificate. Every re-issue this hook makes **revokes** the certificate it replaces and so fans out across the **CA**, like an `active` flip (see **A replaced certificate is still valid**).
 - **Config-only regeneration (cheap)** when `is_lighthouse`, `is_relay`, `public_host_port`, `additional_host_ports`, `firewall_outbound`, `firewall_inbound`, `mtu`, `tun_device`, `unsafe_routes`, `preferred_ranges`, `advertise_addrs`, or `local_allow_list` change — these are config-only.
 - **Peer fan-out** (`regenerateNetworkHostConfigs`) when a lighthouse-relevant field changes on a host that is or was a lighthouse (`is_lighthouse`, `active`, `public_host_port`, `additional_host_ports`, `overlay_ip`) — peers embed lighthouse data in their `static_host_map`/`lighthouse` sections. The same applies to relays (`is_relay`, `active`, `overlay_ip` — but *not* `public_host_port`, since peers carry only a relay's overlay IP, not its endpoint). Fan-out also fires on active lighthouse/relay create and delete, and on network `cidr_range` change. `advertise_addrs` and `local_allow_list` are deliberately absent: a host reports those at runtime over the mesh rather than through any peer's config file.
 
@@ -89,7 +89,7 @@ If you add a new host field, decide which tier it belongs in and **add it to `ce
 
 Consequences worth keeping:
 
-- `getBlocklist(caID)` (`internal/sync/manager.go`) returns the fingerprints of every host **under a CA** with `active = false`, **sorted** — unsorted, map iteration order would make every regeneration look like a change.
+- `getBlocklist(caID)` (`internal/sync/manager.go`) returns, for every host **under a CA**, the fingerprints of its revoked certificates and, if it has `active = false`, of everything it holds or held — **sorted**, because unsorted, map iteration order would make every regeneration look like a change.
 - **The blocklist is scoped to the CA, not the network, because trust is.** A network-scoped blocklist revoked a host from its own peers and left it verifiable by every sibling network under the same CA: those hosts carry the same `pki.ca` and none of them carried the fingerprint. Deactivation has to reach as far as the signature does, or it is not revocation. Consequently an `active` flip fans out across the **whole CA** (`regenerateCAHostConfigs`), while lighthouse and relay changes stay **network**-scoped — no host renders another network's lighthouses.
 - The fingerprint is **derived from the stored certificate** (`cert.FingerprintFromPEM`), not cached in a column. That was originally forced — `InitializeCollections` could not add a field to an existing deployment — but it is still the right shape now that it can: a cached fingerprint is a second copy of something the certificate already states, and the two can disagree after any re-issue. Derive, don't cache. (`rotation_state` is absent from `nebula_ca` for the same reason.)
 - An empty blocklist is **omitted** from the config rather than written as an empty list, so a network with nothing revoked renders exactly the config it did before this feature.
@@ -97,6 +97,23 @@ Consequences worth keeping:
 - A failure to build the blocklist is **logged, never fatal**. A config without a blocklist is the config this library generated for years; failing would stop a host getting any config at all.
 
 **A host is born active.** PocketBase bools have no schema-level default, so a create that omits `active` lands as false -- and every host minted through the API omits it. That was nearly harmless while `active` only gated `getLighthouses`; it stopped being harmless once `active` drove `pki.blocklist`, because a freshly issued certificate would be blocklisted by every peer from the moment it was created. `setupHostHooks` therefore forces `active = true` on create. It is forced rather than defaulted-if-absent because by the time a hook sees the record, "field omitted" and "explicitly false" are indistinguishable; creating an already-revoked host is not a meaningful operation, and deactivation is an update.
+
+### A replaced certificate is still valid
+
+A re-issue does not stop the old certificate working; only expiry or the blocklist does. `getBlocklist` used to read only the **stored** certificate of inactive hosts, so a host taken out of a group kept the group in the certificate its device still held, and reactivating a host that had been deactivated after a leak took the leaked certificate off every blocklist.
+
+`generateHostCertAndConfig` now keeps the certificate it replaces, as PEM, in one of two host columns (`internal/sync/replaced.go`):
+
+- **`revoked_certificates`** — listed whatever the host's state. Every re-issue the **update hook** makes goes here, together with everything retired before it (same name, same groups): a certificate field, `validity_years`, `renew`, reactivation. Those are changes someone asked for, so the hook fans out across the CA. The price is that the host is cut off from each peer that redeploys before it fetches its own new config; that is what `renew` after a leak is for.
+- **`retired_certificates`** — listed only while the host is inactive. The **renewal sweep and the CA rotation sweep** go here. Revoking there would make every nightly renewal a cut-over and would defeat rotation, whose whole point is that the outgoing certificate keeps working until `finish`. Recorded anyway, because the device may still hold it when someone deactivates the host.
+
+`stillAccepted` drops a certificate that has expired **or whose issuer is no longer in the CA bundle** — Nebula refuses both already, and every entry costs ~75 bytes of every `config_yaml` under the CA. The issuer half is what bounds the list: a finished rotation drops everything the old CA signed. It is safe because the bundle and the blocklist travel in the same `config_yaml`, so no host holds the shorter list while still trusting the old CA. The same predicate prunes both columns at write time. `getBlocklist` warns past 400 entries (`blocklistWarnEntries`), because a config over the 50000 cap cannot be saved and every regeneration under the CA would then fail, revocations included. Rotation is the remedy.
+
+`getBlocklist` now loads **every** host under the CA, not just inactive ones, with no SQL over the JSON columns: a filter that missed a row would drop a revocation silently, which is the failure this whole section exists to prevent.
+
+The older rule that nothing re-signs an inactive host still stands, but its old reason (re-signing would un-revoke the held certificate) no longer applies: a re-signed inactive host would keep its old certificate listed. The reason now is that its new certificate would be revoked from birth.
+
+Certificates replaced **before** this shipped were never stored and cannot be listed. They stay valid until they expire, or until a CA rotation finishes.
 
 **Deactivate to revoke; do not delete.** A deleted host record takes its certificate with it, and a fingerprint that is not in the database cannot be blocklisted — so deleting a host leaves its certificate valid until it expires. Deletion is for hosts you are content to leave trusted.
 
@@ -121,7 +138,7 @@ Saves issued by pb-nebula itself re-fire the update hooks, and `e.Record.Origina
 
 **The bundle content is identical in both phases** — `[old, new]` either way (`caBundle`) — which is precisely what lets a host fetch at any instant from `prepare` onward and still talk to every peer. It is read from the **CA record** on every generation, not denormalized onto hosts, which makes rotation self-healing: any regeneration hands out the current bundle, so `finish` and partial recovery need no re-signing. `host.ca_certificate` stays a single certificate.
 
-**Inactive hosts are never re-signed.** Their fingerprint is in every peer's blocklist; re-signing would change it, so `getBlocklist` would publish the new one while the old cert stayed valid under the still-trusted outgoing CA — silently un-revoking it. Verified live across two rotations: the revoked host's fingerprint survived unchanged.
+**Inactive hosts are never re-signed.** Everything they hold or held is on every peer's blocklist, so a new certificate would be revoked from birth; their outgoing-CA certificate stops verifying at `finish`. Verified live across two rotations: the revoked host's fingerprint survived unchanged. **commit retires, never revokes** the certificates it replaces, or a host that has not fetched yet is cut off and the three steps buy nothing; a host deactivated between commit and finish still has its outgoing-CA certificate listed (`TestRotationRetiresAndFinishClearsTheList`).
 
 **So reactivation must force a cert regeneration**, and that is why the `active` false→true branch sets `needsCertRegeneration`. A host parked across a rotation comes back holding a certificate from a CA that may since have been retired — off the blocklist, healthy-looking in the Admin UI, able to handshake with nobody.
 
@@ -149,7 +166,7 @@ the request hook still owns the client-facing message.
 
 **The clamp trap.** `GenerateHostCert` clamps `NotAfter` to the CA's own `NotAfter`. Once the CA's expiry is the binding constraint, a re-issued certificate carries the *same* `NotAfter` as the one it replaced — so it is still past the threshold and the host gets re-signed on **every sweep until the CA expires**. That is a nightly fingerprint change plus a full config fan-out, arriving exactly when the CA needs calm attention. `hostCertNeedsRenewal` therefore refuses to renew when `notAfter` is not before the CA's, and warns naming the real fix: rotate the CA. Verified — a clamped host warns on every tick and is never re-signed.
 
-**Only active hosts are renewed.** An inactive host is revoked; re-issuing it changes its fingerprint, so `getBlocklist` would publish the new one while the old certificate stayed valid and unblocklisted. Renewing a revoked host would un-revoke it. The CA rotation sweep skips them for the same reason.
+**Only active hosts are renewed.** An inactive host is revoked, so its new certificate would be revoked from birth. The CA rotation sweep skips them for the same reason. The sweep **retires** the certificate it replaces (see **A replaced certificate is still valid**), so it fans out nothing.
 
 The **manual** `renew` lever did not, until v0.3.3: it re-signed an inactive host on request. It is now refused before the write, by `checkHostRenew`, at both layers the CA rotation check uses (request hook → `badRequest` with the reason; `OnRecordUpdate` → the raw `ErrHostInactive` for `app.Save` callers). Refused rather than silently skipped because a 200 that did nothing leaves the admin guessing, and the answer they need, "reactivate it instead", fits in the message. Edge-keyed (`renew` false → true against `Original()`), the same edge the executor acts on; a level check would also refuse a *deactivation* that happened to carry a `renew` left set by a failed regeneration, which is the one save that must never be refused.
 

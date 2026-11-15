@@ -392,11 +392,9 @@ func (sm *Manager) regenerateCANetworkConfigs(ca *core.Record) {
 // certificate is not already signed by the current CA.
 //
 // INACTIVE HOSTS ARE SKIPPED:
-// An inactive host is revoked -- its fingerprint is in every peer's
-// pki.blocklist. Re-signing it would change that fingerprint, so getBlocklist
-// would publish the NEW one while the OLD certificate stays valid under the
-// outgoing CA that is still in the trust bundle. Re-signing a revoked host
-// would therefore un-revoke it.
+// An inactive host is revoked -- everything it holds or held is in every
+// peer's pki.blocklist, so a new certificate would be revoked from the start.
+// Its outgoing-CA certificate stops verifying at finish anyway.
 //
 // PER-HOST FAILURES ARE LOGGED, NOT FATAL:
 // nebula_hosts is an auth collection, so every save runs auth validation; one
@@ -439,7 +437,9 @@ func (sm *Manager) resignCAHosts(ca *core.Record) {
 				}
 			}
 
-			if err := sm.generateHostCertAndConfig(host); err != nil {
+			// Retire, not revoke: the outgoing certificate must keep working
+			// until finish, which is the whole point of the three steps.
+			if err := sm.generateHostCertAndConfig(host, retire); err != nil {
 				sm.logger.Warning("Failed to re-sign host %s: %v", host.GetString("hostname"), err)
 				continue
 			}

@@ -352,9 +352,9 @@ func overlayPrefix(overlayIP, networkCIDR string) (netip.Prefix, error) {
 // WHY THIS IS ONLY A QUESTION AND NEVER AN ACTION:
 // Re-signing changes the certificate's fingerprint, and in Nebula a fingerprint
 // is what pki.blocklist revokes. Doing that on the library's own initiative
-// would move every fingerprint in a fleet at once, and would silently un-revoke
-// any host whose old certificate is what peers are blocklisting. So callers
-// warn; an operator re-issues, per host, through the `renew` action field.
+// would move every fingerprint in a fleet at once, and rewrite every peer
+// config with them. So callers warn; an operator re-issues, per host, through
+// the `renew` action field.
 //
 // The comparison is exact rather than mask-only, so it also catches a host
 // whose overlay_ip was changed underneath a certificate that was never
