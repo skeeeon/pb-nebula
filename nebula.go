@@ -39,6 +39,11 @@ import (
 	"github.com/skeeeon/pb-nebula/internal/utils"
 )
 
+// DeviceHostKeyPath is pki.key in the config_yaml of a host whose device holds
+// its own key (device_key = true): the device keeps its key there, or an agent
+// overrides the path before loading the config.
+const DeviceHostKeyPath = config.DeviceHostKeyPath
+
 // Setup initializes pb-nebula with the provided PocketBase application and options.
 // This is the main entry point for the library.
 //

@@ -42,6 +42,14 @@ var (
 	ErrInvalidAllowList      = types.ErrInvalidAllowList
 	ErrHostInactive          = types.ErrHostInactive
 
+	// Device-held key errors, returned (as a 400) by a save that breaks a
+	// device_key invariant. Match with errors.Is.
+	ErrDeviceKeyFrozen        = types.ErrDeviceKeyFrozen
+	ErrDeviceKeyEnrolled      = types.ErrDeviceKeyEnrolled
+	ErrInvalidDeviceKey       = types.ErrInvalidDeviceKey
+	ErrDeviceKeyHasSecret     = types.ErrDeviceKeyHasSecret
+	ErrPublicKeyNotDeviceHeld = types.ErrPublicKeyNotDeviceHeld
+
 	// Config errors - Configuration generation
 	ErrConfigGeneration = types.ErrConfigGeneration
 	ErrInvalidFirewall  = types.ErrInvalidFirewall

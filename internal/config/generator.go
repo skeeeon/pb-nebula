@@ -24,6 +24,12 @@ type Generator struct {
 	// Stateless - no fields needed
 }
 
+// DeviceHostKeyPath is pki.key in the config of a host whose device holds its
+// own key: the path in Nebula's own example config. Not a setting. An agent
+// overrides it before loading the config, and someone running Nebula by hand
+// puts the key there or edits one line.
+const DeviceHostKeyPath = "/etc/nebula/host.key"
+
 // NewGenerator creates a new config generator.
 //
 // RETURNS:
@@ -156,10 +162,18 @@ func (g *Generator) GenerateHostConfig(in HostConfigInput) (string, error) {
 		caBundle = host.CACertificate
 	}
 
+	// A device-held key never reaches the platform, so the config names where
+	// the device keeps it. Nebula reads a path in pki.key as readily as an
+	// inline key.
+	key := host.PrivateKey
+	if host.DeviceKey {
+		key = DeviceHostKeyPath
+	}
+
 	pki := map[string]interface{}{
 		"ca":   caBundle,
 		"cert": host.Certificate,
-		"key":  host.PrivateKey,
+		"key":  key,
 		// Tear down live tunnels to a peer whose certificate has stopped being
 		// valid, rather than waiting for the tunnel to die on its own.
 		//

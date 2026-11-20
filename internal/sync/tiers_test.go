@@ -151,6 +151,8 @@ func TestTiersAreDisjointAndComplete(t *testing.T) {
 	want := []string{
 		// Certificate tier
 		"hostname", "overlay_ip", "groups", "unsafe_networks",
+		// A device-held key arriving signs the first certificate.
+		"public_key",
 		// Config tier
 		"is_lighthouse", "is_relay", "public_host_port", "additional_host_ports",
 		"firewall_outbound", "firewall_inbound", "mtu", "tun_device", "unsafe_routes",

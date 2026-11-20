@@ -206,13 +206,19 @@ func (sm *Manager) hostCertNeedsRenewal(record *core.Record, now time.Time) (boo
 	// never does): re-signing moves a fingerprint and rewrites peer configs, but
 	// it cannot break a host that could not start. It also skips the clamp check
 	// below, because a new key is the point even if the expiry cannot move.
-	keyPEM, err := types.DecryptField(record.GetString("private_key"), sm.options.EncryptionKey)
-	if err != nil {
-		return false, fmt.Errorf("private key does not decrypt: %w", err)
-	}
-	paired, err := cert.HostKeyPairs(certPEM, keyPEM)
-	if err != nil {
-		return false, err
+	//
+	// Not for a device-held key: there is no private key here to check, and
+	// the certificate was signed for the key the device sent.
+	paired := true
+	if !record.GetBool("device_key") {
+		keyPEM, err := types.DecryptField(record.GetString("private_key"), sm.options.EncryptionKey)
+		if err != nil {
+			return false, fmt.Errorf("private key does not decrypt: %w", err)
+		}
+		paired, err = cert.HostKeyPairs(certPEM, keyPEM)
+		if err != nil {
+			return false, err
+		}
 	}
 	if !paired {
 		sm.logger.Warning("Host %s has a private key that does not pair with its certificate, so Nebula cannot start on it; re-issuing",

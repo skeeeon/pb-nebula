@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"strings"
 	"time"
 
+	"github.com/skeeeon/pb-nebula/internal/types"
 	nebulacert "github.com/slackhq/nebula/cert"
 	"golang.org/x/crypto/curve25519"
 )
@@ -75,6 +77,11 @@ type HostCertParams struct {
 
 	CACertPEM       string // CA certificate PEM (for signing)
 	CAPrivateKeyPEM string // CA private key PEM (for signing)
+
+	// PublicKeyPEM is a key the device made (`nebula-cert keygen`). When set,
+	// the certificate is signed for it and no key pair is generated, so the
+	// result carries no private key. Empty: generate a pair, as always.
+	PublicKeyPEM string
 }
 
 // GenerateCA creates a new self-signed Nebula CA certificate.
@@ -193,9 +200,17 @@ func (m *Manager) GenerateHostCert(params HostCertParams) (*HostCertResult, erro
 	// X25519(private key, basepoint) equals the certificate's public key, and
 	// refuses to start if not (VerifyPrivateKey, nebula/pki.go). The Ed25519
 	// pair this used to generate never passed that check, so no host could start.
-	pubKey, privKey, err := hostKeyPair()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate host key pair: %w", err)
+	var pubKey, privKey []byte
+	if params.PublicKeyPEM != "" {
+		pubKey, err = ParseHostPublicKey(params.PublicKeyPEM)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		pubKey, privKey, err = hostKeyPair()
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate host key pair: %w", err)
+		}
 	}
 
 	// The host's address carried at the OVERLAY network's mask -- not /32.
@@ -240,13 +255,37 @@ func (m *Manager) GenerateHostCert(params HostCertParams) (*HostCertResult, erro
 		return nil, fmt.Errorf("failed to marshal host certificate to PEM: %w", err)
 	}
 
-	privKeyPEM := nebulacert.MarshalPrivateKeyToPEM(nebulacert.Curve_CURVE25519, privKey)
-
-	return &HostCertResult{
+	result := &HostCertResult{
 		CertificatePEM: string(certPEM),
-		PrivateKeyPEM:  string(privKeyPEM),
 		ExpiresAt:      expiresAt,
-	}, nil
+	}
+	if privKey != nil {
+		result.PrivateKeyPEM = string(nebulacert.MarshalPrivateKeyToPEM(nebulacert.Curve_CURVE25519, privKey))
+	}
+	return result, nil
+}
+
+// ParseHostPublicKey parses a host public key as `nebula-cert keygen` writes it
+// and returns the raw key. Only X25519 is accepted, because every CA pb-nebula
+// makes is CURVE25519 and Nebula refuses a certificate whose key curve differs
+// from its CA's.
+//
+// RETURNS:
+//   - the 32-byte X25519 public key
+//   - an error wrapping types.ErrInvalidDeviceKey otherwise, including a PEM
+//     with anything after the key
+func ParseHostPublicKey(publicKeyPEM string) ([]byte, error) {
+	pub, rest, curve, err := nebulacert.UnmarshalPublicKeyFromPEM([]byte(publicKeyPEM))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", types.ErrInvalidDeviceKey, err)
+	}
+	if curve != nebulacert.Curve_CURVE25519 {
+		return nil, fmt.Errorf("%w: the key is %s, and pb-nebula CAs are CURVE25519", types.ErrInvalidDeviceKey, curve)
+	}
+	if len(strings.TrimSpace(string(rest))) > 0 {
+		return nil, fmt.Errorf("%w: unexpected data after the key", types.ErrInvalidDeviceKey)
+	}
+	return pub, nil
 }
 
 // hostKeyPair generates a host's X25519 key pair exactly as nebula-cert does

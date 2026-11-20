@@ -500,6 +500,49 @@ rather than defaulted-if-absent because by the time a hook sees the record,
 already-revoked host is not a meaningful operation, and deactivation is an
 update.
 
+## Device-Held Keys
+
+By default pb-nebula generates each host's key pair and keeps the private key,
+so a stolen database holds a working key for every host. A host created with
+`device_key: true` is the other way round, the way Nebula was built: the device
+runs `nebula-cert keygen`, keeps `host.key`, and sends only `host.pub` as
+`public_key`. pb-nebula signs a certificate for that key and never stores a
+private key.
+
+- **An empty `public_key` means "waiting for the device".** Such a host has no
+  certificate and no `config_yaml`, and every save on it works. A peer fan-out
+  does not render it a config.
+- **The key arrives in an ordinary update** (or on create). It is a certificate
+  field, so it signs the host's first certificate. On an inactive host it is
+  stored and signed on reactivation, like any other certificate change.
+- **`pki.key` in its config is a path,** `/etc/nebula/host.key`
+  (`pbnebula.DeviceHostKeyPath`), the one in Nebula's own example config.
+  Nebula reads a path there as readily as an inline key. An agent overrides it;
+  someone running Nebula by hand puts the key there.
+- **Every re-issue re-signs the same key:** edits, `renew`, reactivation, the
+  renewal sweep and CA rotation. Replaced certificates are retired or revoked
+  exactly as for any host. A re-sign inside the same second as the last issue is
+  byte-identical, and is not treated as a replacement, so `renew` cannot revoke
+  the certificate the host still holds.
+- **There is no in-place key reset.** Nebula revokes certificates, by
+  fingerprint, never keys, so re-signing a leaked key changes nothing.
+  Deactivate the host (which blocklists every certificate it holds or held) and
+  create a new one.
+
+Invariants, refused with a 400 that matches the exported errors through
+`errors.Is`:
+
+| Error | Refused |
+|---|---|
+| `ErrDeviceKeyFrozen` | changing `device_key` after create |
+| `ErrDeviceKeyEnrolled` | changing a device key once set |
+| `ErrInvalidDeviceKey` | anything but a `NEBULA X25519 PUBLIC KEY` PEM (pb-nebula CAs are CURVE25519) |
+| `ErrDeviceKeyHasSecret` | a `private_key` on a device-key host |
+| `ErrPublicKeyNotDeviceHeld` | `public_key` on a host whose key pb-nebula generates |
+
+There is no proof of possession: an X25519 key cannot sign, so there is nothing
+to prove it with. A certificate for a key you do not hold is useless to you.
+
 ## Preferred Ranges
 
 `preferred_ranges` tells a host which **underlay** prefixes to favour when a peer

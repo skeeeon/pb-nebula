@@ -155,7 +155,8 @@ type HostRecord struct {
 
 	// Generated Nebula credentials
 	Certificate   string `json:"certificate"`    // PEM encoded host certificate
-	PrivateKey    string `json:"private_key"`    // PEM encoded host private key
+	PrivateKey    string `json:"private_key"`    // PEM encoded host private key; empty when DeviceKey
+	DeviceKey     bool   `json:"device_key"`     // the device holds the private key; pki.key is a path
 	CACertificate string `json:"ca_certificate"` // PEM encoded CA cert (denormalized for convenience)
 	ConfigYAML    string `json:"config_yaml"`    // Complete Nebula config ready to use
 

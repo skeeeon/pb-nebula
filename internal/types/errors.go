@@ -38,6 +38,14 @@ var (
 	ErrInvalidAllowList      = errors.New("invalid allow list")
 	ErrHostInactive          = errors.New("host is inactive")
 
+	// Device-held key errors. A host with device_key = true holds only the
+	// public half of its key pair, as `nebula-cert keygen` writes it.
+	ErrDeviceKeyFrozen        = errors.New("device_key is set at create and cannot change")
+	ErrDeviceKeyEnrolled      = errors.New("a key is already enrolled for this host")
+	ErrInvalidDeviceKey       = errors.New("not a NEBULA X25519 PUBLIC KEY in PEM form")
+	ErrDeviceKeyHasSecret     = errors.New("a device-held key host cannot carry a private key")
+	ErrPublicKeyNotDeviceHeld = errors.New("public_key is set only on a device_key host")
+
 	// Config errors - Configuration generation
 	ErrConfigGeneration = errors.New("failed to generate config")
 	ErrInvalidFirewall  = errors.New("invalid firewall rules")

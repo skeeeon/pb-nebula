@@ -565,6 +565,20 @@ func hostFields() []core.Field {
 			Name: "private_key",
 			Max:  10000,
 		},
+
+		// Device-held keys. device_key true: the device made the key pair
+		// (`nebula-cert keygen`) and sent only public_key, its PEM. pb-nebula
+		// signs that key and stores no private key; pki.key is a path. Set at
+		// create, never changed. An empty public_key means "waiting for the
+		// device": no certificate and no config until it arrives.
+		&core.BoolField{
+			Name: "device_key",
+		},
+		&core.TextField{
+			Name: "public_key",
+			Max:  1000,
+		},
+
 		&core.TextField{
 			Name: "ca_certificate",
 			Max:  10000,

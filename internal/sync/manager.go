@@ -342,6 +342,9 @@ var certFields = []string{
 	"overlay_ip",
 	"groups",
 	"unsafe_networks",
+	// A device-held key arriving. It changes only from empty (device_keys.go),
+	// so this signs the host's first certificate and never re-signs.
+	"public_key",
 }
 
 // configFields are the host fields that appear only in config_yaml, and can be
@@ -452,6 +455,11 @@ func (sm *Manager) setupHostHooks() {
 			return e.Next()
 		}
 		e.Record.Set("active", true)
+		// Device-key invariants (device_keys.go), at the model layer so an
+		// app.Save() from a consumer's route is held to them too.
+		if err := checkHostCreate(e.Record); err != nil {
+			return err
+		}
 		return e.Next()
 	})
 
@@ -499,6 +507,9 @@ func (sm *Manager) setupHostHooks() {
 		if err := checkHostRenew(e.Record, e.Record.Original()); err != nil {
 			return err
 		}
+		if err := sm.checkHostUpdate(e.App, e.Record); err != nil {
+			return err
+		}
 		return e.Next()
 	})
 
@@ -510,6 +521,13 @@ func (sm *Manager) setupHostHooks() {
 
 		// Skip if certificate already exists
 		if e.Record.GetString("certificate") != "" {
+			return e.Next()
+		}
+
+		// A device-held key that has not arrived yet: nothing to sign. The
+		// certificate is signed when public_key is set (it is a cert field).
+		if waitingForDeviceKey(e.Record) {
+			sm.logger.Info("Host %s is waiting for its device to send a public key", e.Record.GetString("hostname"))
 			return e.Next()
 		}
 
@@ -1160,6 +1178,15 @@ func (sm *Manager) generateCA(record *core.Record) error {
 // getBlocklist can find it. A caller that revokes must also fan out across the
 // CA, because the revocation lives in every other host's config.
 func (sm *Manager) generateHostCertAndConfig(record *core.Record, how replacement) error {
+	// THE SIGNING GUARD for device-held keys. Create, edits, renew,
+	// reactivation, the renewal sweep and CA rotation all sign here, so one
+	// check covers them: a host waiting for its device's key gets nothing, and
+	// that is not an error.
+	if waitingForDeviceKey(record) {
+		return nil
+	}
+	deviceKey := record.GetBool("device_key")
+
 	// Get network and CA
 	network, err := sm.app.FindRecordById(sm.options.NetworkCollectionName, record.GetString("network_id"))
 	if err != nil {
@@ -1200,6 +1227,13 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record, how replacemen
 		return err
 	}
 
+	// A device-held key is re-signed every time, so it never changes. Empty:
+	// GenerateHostCert makes a new pair, as it always has.
+	devicePublicKey := ""
+	if deviceKey {
+		devicePublicKey = record.GetString("public_key")
+	}
+
 	// Generate host certificate (expiry is clamped to the CA cert's NotAfter)
 	certResult, err := sm.certManager.GenerateHostCert(cert.HostCertParams{
 		Hostname:      record.GetString("hostname"),
@@ -1213,13 +1247,22 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record, how replacemen
 		UnsafeNetworks:  unsafeNetworks,
 		CACertPEM:       ca.GetString("certificate"),
 		CAPrivateKeyPEM: caPrivateKeyPEM,
+		PublicKeyPEM:    devicePublicKey,
 	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", types.ErrCertGeneration, err)
 	}
 
 	// Keep the certificate being replaced before it is overwritten.
-	replaceCertificate(record, how, trustedCAs(caBundle(ca)), time.Now())
+	//
+	// Unless nothing is being replaced. A device-held key is re-signed, not
+	// regenerated, and a signature is deterministic, so re-signing inside the
+	// same second as the last issue produces a byte-identical certificate.
+	// "Replacing" it with itself would put the host's current certificate on
+	// every blocklist (renew revokes what it replaces).
+	if certResult.CertificatePEM != record.GetString("certificate") {
+		replaceCertificate(record, how, trustedCAs(caBundle(ca)), time.Now())
+	}
 
 	// Store certificate and CA cert (denormalized).
 	// Set private_key as plaintext temporarily so generateHostConfig can embed it
@@ -1235,6 +1278,12 @@ func (sm *Manager) generateHostCertAndConfig(record *core.Record, how replacemen
 	// Generate config (reads plaintext private_key from in-memory record)
 	if err := sm.generateHostConfig(record); err != nil {
 		return err
+	}
+
+	// Nothing to encrypt: the device has the private key. Encrypting an empty
+	// string would store a ciphertext that looks like one.
+	if deviceKey {
+		return nil
 	}
 
 	// Encrypt private_key for at-rest storage
@@ -1337,6 +1386,14 @@ func (sm *Manager) loadNetworkConfigContext(networkID string) (*networkConfigCon
 // generateHostConfigWith renders one host's config against an already-loaded
 // network context, and updates the record.
 func (sm *Manager) generateHostConfigWith(record *core.Record, ctx *networkConfigContext) error {
+	// No certificate, no config. A host waiting for its device's key has none,
+	// and every peer fan-out reaches it: rendering anyway handed it a config
+	// with an empty pki.cert.
+	if record.GetString("certificate") == "" {
+		record.Set("config_yaml", "")
+		return nil
+	}
+
 	configYAML, err := sm.configGen.GenerateHostConfig(config.HostConfigInput{
 		Host:        sm.recordToHostModel(record),
 		Lighthouses: ctx.lighthouses,
@@ -1660,6 +1717,7 @@ func (sm *Manager) recordToHostModel(record *core.Record) *types.HostRecord {
 		TunDevice:        record.GetString("tun_device"),
 		Certificate:      record.GetString("certificate"),
 		PrivateKey:       privateKey,
+		DeviceKey:        record.GetBool("device_key"),
 		CACertificate:    record.GetString("ca_certificate"),
 		ConfigYAML:       record.GetString("config_yaml"),
 		FirewallOutbound: record.GetString("firewall_outbound"),
